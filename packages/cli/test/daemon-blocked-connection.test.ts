@@ -20,6 +20,7 @@ import {
   type LifecycleDeps,
 } from "../src/daemon-lifecycle.js";
 import { resolveOfflineHelpPath } from "../src/daemon-reachability.js";
+import { createProcessLiveness, signalProbe } from "../src/commands/daemon.js";
 
 const URL = "http://127.0.0.1:7433";
 const DOWN_ADVICE = /rig daemon start|'rig up'|if it is down/i;
@@ -228,5 +229,86 @@ describe("offline help guide path (reachable without the daemon)", () => {
     expect(resolveOfflineHelpPath(installed, (p) => p === "/p/lib/node_modules/@openrig/cli/daemon/docs/reference/help.md"))
       .toBe("/p/lib/node_modules/@openrig/cli/daemon/docs/reference/help.md");
     expect(resolveOfflineHelpPath(installed, () => false)).toBeUndefined();
+  });
+
+  it("never resolves outside an installed package, even if a file sits there", () => {
+    const installed = "/p/lib/node_modules/@openrig/cli/dist";
+    const outside = "/p/lib/node_modules/docs/reference/help.md";
+    const bundled = "/p/lib/node_modules/@openrig/cli/daemon/docs/reference/help.md";
+    expect(resolveOfflineHelpPath(installed, (p) => p === outside || p === bundled)).toBe(bundled);
+    expect(resolveOfflineHelpPath(installed, (p) => p === outside)).toBeUndefined();
+  });
+});
+
+// Review finding on #504 (measured inside Codex's macOS sandbox): kill(pid, 0) on the daemon returns
+// EPERM and `ps` cannot run, so the old boolean liveness said "dead", status said `stale`, and the
+// precheck told the seat to start a daemon before any health probe ran.
+describe("sandboxed liveness: EPERM on kill(pid, 0) is not a dead daemon", () => {
+  const STATE = { pid: 4242, port: 7433, db: "/x/openrig.sqlite", startedAt: new Date().toISOString() };
+  const withState = (over: Partial<LifecycleDeps>): LifecycleDeps => lifecycleDeps({
+    exists: (p: string) => p.endsWith("daemon.json"),
+    readFile: (p: string) => (p.endsWith("daemon.json") ? JSON.stringify(STATE) : null),
+    ...over,
+  });
+  // What realDeps' liveness yields in the sandbox: kill(pid, 0) EPERM and no runnable `ps`.
+  const sandboxLiveness = (): "unknown" => "unknown";
+
+  it("classifies liveness: only a missing process or a zombie is dead; an uninspectable one is unknown", () => {
+    const live = (signal: "sent" | "missing" | "not-permitted", state: string | null) =>
+      createProcessLiveness({ signal: () => signal, readProcessState: () => state })(1);
+    expect(live("sent", "S")).toBe("alive");
+    expect(live("sent", "Z")).toBe("dead");
+    expect(live("sent", null)).toBe("unknown");
+    expect(live("missing", "S")).toBe("dead");
+    expect(live("not-permitted", "S")).toBe("alive");
+    expect(live("not-permitted", "Z")).toBe("dead");
+    expect(live("not-permitted", null)).toBe("unknown");
+  });
+
+  it("maps kill(pid, 0) errors: EPERM is not-permitted, ESRCH is missing", () => {
+    const throwing = (code: string) => () => { throw Object.assign(new Error(code), { code }); };
+    expect(signalProbe(1, () => true)).toBe("sent");
+    expect(signalProbe(1, throwing("EPERM"))).toBe("not-permitted");
+    expect(signalProbe(1, throwing("ESRCH"))).toBe("missing");
+  });
+
+  it("unknown liveness plus a blocked probe is unverified with EPERM, never stale, and the guard says blocked", async () => {
+    const status = await getDaemonStatus(withState({
+      isProcessAlive: () => false,
+      processLiveness: sandboxLiveness,
+      fetch: probeFailing("EPERM"),
+    }));
+    expect(status.state).not.toBe("stale");
+    expect(status.state).toBe("unverified");
+    expect(status.probeErrorCode).toBe("EPERM");
+    const guard = statusGuardMessage(status);
+    expect(`${guard.fact} ${guard.consequence} ${guard.action}`).toMatch(/blocked/);
+    expect(`${guard.fact} ${guard.consequence} ${guard.action}`).not.toMatch(DOWN_ADVICE);
+    expect(guard.fact).not.toMatch(/not running/i);
+  });
+
+  it("unknown liveness plus a refused probe is still a stopped daemon with down advice", async () => {
+    const status = await getDaemonStatus(withState({
+      isProcessAlive: () => false,
+      processLiveness: sandboxLiveness,
+      fetch: probeFailing("ECONNREFUSED"),
+    }));
+    expect(status.state).toBe("stopped");
+    expect(statusGuardMessage(status).fact).toMatch(/not running/i);
+  });
+
+  it("unknown liveness plus a healthy probe is running", async () => {
+    const status = await getDaemonStatus(withState({
+      isProcessAlive: () => false,
+      processLiveness: sandboxLiveness,
+      fetch: async () => ({ ok: true }),
+    }));
+    expect(status.state).toBe("running");
+  });
+
+  it("a really dead PID stays stale, with or without the new liveness", async () => {
+    const dead = (): "dead" => "dead";
+    expect((await getDaemonStatus(withState({ isProcessAlive: () => false, processLiveness: dead }))).state).toBe("stale");
+    expect((await getDaemonStatus(withState({ isProcessAlive: () => false }))).state).toBe("stale");
   });
 });

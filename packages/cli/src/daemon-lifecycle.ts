@@ -64,6 +64,9 @@ export interface DaemonStatus {
   probeErrorCode?: string;
 }
 
+/** "unknown": the process may exist but this shell can neither signal nor inspect it. */
+export type ProcessLiveness = "alive" | "dead" | "unknown";
+
 export interface GetDaemonStatusOptions {
   /** Observers may disable cleanup; only a matching clean shutdown permits removal. */
   cleanupStaleState?: boolean;
@@ -210,6 +213,9 @@ export interface LifecycleDeps {
   openForAppend: (path: string) => number;
   closeFile?: (fd: number) => void;
   isProcessAlive: (pid: number) => boolean;
+  /** #275 — three-state liveness for status reads (production: realDeps). Optional so existing
+   *  mocks keep the boolean rule; absent = derived from isProcessAlive. */
+  processLiveness?: (pid: number) => ProcessLiveness;
   // OPR.0.4.2.1 — optional injectable delay for the status-probe bounded settle/retry.
   // Defaults to a real setTimeout in production; tests pass a no-op to stay fast. Optional so
   // existing deps / mocks / callers are untouched.
@@ -999,7 +1005,10 @@ export async function getDaemonStatus(
     }
   }
 
-  if (!deps.isProcessAlive(state.pid)) {
+  const liveness: ProcessLiveness = deps.processLiveness
+    ? deps.processLiveness(state.pid)
+    : deps.isProcessAlive(state.pid) ? "alive" : "dead";
+  if (liveness === "dead") {
     // A status read must not erase the identity needed to judge a failed stop.
     const stateFile = resolveLifecycleFile(deps, "daemon.json");
     const { receipt } = readShutdownReceipt(deps, stateFile);
@@ -1009,8 +1018,21 @@ export async function getDaemonStatus(
     return { state: "stale" };
   }
 
-  // Process alive — check healthz
   const host = state.host ?? DEFAULT_HOST;
+  if (liveness === "unknown") {
+    // #275: this shell can neither signal nor inspect the recorded PID (a sandbox, or another
+    // user's process). Never call that stale; let the daemon answer, and touch no state file.
+    try {
+      const res = await probeHealthzWithSettle(deps, `http://${formatDaemonHostForUrl(host)}:${state.port}/healthz`);
+      const ev = await readHealthEvidence(res);
+      return { state: "running", port: state.port, host, pid: state.pid, healthy: ev.healthy, reason: ev.reason, eventLoop: ev.eventLoop };
+    } catch (err) {
+      // 1ae863d2: refusal = positive down; anything else (timeout/wedged/blocked) = unverified.
+      return isRefusedError(err) ? { state: "stopped" } : { state: "unverified", pid: state.pid, ...probeErrorCodeOf(err) };
+    }
+  }
+
+  // Process alive — check healthz
   let healthy = false;
   let reason: DaemonStatus["reason"];
   let eventLoop: DaemonEventLoopEvidence | undefined;

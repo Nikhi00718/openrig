@@ -41,14 +41,15 @@ export function blockedConnectionGuidance(
 }
 
 /** The help guide that ships with this CLI, readable without the daemon. `baseDir` is this
- *  module's directory (`src/` in a checkout, `dist/` when installed). The source checkout's
+ *  module's directory (`src/` in a checkout, `dist/` when installed). In a source checkout its
  *  `docs/` wins, as in resolveDaemonPath; then the copy the package build places under
- *  `daemon/docs/reference/`. Pure: `exists` is injected. */
+ *  `daemon/docs/reference/`. An installed package (under `node_modules`) never looks outside
+ *  itself. Pure: `exists` is injected. */
 export function resolveOfflineHelpPath(baseDir: string, exists: (p: string) => boolean): string | undefined {
-  return [
-    path.resolve(baseDir, "../../../docs/reference/help.md"),
-    path.resolve(baseDir, "../daemon/docs/reference/help.md"),
-  ].find((candidate) => exists(candidate));
+  const bundled = path.resolve(baseDir, "../daemon/docs/reference/help.md");
+  const installed = path.resolve(baseDir).split(path.sep).includes("node_modules");
+  const candidates = installed ? [bundled] : [path.resolve(baseDir, "../../../docs/reference/help.md"), bundled];
+  return candidates.find((candidate) => exists(candidate));
 }
 
 export function getOfflineHelpPath(): string | undefined {
