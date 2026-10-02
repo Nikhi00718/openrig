@@ -1620,12 +1620,11 @@ export class PodRigInstantiator {
               } catch {
                 return; // Unknown state: retain the rig for recovery.
               }
-              if (probe.state === "absent" ||
-                (probe.state === "transport_unavailable" && probe.cause?.includes("no server running"))) continue;
+              if (probe.state === "absent") continue;
               if (probe.state !== "present") return;
             }
             const stopped = await this.deps.tmuxAdapter.killSession(sessionName);
-            if (!stopped.ok && stopped.code !== "session_not_found") return; // Do not forget a still-protected/uncertain session.
+            if (!stopped.ok && (stopped.code !== "session_not_found" || /no server running/i.test(stopped.message ?? ""))) return;
           }
         }
         this.deps.rigRepo.deleteRig(rigId);
