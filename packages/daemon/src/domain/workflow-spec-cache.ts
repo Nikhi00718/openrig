@@ -548,6 +548,12 @@ export function parseWorkflowSpec(rawYaml: string, sourcePath: string): Workflow
   };
 }
 
+/**
+ * #511 — status of a cached version kept only because unfinished work is pinned to it after its
+ * source file disappeared. Readable by name and version; excluded from discovery listings.
+ */
+export const RETAINED_STATUS = "retained";
+
 export class WorkflowSpecCache {
   private readonly hasSpecJsonColumn: boolean;
   private readonly hasDiagnosticColumns: boolean;
@@ -587,7 +593,11 @@ export class WorkflowSpecCache {
       ? this.db.prepare("SELECT * FROM workflow_specs WHERE source_path = ? AND status = 'error'").get(sourcePath) as SpecRow | undefined
       : undefined;
     const existing = named ?? diagnostic;
-    if (existing && existing.status !== "error" && existing.source_hash === sourceHash) {
+    // A file moved away from a path that no longer exists keeps its cached row: record the new
+    // path, so the scanner's removal pass does not delete the current version (#511). A retained
+    // row whose file is back is made valid again.
+    const moved = existing !== undefined && existing.source_path !== sourcePath && !existsSync(existing.source_path);
+    if (existing && existing.status !== "error" && existing.status !== RETAINED_STATUS && !moved && existing.source_hash === sourceHash) {
       // readThrough is file-authoritative: return the freshly parsed
       // file spec so validation sees non-column metadata such as
       // workflow.entry and workflow.invariants.
@@ -785,7 +795,7 @@ export class WorkflowSpecCache {
     const row = this.db
       .prepare(
         `SELECT source_path FROM workflow_specs
-           WHERE name = ? AND version != ''
+           WHERE name = ? AND version != ''${this.hasDiagnosticColumns ? ` AND status != '${RETAINED_STATUS}'` : ""}
            ORDER BY version DESC LIMIT 1`,
       )
       .get(name) as { source_path: string } | undefined;
@@ -800,7 +810,7 @@ export class WorkflowSpecCache {
    */
   listAll(): WorkflowSpecRow[] {
     const rows = this.db
-      .prepare(`SELECT * FROM workflow_specs ORDER BY name, version`)
+      .prepare(`SELECT * FROM workflow_specs${this.hasDiagnosticColumns ? ` WHERE status != '${RETAINED_STATUS}'` : ""} ORDER BY name, version`)
       .all() as SpecRow[];
     return rows.map((row) => rowToWorkflowSpec(row));
   }
@@ -867,6 +877,30 @@ export class WorkflowSpecCache {
    * detects a workflow YAML was deleted from disk). Returns the
    * number of rows removed (0 when no row exists for that path).
    */
+  /**
+   * #511 — an unfinished workflow instance (active, waiting, or failed and still resumable) reads
+   * its pinned spec by name and version. Such a version outlives its source file until that work
+   * ends. A missing instances table (older harnesses) pins nothing.
+   */
+  isPinnedByUnfinishedWork(name: string, version: string): boolean {
+    try {
+      return this.db
+        .prepare(`SELECT 1 FROM workflow_instances WHERE workflow_name = ? AND workflow_version = ? AND status IN ('active', 'waiting', 'failed') LIMIT 1`)
+        .get(name, version) !== undefined;
+    } catch {
+      return false;
+    }
+  }
+
+  /** #511 — keep a pinned version whose file is gone: readable by name and version, hidden from discovery. */
+  retain(specId: string): void {
+    this.db.prepare(`UPDATE workflow_specs SET status = '${RETAINED_STATUS}' WHERE spec_id = ?`).run(specId);
+  }
+
+  removeBySpecId(specId: string): number {
+    return this.db.prepare(`DELETE FROM workflow_specs WHERE spec_id = ?`).run(specId).changes;
+  }
+
   removeBySourcePath(sourcePath: string): number {
     const result = this.db
       .prepare(`DELETE FROM workflow_specs WHERE source_path = ?`)

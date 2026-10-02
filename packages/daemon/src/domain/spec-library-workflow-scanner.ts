@@ -24,7 +24,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { WorkflowSpec, WorkflowExitKind, WorkflowAgentHarness, WorkflowGateSpec } from "./workflow-types.js";
-import type { WorkflowSpecCache } from "./workflow-spec-cache.js";
+import { RETAINED_STATUS, type WorkflowSpecCache } from "./workflow-spec-cache.js";
 import type { EventBus } from "./event-bus.js";
 
 export interface SpecLibraryWorkflowEntry {
@@ -155,6 +155,8 @@ export function scanWorkflowSpecs(opts: ScanWorkflowSpecsOpts): SpecLibraryWorkf
 
   const out: SpecLibraryWorkflowEntry[] = [];
   for (const row of rows) {
+    // A version kept only for unfinished work after its file was deleted is not discoverable (#511).
+    if (row.status === RETAINED_STATUS) continue;
     const status: "valid" | "error" = row.status === "error" ? "error" : "valid";
     const isBuiltIn = opts.workflowBuiltinSpecsDir
       ? isUnderDir(row.source_path, opts.workflowBuiltinSpecsDir)
@@ -232,7 +234,7 @@ export function getWorkflowReview(opts: ScanWorkflowSpecsOpts & { name: string; 
   } catch {
     return null;
   }
-  if (!row) return null;
+  if (!row || row.status === RETAINED_STATUS) return null;
 
   let roles: WorkflowSpec["roles"];
   let steps: WorkflowSpec["steps"];
@@ -461,7 +463,7 @@ export function scanWorkflowSpecFolder(
     // is `T - 999ms` would always look "newer" than its cached_at at
     // exactly `T` and never skip.
     const cachedAt = opts.db
-      .prepare(`SELECT cached_at, source_hash FROM workflow_specs WHERE source_path = ?`)
+      .prepare(`SELECT cached_at, source_hash FROM workflow_specs WHERE source_path = ? AND status != '${RETAINED_STATUS}'`)
       .get(filePath) as { cached_at: string; source_hash: string } | undefined;
     if (cachedAt) {
       const cachedAtMs = Date.parse(cachedAt.cached_at);
@@ -531,7 +533,14 @@ export function scanWorkflowSpecFolder(
     // literal directory owns deletion; neighboring cache rows must survive.
     if (!row.source_path.startsWith(folderPrefix)) continue;
     if (seenPaths.has(row.source_path)) continue;
-    const removed = opts.cache.removeBySourcePath(row.source_path);
+    if (!row.spec_id) continue;
+    // #511: a version that unfinished work is pinned to stays readable until that work ends;
+    // a later scan removes it. Every other row of the vanished file goes, one event per version.
+    if (row.name && row.version && opts.cache.isPinnedByUnfinishedWork(row.name, row.version)) {
+      opts.cache.retain(row.spec_id);
+      continue;
+    }
+    const removed = opts.cache.removeBySpecId(row.spec_id);
     if (removed > 0) {
       result.removed += removed;
       // OQ-4 audit-log: record the disappearance so operators can trace
