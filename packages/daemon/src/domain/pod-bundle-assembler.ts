@@ -9,6 +9,7 @@ import type { RigSpec, StartupBlock } from "./types.js";
 export interface PodAssemblerFsOps extends AgentResolverFsOps {
   /** Raw bytes, for files the bundle copies verbatim (agent packages, culture, docs, startup files). */
   readFileBuffer(path: string): Uint8Array;
+  realpath(path: string): string;
   mkdirp(path: string): void;
   /** Source permission bits, used to preserve executable bundle assets. */
   fileMode?(path: string): number;
@@ -239,11 +240,17 @@ export class PodBundleAssembler {
   }
 
   private collectRigFile(relPath: string, rigRoot: string, outputDir: string, collected: string[]): void {
-    const absPath = nodePath.resolve(rigRoot, relPath);
-    if (!absPath.startsWith(rigRoot)) {
+    const root = nodePath.resolve(rigRoot);
+    const absPath = nodePath.resolve(root, relPath);
+    if (absPath !== root && !absPath.startsWith(nodePath.join(root, nodePath.sep))) {
       throw new Error(`Path traversal detected: "${relPath}" escapes rig root`);
     }
     if (!this.fs.exists(absPath)) return; // optional files may not exist
+    const realRoot = this.fs.realpath(root);
+    const realPath = this.fs.realpath(absPath);
+    if (realPath !== realRoot && !realPath.startsWith(nodePath.join(realRoot, nodePath.sep))) {
+      throw new Error(`Path traversal detected: "${relPath}" resolves outside rig root`);
+    }
     const content = this.fs.readFileBuffer(absPath);
     const mode = this.fs.fileMode?.(absPath);
     assertShippableSubstance([{ path: relPath, bytes: content }]);
