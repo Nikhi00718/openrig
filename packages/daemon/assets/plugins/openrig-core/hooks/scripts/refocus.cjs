@@ -121,20 +121,28 @@ function deriveWorkStart() {
 }
 
 // The trace script looks up each missing root with its own `rig config get`, two CLI starts
-// inside its 2 s budget. One `rig config --json` read here fills only the roots that are
-// missing, under the config store's own env names, which the script already honours. An
-// explicit nonempty value is never replaced; both present skips the read; a failed or
-// malformed read sets nothing, so the script's own lookup runs exactly as before. Only the
-// two root fields are consumed and nothing from the config is logged.
-function traceEnv() {
+// inside its 2 s budget. One `rig config --json` read here fills only the roots the selected
+// trees need and that are missing, under the config store's own env names, which the script
+// already honours. An explicit nonempty value is never replaced; nothing missing skips the
+// read; a failed, malformed or skipped read sets nothing, so the script's own lookup runs
+// exactly as before. Only the two root fields are consumed and nothing from the config is logged.
+//
+// Both harnesses kill this hook at 5 s (hooks/claude.json, hooks/codex.json). The read gets only
+// what is left of a 4.5 s budget, counted from process start, after reserving python's 2 s; with
+// 250 ms or less left it is skipped, so queue whoami + this read + python stay under the kill.
+function traceEnv(trees) {
   const env = { ...process.env };
-  const missing = [["OPENRIG_TOPOLOGY_ROOT", "topology"], ["OPENRIG_WORKSPACE_ROOT", "workspace"]]
-    .filter(([name]) => !env[name]);
+  const missing = [
+    ["OPENRIG_TOPOLOGY_ROOT", "topology", "topology"],
+    ["OPENRIG_WORKSPACE_ROOT", "workspace", "work"],
+  ].filter(([name, , tree]) => (trees === "both" || trees === tree) && !env[name]);
   if (missing.length === 0) return env;
+  const timeout = Math.floor(Math.min(2_000, 4_500 - 2_000 - process.uptime() * 1_000));
+  if (timeout <= 250) return env;
   const result = spawnSync("rig", ["config", "--json"], {
     encoding: "utf8",
     env: process.env,
-    timeout: 2_000,
+    timeout,
     maxBuffer: 16 * 1024 * 1024,
   });
   if (result.error || result.status !== 0) return env;
@@ -149,9 +157,10 @@ function traceEnv() {
 
 function renderTrace() {
   const script = path.resolve(__dirname, "../../skills/refocusing/scripts/trace-to-root.py");
+  const trees = process.env.OPENRIG_REFOCUS_TREES || "both";
   const args = [
     script,
-    "--trees", process.env.OPENRIG_REFOCUS_TREES || "both",
+    "--trees", trees,
     "--depth", process.env.OPENRIG_REFOCUS_DEPTH || "light",
   ];
   if (process.env.OPENRIG_REFOCUS_TOPOLOGY_NODE) {
@@ -163,7 +172,7 @@ function renderTrace() {
   else if (work.unknown) args.push("--work-unknown", work.unknown);
   const result = spawnSync(process.env.PYTHON || "python3", args, {
     encoding: "utf8",
-    env: traceEnv(),
+    env: traceEnv(trees),
     timeout: 2_000,
     maxBuffer: 16 * 1024 * 1024,
   });

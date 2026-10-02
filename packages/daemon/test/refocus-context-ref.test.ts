@@ -296,6 +296,7 @@ describe("openrig-core refocusing skill — real dual-tree trace", () => {
     // Every invocation is logged, so a test can count the rig processes one fire spends.
     writeFileSync(rig, `#!/bin/sh
 printf '%s\\n' "$*" >> "$RIG_CALL_LOG"
+if [ -n "$RIG_HANG" ]; then exec sleep "$RIG_HANG"; fi
 if [ "$1 $2" = "queue whoami" ]; then
   if [ -n "$RIG_QUEUE_WHOAMI_SLEEP" ]; then exec sleep "$RIG_QUEUE_WHOAMI_SLEEP"; fi
   printf '%s' "$RIG_QUEUE_WHOAMI_STDOUT"; exit 0
@@ -588,6 +589,36 @@ exit 1
       expect(empty.context).toContain(`root: ${realpathSync(f.topology)}`);
       expect(empty.context).toContain("Builder learned");
     });
+
+    it("reads config only for the roots the selected trees need", () => {
+      const f = fixture();
+      const work = hook(f, { OPENRIG_REFOCUS_TREES: "work", OPENRIG_WORKSPACE_ROOT: f.workspace });
+      expect(work.status).toBe(0);
+      expect(work.calls.filter((call) => call.startsWith("config"))).toEqual([]);
+      expect(work.context).toContain("Deliver refocus");
+      expect(work.context).not.toContain("TOPOLOGY TRACE");
+
+      const topology = hook(f, { OPENRIG_REFOCUS_TREES: "topology", OPENRIG_TOPOLOGY_ROOT: f.topology });
+      expect(topology.status).toBe(0);
+      expect(topology.calls.filter((call) => call.startsWith("config"))).toEqual([]);
+      expect(topology.context).toContain("Builder learned");
+      expect(topology.context).not.toContain("WORK TRACE");
+    });
+
+    // Both harnesses kill the hook at 5 s. With every rig call hanging, queue whoami (2 s) and
+    // python (2 s) are fixed, so the config read may only use what is left; a gap is delivered.
+    it("delivers within the 5 s hook kill when every rig call hangs", () => {
+      const f = fixture();
+      const started = Date.now();
+      const result = hook(f, { RIG_HANG: "8" });
+      const elapsed = Date.now() - started;
+      expect(result.status).toBe(0);
+      expect(elapsed).toBeLessThan(5_000);
+      expect(result.context).toContain("REFOCUS (on demand)");
+      expect(result.context).toContain("TRACE GAP");
+      expect(result.calls[0]).toBe("queue whoami --json");
+      expect(result.calls.filter((call) => call === "config --json").length).toBeLessThanOrEqual(1);
+    }, 20_000);
 
     // A queue whoami past the hook's 2 s budget must reach the trace as UNKNOWN (#484 review LOW-1).
     it("passes a queue whoami that outlives its 2 s budget as UNKNOWN to the real trace", () => {
