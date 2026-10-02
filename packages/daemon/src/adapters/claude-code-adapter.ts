@@ -755,8 +755,14 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
    * Best-effort: provision the OpenRig context collector for managed Claude sessions.
    * Writes a collector script and merges status line config into .claude/settings.local.json.
    * Idempotent: safe to call multiple times (merge preserves existing settings). A user's own
-   * status line command, or a file that does not parse, is left as it is; that seat then has no
-   * context-usage sidecar.
+   * status line command (anything but the exact command written below), or a file that does not
+   * parse, is left as it is. The collector then never runs for that seat, so:
+   * - context usage reads unknown (`missing_sidecar`) once no valid retained sidecar exists; a
+   *   recent sample from an earlier collector can still read as known until it goes stale;
+   * - Claude resume-token capture at adoption or handover is skipped (`missing_sidecar`);
+   * - its provider-usage row is an explicit unknown (`no_statusline_cache_yet`) unless an earlier
+   *   cache for that seat is retained.
+   * The read-modify-write below is not safe against a concurrent writer of the same file.
    */
   private provisionContextCollector(binding: { cwd?: string | null; tmuxSession?: string | null }): void {
     if (!this.stateDir || !this.collectorAssetPath || !binding.cwd) return;
@@ -775,21 +781,25 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     this.fs.mkdirp(nodePath.dirname(settingsPath));
 
     // The seat cwd can be a shared repo whose project-local settings other sessions read (#421).
-    // Like the activity hooks, never clobber text we cannot parse. Valid JSON that is not an
-    // object (for example `[]`) is still replaced, as before.
+    // Like the activity hooks, never clobber text we cannot parse. An empty file holds no settings
+    // and is treated as `{}`. Valid JSON that is not an object (for example `[]`) is still
+    // replaced, as before.
     let existing: Record<string, unknown> = {};
     if (this.fs.exists(settingsPath)) {
-      let parsed: unknown;
-      try { parsed = JSON.parse(this.fs.readFile(settingsPath)); } catch { return; }
-      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) existing = parsed as Record<string, unknown>;
+      const text = this.fs.readFile(settingsPath);
+      if (text.trim() !== "") {
+        let parsed: unknown;
+        try { parsed = JSON.parse(text); } catch { return; }
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) existing = parsed as Record<string, unknown>;
+      }
     }
     const statusLine = typeof existing["statusLine"] === "object" && existing["statusLine"] !== null
       ? existing["statusLine"] as Record<string, unknown> : {};
     // A user's own status line command wins; only OpenRig's collector command is installed or refreshed.
-    const current = statusLine["command"];
-    if (typeof current === "string" && current.trim() !== "" && !current.includes(nodePath.join(".openrig", "context-collector.cjs"))) return;
-
     const collectorCmd = `node ${collectorDest} ${contextDir} ${providerUsageDir}`;
+    const current = statusLine["command"];
+    if (typeof current === "string" && current.trim() !== "" && current !== collectorCmd && !isOwnedCollectorCommand(current)) return;
+
     existing["statusLine"] = { ...statusLine, type: "command", command: collectorCmd };
 
     this.fs.writeFile(settingsPath, JSON.stringify(existing, null, 2));
@@ -913,6 +923,19 @@ const OWNED_RELAY_SUFFIX = "/.openrig/hooks/scripts/activity-relay.cjs";
 
 function hookCommand(hook: unknown): string | undefined {
   return isPlainObject(hook) && typeof hook["command"] === "string" ? (hook["command"] as string) : undefined;
+}
+
+// OpenRig-owned context collector. provisionContextCollector writes exactly
+// `node <cwd>/.openrig/context-collector.cjs <contextDir> <providerUsageDir>`, unquoted. Ownership is
+// that four-token shape with any (possibly stale) paths. A command that merely contains the path,
+// composed with `;`, `&&` or a pipe, or naming another file such as `.cjs.backup`, is the user's.
+const OWNED_COLLECTOR_SUFFIX = nodePath.sep + nodePath.join(".openrig", "context-collector.cjs");
+
+function isOwnedCollectorCommand(cmd: string): boolean {
+  const tokens = cmd.trim().split(/\s+/);
+  if (tokens.length !== 4 || tokens[0] !== "node") return false;
+  if (tokens.some((token) => /[;&|<>`$()'"\\]/.test(token))) return false;
+  return tokens[1]!.endsWith(OWNED_COLLECTOR_SUFFIX);
 }
 
 function isOwnedRelayCommand(cmd: string | undefined): boolean {

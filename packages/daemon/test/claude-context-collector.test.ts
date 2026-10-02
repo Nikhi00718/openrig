@@ -278,6 +278,29 @@ describe("ClaudeCodeAdapter Context Collector Provisioning", () => {
       await deliver();
       expect(written[settingsPath]).toBe(unparseable);
     });
+
+    // Only the exact command OpenRig writes is ours; a command that merely contains the path is the user's.
+    it.each([
+      "node /old/.openrig/context-collector.cjs /old/ctx /old/prov; ~/bin/my-status.sh",
+      "node /old/.openrig/context-collector.cjs /old/ctx /old/prov && ~/bin/my-status.sh",
+      "node /old/.openrig/context-collector.cjs /old/ctx /old/prov;~/bin/my-status.sh",
+      "node /tools/.openrig/context-collector.cjs.backup",
+    ])("keeps a user command that only contains the collector path: %s", async (command) => {
+      const original = JSON.stringify({ statusLine: { type: "command", command, padding: 1 } }, null, 2);
+      written[settingsPath] = original;
+      await deliver();
+      expect(written[settingsPath]).toBe(original);
+    });
+
+    it.each(["", "  \n"])("installs the collector into an empty settings file (%j)", async (text) => {
+      written[settingsPath] = text;
+      await deliver();
+      expect(written[settingsPath]).toContain("/project/.openrig/context-collector.cjs");
+      expect(JSON.parse(written[settingsPath]!).statusLine).toEqual({
+        type: "command",
+        command: `node /project/.openrig/context-collector.cjs ${join(tmpDir, "state", "context-usage")} ${join(tmpDir, "state", "provider-usage")}`,
+      });
+    });
   });
 
   // T5: deliverStartup copies collector script to project
