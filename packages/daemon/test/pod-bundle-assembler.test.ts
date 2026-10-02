@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import nodePath from "node:path";
 import * as nodeFs from "node:fs";
 import { tmpdir } from "node:os";
@@ -349,8 +349,18 @@ describe("PodBundleAssembler", () => {
     })).toThrow(/traversal|escape/i);
   });
 
+  it("rejects a sibling-prefix traversal at schema validation", () => {
+    const spec = makeRigSpec({ cultureFile: "../rig-sibling/context.md" });
+    const fs = mockFs({ [`${RIG_ROOT}/rig.yaml`]: rigSpecYaml(spec) });
+    const realpath = vi.spyOn(fs, "realpath");
+    expect(() => new PodBundleAssembler({ fsOps: fs }).assemble({
+      rigRoot: RIG_ROOT, rigSpecPath: `${RIG_ROOT}/rig.yaml`,
+      outputDir: "/tmp/staging", bundleName: "test", bundleVersion: "1.0",
+    })).toThrow('Invalid rig spec: culture_file: path traversal (..) is not allowed (got "../rig-sibling/context.md")');
+    expect(realpath).not.toHaveBeenCalled();
+  });
+
   it.each([
-    "../rig-sibling/context.md",
     "outside.md",
     "outside-dir/context.md",
   ])("rejects a rig file resolving into a sibling-prefix directory: %s", (path) => {
@@ -377,7 +387,7 @@ describe("PodBundleAssembler", () => {
       expect(() => new PodBundleAssembler({ fsOps: fs }).assemble({
         rigRoot, rigSpecPath: `${rigRoot}/rig.yaml`, outputDir: `${root}/staging`,
         bundleName: "test", bundleVersion: "1.0",
-      })).toThrow(/traversal|outside|escapes/i);
+      })).toThrow(`"${path}" resolves outside the rig root through a symlink; copy the file into the rig to bundle it`);
       expect((fs as typeof fs & { _written: object })._written).toEqual({});
     } finally {
       nodeFs.rmSync(root, { recursive: true, force: true });
@@ -400,6 +410,10 @@ describe("PodBundleAssembler", () => {
         [`${rigRoot}/inside.md`]: "# Local context",
       });
       Object.assign(fs, { realpath: nodeFs.realpathSync });
+      const readFileBuffer = fs.readFileBuffer;
+      const read = vi.spyOn(fs, "readFileBuffer").mockImplementation((p) =>
+        nodeFs.existsSync(p) ? nodeFs.readFileSync(p) : readFileBuffer(p));
+      const mode = vi.spyOn(fs, "fileMode");
       const result = new PodBundleAssembler({ fsOps: fs }).assemble({
         rigRoot, rigSpecPath: `${rigRoot}/rig.yaml`, outputDir: `${root}/staging`,
         bundleName: "test", bundleVersion: "1.0",
@@ -407,6 +421,8 @@ describe("PodBundleAssembler", () => {
       expect(result.collectedFiles).toContain("inside.md");
       const written = (fs as typeof fs & { _written: Record<string, Uint8Array> })._written;
       expect(Buffer.from(written[`${root}/staging/inside.md`]!).toString()).toBe("# Local context");
+      expect(read).toHaveBeenCalledWith(nodePath.join(actualRoot, "context.md"));
+      expect(mode).toHaveBeenCalledWith(nodePath.join(actualRoot, "context.md"));
     } finally {
       nodeFs.rmSync(root, { recursive: true, force: true });
     }

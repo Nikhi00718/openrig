@@ -249,10 +249,10 @@ export class PodBundleAssembler {
     const realRoot = this.fs.realpath(root);
     const realPath = this.fs.realpath(absPath);
     if (realPath !== realRoot && !realPath.startsWith(nodePath.join(realRoot, nodePath.sep))) {
-      throw new Error(`Path traversal detected: "${relPath}" resolves outside rig root`);
+      throw new Error(`"${relPath}" resolves outside the rig root through a symlink; copy the file into the rig to bundle it`);
     }
-    const content = this.fs.readFileBuffer(absPath);
-    const mode = this.fs.fileMode?.(absPath);
+    const content = this.fs.readFileBuffer(realPath);
+    const mode = this.fs.fileMode?.(realPath);
     assertShippableSubstance([{ path: relPath, bytes: content }]);
     this.fs.mkdirp(nodePath.dirname(nodePath.join(outputDir, relPath)));
     this.fs.writeFile(nodePath.join(outputDir, relPath), content, mode);
