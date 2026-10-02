@@ -756,10 +756,11 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
    * Writes a collector script and merges status line config into .claude/settings.local.json.
    * Idempotent: safe to call multiple times (merge preserves existing settings). A user's own
    * status line command (anything but the exact command written below), or a file that does not
-   * parse, is left as it is. The collector then never runs for that seat, so:
-   * - context usage reads unknown (`missing_sidecar`) once no valid retained sidecar exists; a
-   *   recent sample from an earlier collector can still read as known until it goes stale;
-   * - Claude resume-token capture at adoption or handover is skipped (`missing_sidecar`);
+   * parse, is left as it is. The collector then never runs for that seat. While a valid sidecar
+   * from an earlier collector is retained, context usage (shown as stale once it ages) and Claude
+   * resume-token capture keep using it. Once none exists:
+   * - context usage reads unknown (`missing_sidecar`);
+   * - resume-token capture at adoption or handover is skipped (`missing_sidecar`);
    * - its provider-usage row is an explicit unknown (`no_statusline_cache_yet`) unless an earlier
    *   cache for that seat is retained.
    * The read-modify-write below is not safe against a concurrent writer of the same file.
@@ -926,14 +927,16 @@ function hookCommand(hook: unknown): string | undefined {
 }
 
 // OpenRig-owned context collector. provisionContextCollector writes exactly
-// `node <cwd>/.openrig/context-collector.cjs <contextDir> <providerUsageDir>`, unquoted. Ownership is
-// that four-token shape with any (possibly stale) paths. A command that merely contains the path,
-// composed with `;`, `&&` or a pipe, or naming another file such as `.cjs.backup`, is the user's.
+// `node <cwd>/.openrig/context-collector.cjs <contextDir> <providerUsageDir>`, unquoted; older
+// releases wrote the same command without `<providerUsageDir>`. Ownership is either shape with any
+// (possibly stale) paths, on one line. A command that merely contains the path, composed with `;`,
+// `&&`, a pipe or a newline, or naming another file such as `.cjs.backup`, is the user's.
 const OWNED_COLLECTOR_SUFFIX = nodePath.sep + nodePath.join(".openrig", "context-collector.cjs");
 
 function isOwnedCollectorCommand(cmd: string): boolean {
+  if (/[\r\n]/.test(cmd)) return false;
   const tokens = cmd.trim().split(/\s+/);
-  if (tokens.length !== 4 || tokens[0] !== "node") return false;
+  if ((tokens.length !== 3 && tokens.length !== 4) || tokens[0] !== "node") return false;
   if (tokens.some((token) => /[;&|<>`$()'"\\]/.test(token))) return false;
   return tokens[1]!.endsWith(OWNED_COLLECTOR_SUFFIX);
 }
