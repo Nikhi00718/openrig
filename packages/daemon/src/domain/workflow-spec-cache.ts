@@ -587,6 +587,13 @@ export class WorkflowSpecCache {
       ? this.db.prepare("SELECT * FROM workflow_specs WHERE source_path = ? AND status = 'error'").get(sourcePath) as SpecRow | undefined
       : undefined;
     const existing = named ?? diagnostic;
+    // A successful parse supersedes this file's diagnostic rows. Only diagnostic-only rows
+    // (status error, no version) are removed; a versioned row may still back running work (#503).
+    if (this.hasDiagnosticColumns) {
+      this.db
+        .prepare(`DELETE FROM workflow_specs WHERE source_path = ? AND status = 'error' AND version = '' AND spec_id != ?`)
+        .run(sourcePath, existing?.spec_id ?? "");
+    }
     if (existing && existing.status !== "error" && existing.source_hash === sourceHash) {
       // readThrough is file-authoritative: return the freshly parsed
       // file spec so validation sees non-column metadata such as
@@ -813,13 +820,12 @@ export class WorkflowSpecCache {
    * falls back to the source file basename so the Library has a
    * stable label even when the YAML couldn't be parsed.
    *
-   * Single-row-per-source_path semantics: writeDiagnostic on a path
-   * that already has a row (valid or diagnostic) UPDATES the row's
-   * status to 'error', error_message, source_hash, cached_at, and
-   * resets the parsed payload fields to empty (the prior YAML is no
-   * longer trusted). Round-trip between 'valid' and 'error' is
-   * supported via the same path: a passing readThrough flips the
-   * row back to 'valid' with parsed payload restored.
+   * One diagnostic row per source_path: writeDiagnostic updates the
+   * path's existing diagnostic row (status 'error') or inserts one. It
+   * never rewrites a cached valid version, because a running workflow
+   * may still read that version by name and version (#503). A passing
+   * readThrough removes the path's diagnostic rows, or turns the only
+   * row of a never-valid file into the valid row.
    */
   writeDiagnostic(opts: {
     sourcePath: string;
@@ -829,7 +835,7 @@ export class WorkflowSpecCache {
     const cachedAt = this.now().toISOString();
     const fallbackName = opts.sourcePath.split("/").pop() ?? opts.sourcePath;
     const existing = this.db
-      .prepare(`SELECT spec_id FROM workflow_specs WHERE source_path = ?`)
+      .prepare(`SELECT spec_id FROM workflow_specs WHERE source_path = ? AND status = 'error'`)
       .get(opts.sourcePath) as { spec_id: string } | undefined;
     if (existing) {
       this.db
