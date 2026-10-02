@@ -226,10 +226,14 @@ def derive_topology_start(root):
     explicit = os.environ.get("OPENRIG_REFOCUS_TOPOLOGY_NODE")
     if explicit:
         return Path(explicit)
+    # A stale session name (one left over from a seat swap) can name a seat that has no folder;
+    # only an existing seat directory is trusted, otherwise `rig whoami` decides.
     seat = canonical_seat(os.environ.get("OPENRIG_SESSION_NAME"))
     if seat:
         member, rig = seat
-        return root / "rigs" / rig / "seats" / member
+        candidate = root / "rigs" / rig / "seats" / member
+        if candidate.is_dir():
+            return candidate
     raw = rig_output("whoami", "--json")
     if not raw:
         return None

@@ -614,11 +614,22 @@ exit 1
         ["member@rig@x", "rigs/rig@x/seats/member"],
         ["human@some-rig", "rigs/some-rig/seats/human"],
       ]) {
+        mkdirSync(join(f.topology, seat), { recursive: true });
         const result = topologyTrace(f, { OPENRIG_SESSION_NAME: session });
         expect(result.status, session).toBe(0);
         expect(result.stdout, session).toContain(`start: ${realpathSync(f.topology)}/${seat}\n`);
         expect(f.calls(), session).not.toContain("whoami --json");
       }
+    });
+
+    it("asks rig whoami once when a canonical session name has no seat folder", () => {
+      const f = fixture();
+      // A stale name left over from a seat swap: canonical, but no such seat exists.
+      const result = topologyTrace(f, { OPENRIG_SESSION_NAME: "builder-v2@demo" });
+      expect(result.status).toBe(0);
+      expect(f.calls().filter((call) => call === "whoami --json")).toHaveLength(1);
+      expect(result.stdout).toContain(`start: ${realpathSync(f.topology)}/rigs/demo/seats/builder\n`);
+      expect(result.stdout).toContain("Builder learned");
     });
 
     it("keeps rig whoami for legacy, malformed, human-class and out-of-charset session names", () => {
