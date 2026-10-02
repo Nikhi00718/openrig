@@ -290,7 +290,7 @@ describe("ClaudeCodeAdapter Context Collector Provisioning", () => {
       "node /old/.openrig/context-collector.cjs /old/ctx /old/prov; ~/bin/my-status.sh",
       "node /old/.openrig/context-collector.cjs /old/ctx /old/prov && ~/bin/my-status.sh",
       "node /old/.openrig/context-collector.cjs /old/ctx /old/prov;~/bin/my-status.sh",
-      "node /old/.openrig/context-collector.cjs /old/ctx /old/prov\n~/bin/my-status.sh",
+      "node /old/.openrig/context-collector.cjs\n~/bin/my-status.sh",
       "node /old/.openrig/context-collector.cjs /old/ctx /old/prov\r\n~/bin/my-status.sh",
       "node /old/.openrig/context-collector.cjs /old/ctx\n~/bin/my-status.sh",
       "node /old/.openrig/context-collector.cjs /old/ctx\r\n~/bin/my-status.sh",

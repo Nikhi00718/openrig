@@ -758,7 +758,8 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
    * status line command (anything but the exact command written below), or a file that does not
    * parse, is left as it is. The collector then never runs for that seat. While a valid sidecar
    * from an earlier collector is retained, context usage (shown as stale once it ages) and Claude
-   * resume-token capture keep using it. Once none exists:
+   * resume-token capture keep using it. That sidecar's session id may belong to an earlier Claude
+   * session, so capture can record an older session id for such a seat. Once none exists:
    * - context usage reads unknown (`missing_sidecar`);
    * - resume-token capture at adoption or handover is skipped (`missing_sidecar`);
    * - its provider-usage row is an explicit unknown (`no_statusline_cache_yet`) unless an earlier
@@ -797,6 +798,8 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     const statusLine = typeof existing["statusLine"] === "object" && existing["statusLine"] !== null
       ? existing["statusLine"] as Record<string, unknown> : {};
     // A user's own status line command wins; only OpenRig's collector command is installed or refreshed.
+    // If this command's shape changes, keep the old shape recognised in isOwnedCollectorCommand, or
+    // seats holding it will never be refreshed.
     const collectorCmd = `node ${collectorDest} ${contextDir} ${providerUsageDir}`;
     const current = statusLine["command"];
     if (typeof current === "string" && current.trim() !== "" && current !== collectorCmd && !isOwnedCollectorCommand(current)) return;
