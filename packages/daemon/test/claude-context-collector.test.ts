@@ -240,6 +240,46 @@ describe("ClaudeCodeAdapter Context Collector Provisioning", () => {
     expect(dirsMade).toContain(join(tmpDir, "state", "provider-usage"));
   });
 
+  // #421: the seat cwd can be a shared repo whose project-local settings other sessions read.
+  describe("project-local settings preservation (#421)", () => {
+    const settingsPath = "/project/.claude/settings.local.json";
+    const deliver = async () => {
+      const adapter = new ClaudeCodeAdapter({ tmux: mockTmux(), fsOps: mockFsOps(), stateDir: tmpDir, collectorAssetPath: "/fake/collector.js" });
+      await adapter.deliverStartup([], { cwd: "/project", tmuxSession: "dev-impl@test", nodeId: "n1" } as any);
+    };
+
+    it("keeps a user's own status line command and the rest of the file", async () => {
+      written[settingsPath] = JSON.stringify({ statusLine: { type: "command", command: "~/bin/my-status.sh", padding: 1 }, permissions: { allow: ["Bash(ls:*)"] } }, null, 2);
+      await deliver();
+      const settings = JSON.parse(written[settingsPath]!);
+      expect(settings.statusLine).toEqual({ type: "command", command: "~/bin/my-status.sh", padding: 1 });
+      expect(settings.permissions).toEqual({ allow: ["Bash(ls:*)"] });
+    });
+
+    it("refreshes a stale OpenRig collector command and keeps other status line keys", async () => {
+      written[settingsPath] = JSON.stringify({ statusLine: { type: "command", command: "node /old/.openrig/context-collector.cjs /old/ctx /old/prov", padding: 2 } });
+      await deliver();
+      const statusLine = JSON.parse(written[settingsPath]!).statusLine;
+      expect(statusLine.command).toBe(`node /project/.openrig/context-collector.cjs ${join(tmpDir, "state", "context-usage")} ${join(tmpDir, "state", "provider-usage")}`);
+      expect(statusLine.padding).toBe(2);
+    });
+
+    it("installs the collector into a status line that has no command", async () => {
+      written[settingsPath] = JSON.stringify({ statusLine: { padding: 3 } });
+      await deliver();
+      const statusLine = JSON.parse(written[settingsPath]!).statusLine;
+      expect(statusLine).toMatchObject({ type: "command", padding: 3 });
+      expect(statusLine.command).toContain("/project/.openrig/context-collector.cjs");
+    });
+
+    it("leaves a settings file it cannot parse byte-for-byte untouched", async () => {
+      const unparseable = '{ "permissions": { "allow": ["Bash(ls:*)"] }, ';
+      written[settingsPath] = unparseable;
+      await deliver();
+      expect(written[settingsPath]).toBe(unparseable);
+    });
+  });
+
   // T5: deliverStartup copies collector script to project
   it("deliverStartup copies collector script to project .openrig/", async () => {
     const adapter = new ClaudeCodeAdapter({
