@@ -179,11 +179,13 @@ export class ResumeMetadataRefresher {
           // (NO probe; never spawns `claude --resume`). Re-derive via the pure-read
           // status-line sidecar and refresh freshness ONLY on an EXACT match to the
           // stored token. Different / absent / parse-error / unreadable → no-op: no
-          // re-stamp and no token clobber (left honest for FR-6 + FR-7).
+          // re-stamp and no token clobber (left honest for FR-6 + FR-7). An equal token in a sample
+          // taken before the pane's current Claude process started is not evidence for it (#421).
           const sidecar = this.contextUsageStore?.readSidecar(session.sessionName);
           if (sidecar?.ok) {
             const derived = sidecar.data.session_id;
-            if (typeof derived === "string" && derived.trim().length > 0 && derived.trim() === session.resumeToken) {
+            if (typeof derived === "string" && derived.trim().length > 0 && derived.trim() === session.resumeToken
+              && !(await isClaudeSidecarFromEarlierProcess(sidecar.data.sampled_at, session.sessionName, this.claudeProcessStartedAt))) {
               this.sessionRegistry.markResumeProbeResult(session.sessionId, "resumable");
             }
           }

@@ -571,6 +571,31 @@ describe("ResumeMetadataRefresher", () => {
       expect(sessionRegistry.updateResumeToken).not.toHaveBeenCalled();
     });
 
+    // #421: an equal token in a sample taken before the pane's current Claude process started is
+    // an earlier process's evidence; it must not refresh the stored token's freshness.
+    it.each([
+      ["does not re-stamp from a sample taken before the process started", -3_600_000, false],
+      ["re-stamps from a sample taken after the process started", 60_000, true],
+    ])("Claude present + equal sidecar derive: %s", async (_label, offsetMs, restamps) => {
+      const processStart = "Fri Oct  2 11:00:00 2026";
+      const sessionRegistry = { updateResumeToken: vi.fn(), markResumeProbeResult: vi.fn() } as unknown as SessionRegistry;
+      const claudeProcessStartedAt = vi.fn(async () => processStart);
+      const refresher = new ResumeMetadataRefresher({
+        sessionRegistry,
+        tmuxAdapter: mockTmux(),
+        contextUsageStore: { readSidecar: () => ({ ok: true as const, data: { session_id: "claude-tok-A", sampled_at: new Date(Date.parse(processStart) + offsetMs).toISOString() } }) },
+        claudeProcessStartedAt,
+        probeClaudeResume: vi.fn(async () => "resumable" as const),
+        sleep: async () => {},
+      });
+      await refresher.refresh([
+        { sessionId: "sess-c", sessionName: "dev-design@demo-rig", runtime: "claude-code", resumeType: null, resumeToken: "claude-tok-A", cwd: "/repo" },
+      ], { fillNullOnly: true });
+      if (restamps) expect(sessionRegistry.markResumeProbeResult).toHaveBeenCalledWith("sess-c", "resumable");
+      else expect(sessionRegistry.markResumeProbeResult).not.toHaveBeenCalled();
+      expect(claudeProcessStartedAt).toHaveBeenCalledWith("dev-design@demo-rig");
+    });
+
     it("Claude present + DIFFERENT sidecar derive → no re-stamp, no probe, no clobber", async () => {
       const sessionRegistry = { updateResumeToken: vi.fn(), markResumeProbeResult: vi.fn() } as unknown as SessionRegistry;
       const probeClaudeResume = vi.fn(async () => "resumable" as const);
