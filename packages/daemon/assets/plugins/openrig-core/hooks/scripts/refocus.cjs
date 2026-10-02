@@ -120,6 +120,33 @@ function deriveWorkStart() {
   }
 }
 
+// The trace script looks up each missing root with its own `rig config get`, two CLI starts
+// inside its 2 s budget. One `rig config --json` read here fills only the roots that are
+// missing, under the config store's own env names, which the script already honours. An
+// explicit nonempty value is never replaced; both present skips the read; a failed or
+// malformed read sets nothing, so the script's own lookup runs exactly as before. Only the
+// two root fields are consumed and nothing from the config is logged.
+function traceEnv() {
+  const env = { ...process.env };
+  const missing = [["OPENRIG_TOPOLOGY_ROOT", "topology"], ["OPENRIG_WORKSPACE_ROOT", "workspace"]]
+    .filter(([name]) => !env[name]);
+  if (missing.length === 0) return env;
+  const result = spawnSync("rig", ["config", "--json"], {
+    encoding: "utf8",
+    env: process.env,
+    timeout: 2_000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) return env;
+  let config;
+  try { config = JSON.parse(result.stdout); } catch { return env; }
+  for (const [name, section] of missing) {
+    const value = config?.[section]?.root;
+    if (typeof value === "string" && value) env[name] = value;
+  }
+  return env;
+}
+
 function renderTrace() {
   const script = path.resolve(__dirname, "../../skills/refocusing/scripts/trace-to-root.py");
   const args = [
@@ -136,7 +163,7 @@ function renderTrace() {
   else if (work.unknown) args.push("--work-unknown", work.unknown);
   const result = spawnSync(process.env.PYTHON || "python3", args, {
     encoding: "utf8",
-    env: process.env,
+    env: traceEnv(),
     timeout: 2_000,
     maxBuffer: 16 * 1024 * 1024,
   });

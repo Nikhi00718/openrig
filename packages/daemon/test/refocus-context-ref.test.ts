@@ -292,7 +292,16 @@ describe("openrig-core refocusing skill — real dual-tree trace", () => {
     writeFileSync(join(workspace, "missions/release/NOTES.md"), "release observation secret\n", "utf8");
     writeFileSync(join(workStart, "NOTES.md"), "feature observation secret\n", "utf8");
     const rig = join(bin, "rig");
+    const callLog = join(root, "rig-calls.log");
+    // Every invocation is logged, so a test can count the rig processes one fire spends.
     writeFileSync(rig, `#!/bin/sh
+printf '%s\\n' "$*" >> "$RIG_CALL_LOG"
+if [ "$1 $2" = "queue whoami" ]; then
+  if [ -n "$RIG_QUEUE_WHOAMI_SLEEP" ]; then exec sleep "$RIG_QUEUE_WHOAMI_SLEEP"; fi
+  printf '%s' "$RIG_QUEUE_WHOAMI_STDOUT"; exit 0
+fi
+if [ "$1 $2" = "config --json" ]; then printf '%s' "$RIG_CONFIG_JSON_STDOUT"; exit "\${RIG_CONFIG_JSON_STATUS:-0}"; fi
+if [ "$1 $2" = "whoami --json" ]; then printf '{"identity":{"rigName":"demo","sessionName":"builder@demo"}}\\n'; exit 0; fi
 if [ "$1 $2 $3" = "config get topology.root" ]; then printf '%s\\n' "$OPENRIG_TEST_TOPOLOGY_ROOT"; exit 0; fi
 if [ "$1 $2 $3" = "config get workspace.root" ]; then printf '%s\\n' "$OPENRIG_TEST_WORKSPACE_ROOT"; exit 0; fi
 if [ "$1 $2" = "scope resolve-notes" ]; then
@@ -308,8 +317,11 @@ exit 1
       PATH: `${bin}:${process.env.PATH || ""}`,
       OPENRIG_TEST_TOPOLOGY_ROOT: topology,
       OPENRIG_TEST_WORKSPACE_ROOT: workspace,
+      RIG_CALL_LOG: callLog,
     };
-    return { topology, workspace, topologyStart, workStart, env };
+    const calls = () => (existsSync(callLog) ? readFileSync(callLog, "utf8").split("\n").filter(Boolean) : []);
+    const resetCalls = () => rmSync(callLog, { force: true });
+    return { topology, workspace, topologyStart, workStart, env, calls, resetCalls };
   }
 
   function trace(args: string[], env: NodeJS.ProcessEnv, cwd?: string) {
@@ -452,6 +464,184 @@ exit 1
     const publicText = [skill, readFileSync(REFOCUS_MD, "utf8"), readFileSync(TRACE, "utf8")].join("\n");
     expect(publicText).not.toMatch(/\/(?:Users|home|private|var|opt)\//);
     expect(publicText).not.toMatch(/v-openrig-build|release-0\.5\.5|qitem-/i);
+  });
+
+  // One fire used to start 7 rig processes on a typed slice: queue whoami, two config gets,
+  // whoami, and one resolver call per level. The hook now reads both roots with one config read
+  // and the script takes a canonical seat from OPENRIG_SESSION_NAME, which leaves 5.
+  describe("rig processes per fire", () => {
+    const typed = (workNodePath: string) =>
+      JSON.stringify({ currentWork: { workNodePath }, currentWorkBasis: "one typed in-progress work node" });
+    const configJson = (topology: unknown, workspace: unknown) => JSON.stringify({
+      daemon: { port: 1 },
+      db: { path: "CONFIG-FIELD-NOT-FOR-OUTPUT" },
+      topology: { root: topology },
+      workspace: { root: workspace },
+    });
+    // Nothing ambient may decide a root, a start or the interpreter.
+    const clean = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => ({
+      ...env,
+      OPENRIG_NODE_ID: undefined,
+      OPENRIG_SESSION_NAME: undefined,
+      OPENRIG_TOPOLOGY_ROOT: undefined,
+      OPENRIG_WORKSPACE_ROOT: undefined,
+      OPENRIG_REFOCUS_TOPOLOGY_NODE: undefined,
+      OPENRIG_REFOCUS_WORK_NODE: undefined,
+      OPENRIG_REFOCUS_TREES: undefined,
+      OPENRIG_REFOCUS_DEPTH: undefined,
+      OPENRIG_REFOCUS_CONTENT_REF: undefined,
+      OPENRIG_REFOCUS_CONTENT_FILE: undefined,
+      PYTHON: undefined,
+    });
+
+    function hook(f: ReturnType<typeof fixture>, env: NodeJS.ProcessEnv = {}) {
+      f.resetCalls();
+      const result = spawnSync(process.execPath, [HOOK, "--runtime", "claude"], {
+        input: JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "refocus-calls" }),
+        encoding: "utf8",
+        env: {
+          ...clean(f.env),
+          OPENRIG_HOME: join(root!, "hook-home"),
+          OPENRIG_SESSION_NAME: "builder@demo",
+          OPENRIG_REFOCUS_NOW: "1",
+          RIG_QUEUE_WHOAMI_STDOUT: typed(f.workStart),
+          RIG_CONFIG_JSON_STDOUT: configJson(f.topology, f.workspace),
+          ...env,
+        },
+      });
+      const context = result.stdout
+        ? (JSON.parse(result.stdout) as { hookSpecificOutput: { additionalContext: string } }).hookSpecificOutput.additionalContext
+        : "";
+      return { ...result, context, calls: f.calls() };
+    }
+
+    const resolverCalls = (f: ReturnType<typeof fixture>, nodes: string[]) =>
+      nodes.map((node) => `scope resolve-notes ${join(realpathSync(f.workspace), node)} --json`);
+
+    it("spends 5 rig processes on a typed fire and 3 on the no-baton fallback", () => {
+      const f = fixture();
+      const typedFire = hook(f);
+      expect(typedFire.status).toBe(0);
+      expect(typedFire.stderr).toBe("");
+      expect(typedFire.context).toContain(`start: ${realpathSync(f.topology)}/rigs/demo/seats/builder\n`);
+      expect(typedFire.context).toContain("Builder learned");
+      expect(typedFire.context).toContain("Deliver refocus");
+      expect(typedFire.context).not.toContain("CONFIG-FIELD-NOT-FOR-OUTPUT");
+      expect(typedFire.calls).toEqual([
+        "queue whoami --json",
+        "config --json",
+        ...resolverCalls(f, ["", "missions/release", "missions/release/slices/feature"]),
+      ]);
+
+      const fallback = hook(f, { RIG_QUEUE_WHOAMI_STDOUT: JSON.stringify({ currentWork: null, currentWorkBasis: NO_BATON }) });
+      expect(fallback.status).toBe(0);
+      expect(fallback.context).toContain(`FALLBACK — no current typed baton (${NO_BATON})`);
+      expect(fallback.context).toContain("Builder learned");
+      expect(fallback.calls).toEqual(["queue whoami --json", "config --json", ...resolverCalls(f, [""])]);
+    });
+
+    it("sets no root from a failed or malformed config read, so the script's own lookup runs as before", () => {
+      const f = fixture();
+      for (const env of [
+        { RIG_CONFIG_JSON_STDOUT: "", RIG_CONFIG_JSON_STATUS: "1" },
+        { RIG_CONFIG_JSON_STDOUT: "not json at all" },
+        { RIG_CONFIG_JSON_STDOUT: configJson(42, null) },
+      ]) {
+        const result = hook(f, env);
+        expect(result.status).toBe(0);
+        expect(result.calls.filter((call) => call.startsWith("config"))).toEqual([
+          "config --json",
+          "config get topology.root",
+          "config get workspace.root",
+        ]);
+        expect(result.context).toContain(`root: ${realpathSync(f.topology)}`);
+        expect(result.context).toContain("Builder learned");
+        expect(result.context).toContain("Deliver refocus");
+      }
+    });
+
+    it("keeps explicit roots, fills only a missing one, and skips the read when both are supplied", () => {
+      const f = fixture();
+      const decoy = join(root!, "decoy-root");
+
+      const both = hook(f, {
+        OPENRIG_TOPOLOGY_ROOT: f.topology,
+        OPENRIG_WORKSPACE_ROOT: f.workspace,
+        RIG_CONFIG_JSON_STDOUT: configJson(decoy, decoy),
+      });
+      expect(both.status).toBe(0);
+      expect(both.calls.filter((call) => call.startsWith("config"))).toEqual([]);
+      expect(both.context).toContain("Builder learned");
+      expect(both.context).toContain("Deliver refocus");
+
+      const partial = hook(f, {
+        OPENRIG_TOPOLOGY_ROOT: f.topology,
+        RIG_CONFIG_JSON_STDOUT: configJson(decoy, f.workspace),
+      });
+      expect(partial.calls.filter((call) => call.startsWith("config"))).toEqual(["config --json"]);
+      expect(partial.context).toContain(`root: ${realpathSync(f.topology)}`);
+      expect(partial.context).toContain("Deliver refocus");
+      expect(partial.context).not.toContain("decoy-root");
+
+      const empty = hook(f, { OPENRIG_TOPOLOGY_ROOT: "", OPENRIG_WORKSPACE_ROOT: f.workspace });
+      expect(empty.calls.filter((call) => call.startsWith("config"))).toEqual(["config --json"]);
+      expect(empty.context).toContain(`root: ${realpathSync(f.topology)}`);
+      expect(empty.context).toContain("Builder learned");
+    });
+
+    // A queue whoami past the hook's 2 s budget must reach the trace as UNKNOWN (#484 review LOW-1).
+    it("passes a queue whoami that outlives its 2 s budget as UNKNOWN to the real trace", () => {
+      const f = fixture();
+      const result = hook(f, { RIG_QUEUE_WHOAMI_SLEEP: "6" });
+      expect(result.status).toBe(0);
+      expect(result.context).toContain(
+        "TRACE GAP — current work node UNKNOWN: queue whoami failed: spawnSync rig ETIMEDOUT",
+      );
+      expect(result.context).not.toContain("Deliver refocus");
+    }, 20_000);
+
+    // Vectors from the daemon's session-name parity set (session-name-parity.test.ts).
+    const topologyTrace = (f: ReturnType<typeof fixture>, env: NodeJS.ProcessEnv, args: string[] = []) => {
+      f.resetCalls();
+      return trace(["--trees", "topology", ...args], { ...clean(f.env), ...env });
+    };
+
+    it("derives the seat start from a canonical session name without asking rig whoami", () => {
+      const f = fixture();
+      for (const [session, seat] of [
+        ["builder@demo", "rigs/demo/seats/builder"],
+        ["dev46-driver2@openrig-delivery", "rigs/openrig-delivery/seats/dev46-driver2"],
+        ["member@rig@x", "rigs/rig@x/seats/member"],
+        ["human@some-rig", "rigs/some-rig/seats/human"],
+      ]) {
+        const result = topologyTrace(f, { OPENRIG_SESSION_NAME: session });
+        expect(result.status, session).toBe(0);
+        expect(result.stdout, session).toContain(`start: ${realpathSync(f.topology)}/${seat}\n`);
+        expect(f.calls(), session).not.toContain("whoami --json");
+      }
+    });
+
+    it("keeps rig whoami for legacy, malformed, human-class and out-of-charset session names", () => {
+      const f = fixture();
+      for (const session of [undefined, "", "r03-worker", "bare", "@rig", "member@", "human@kernel", "human-mvs@host", "mike@external", "seat/x@demo"]) {
+        const result = topologyTrace(f, { OPENRIG_SESSION_NAME: session });
+        expect(result.status, String(session)).toBe(0);
+        expect(f.calls(), String(session)).toContain("whoami --json");
+        expect(result.stdout, String(session)).toContain(`start: ${realpathSync(f.topology)}/rigs/demo/seats/builder\n`);
+      }
+    });
+
+    it("lets an explicit topology start win over the session name", () => {
+      const f = fixture();
+      const explicit = join(f.topology, "rigs/demo");
+      const flag = topologyTrace(f, { OPENRIG_SESSION_NAME: "other@elsewhere" }, ["--topology-start", explicit]);
+      expect(flag.stdout).toContain(`start: ${explicit}\n`);
+      expect(f.calls()).not.toContain("whoami --json");
+
+      const env = topologyTrace(f, { OPENRIG_SESSION_NAME: "other@elsewhere", OPENRIG_REFOCUS_TOPOLOGY_NODE: explicit });
+      expect(env.stdout).toContain(`start: ${explicit}\n`);
+      expect(f.calls()).not.toContain("whoami --json");
+    });
   });
 });
 
