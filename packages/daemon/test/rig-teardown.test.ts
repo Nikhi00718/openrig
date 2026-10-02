@@ -251,9 +251,97 @@ describe("RigTeardownOrchestrator", () => {
 
     const result = await td.teardown(rigId, { delete: true });
 
-    expect(result.sessionsKilled).toBe(1);
+    expect(result.sessionsKilled).toBe(0);
     expect(result.deleted).toBe(true);
     expect(result.errors).toHaveLength(0);
+  });
+
+  it("deletes a failed launch whose recorded session is absent without asking the guard to kill it", async () => {
+    const { rigId, nodeId } = seedRig();
+    sessionRegistry.updateBinding(nodeId, { tmuxSession: "r01-dev" });
+    const tmux = mockTmux({ ok: false, code: "guard_target_unknown", message: "ambiguous target" });
+    tmux.probeSession = vi.fn(async () => ({ state: "absent" }));
+
+    const result = await buildTeardown(tmux).teardown(rigId, { delete: true });
+
+    expect(result.deleted).toBe(true);
+    expect(result.deleteBlocked).toBe(false);
+    expect(tmux.killSession).not.toHaveBeenCalled();
+    expect(rigRepo.getRig(rigId)).toBeNull();
+  });
+
+  it("deletes an archived duplicate without killing the live rig's same-name session", async () => {
+    const stale = seedRig();
+    sessionRegistry.updateBinding(stale.nodeId, { tmuxSession: "r01-dev" });
+    rigRepo.archiveRig(stale.rigId);
+    const liveRig = rigRepo.createRig("test-rig");
+    const liveNode = rigRepo.addNode(liveRig.id, "dev");
+    const liveSession = sessionRegistry.registerSession(liveNode.id, "r01-dev");
+    sessionRegistry.updateStatus(liveSession.id, "running");
+    sessionRegistry.updateBinding(liveNode.id, { tmuxSession: "r01-dev" });
+    db.prepare("UPDATE nodes SET runtime = 'claude-code', cwd = ? WHERE id IN (?, ?)")
+      .run(tmpDir, stale.nodeId, liveNode.id);
+    const guidance = path.join(tmpDir, "CLAUDE.md");
+    fs.writeFileSync(guidance, "<!-- BEGIN OpenRig MANAGED BLOCK: role -->\nlive guidance\n<!-- END OpenRig MANAGED BLOCK: role -->\n");
+    const tmux = mockTmux({ ok: false, code: "guard_target_unknown", message: "owned by live rig" });
+    tmux.probeSession = vi.fn(async () => ({ state: "present" }));
+
+    const result = await buildTeardown(tmux).teardown(stale.rigId, { delete: true });
+
+    expect(result.deleted).toBe(true);
+    expect(tmux.killSession).not.toHaveBeenCalled();
+    expect(rigRepo.getRig(liveRig.id)).not.toBeNull();
+    expect(sessionRegistry.getSessionsForRig(liveRig.id)[0]?.status).toBe("running");
+    expect(sessionRegistry.getBindingForNode(liveNode.id)?.tmuxSession).toBe("r01-dev");
+    expect(fs.readFileSync(guidance, "utf-8")).toContain("live guidance");
+  });
+
+  it("keeps the rig when tmux cannot confirm whether a session is absent", async () => {
+    const { rigId } = seedRig();
+    const tmux = mockTmux();
+    tmux.probeSession = vi.fn(async () => ({ state: "transport_unavailable", cause: "permission denied" }));
+
+    const result = await buildTeardown(tmux).teardown(rigId, { delete: true });
+
+    expect(result.deleteBlocked).toBe(true);
+    expect(tmux.killSession).not.toHaveBeenCalled();
+    expect(rigRepo.getRig(rigId)).not.toBeNull();
+  });
+
+  it("preserves guidance shared with a live rig under a different name", async () => {
+    const stale = seedRig();
+    sessionRegistry.updateStatus(stale.sessionId, "exited");
+    rigRepo.archiveRig(stale.rigId);
+    const live = rigRepo.createRig("other-name");
+    const liveNode = rigRepo.addNode(live.id, "dev");
+    db.prepare("UPDATE nodes SET runtime = 'claude-code', cwd = ? WHERE id IN (?, ?)")
+      .run(tmpDir, stale.nodeId, liveNode.id);
+    const guidance = path.join(tmpDir, "CLAUDE.md");
+    fs.writeFileSync(guidance, "<!-- BEGIN OpenRig MANAGED BLOCK: role -->\nlive guidance\n<!-- END OpenRig MANAGED BLOCK: role -->\n");
+
+    const result = await buildTeardown().teardown(stale.rigId, { delete: true });
+
+    expect(result.deleted).toBe(true);
+    expect(fs.readFileSync(guidance, "utf-8")).toContain("live guidance");
+  });
+
+  it("removes stale guidance when a same-name rig uses a different path", async () => {
+    const stale = seedRig();
+    sessionRegistry.updateStatus(stale.sessionId, "exited");
+    rigRepo.archiveRig(stale.rigId);
+    const live = rigRepo.createRig("test-rig");
+    const liveNode = rigRepo.addNode(live.id, "dev");
+    db.prepare("UPDATE nodes SET runtime = 'claude-code', cwd = ? WHERE id = ?")
+      .run(tmpDir, stale.nodeId);
+    db.prepare("UPDATE nodes SET runtime = 'claude-code', cwd = ? WHERE id = ?")
+      .run(path.join(tmpDir, "other"), liveNode.id);
+    const guidance = path.join(tmpDir, "CLAUDE.md");
+    fs.writeFileSync(guidance, "<!-- BEGIN OpenRig MANAGED BLOCK: role -->\nstale guidance\n<!-- END OpenRig MANAGED BLOCK: role -->\n");
+
+    const result = await buildTeardown().teardown(stale.rigId, { delete: true });
+
+    expect(result.deleted).toBe(true);
+    expect(fs.existsSync(guidance)).toBe(false);
   });
 
   it("removes only OpenRig-managed blocks and preserves user + third-party content", async () => {

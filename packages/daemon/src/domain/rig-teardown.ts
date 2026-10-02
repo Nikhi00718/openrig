@@ -10,6 +10,7 @@ import fs from "node:fs";
 import nodePath from "node:path";
 import { removeManagedBlocksFromFile, DEFAULT_CLAUDE_MANAGED_BLOCK_FILE } from "./managed-blocks.js";
 import { stopTranscriptRotation } from "./transcript-rotation.js";
+import { findOtherSessionOwner } from "./session-owner.js";
 
 export interface TeardownResult {
   rigId: string;
@@ -81,13 +82,17 @@ export class RigTeardownOrchestrator {
       rigId, sessionsKilled: 0, snapshotId: null,
       deleted: false, deleteBlocked: false, alreadyStopped: false, errors: [],
     };
+    const archived = this.db.prepare("SELECT archived_at FROM rigs WHERE id = ?").get(rigId) as { archived_at: string | null };
+    const liveGuidanceTargets = archived.archived_at !== null
+      ? this.liveGuidanceTargets(rigId)
+      : new Set<string>();
 
     // 2. Get latest session per node
     const liveSessions = this.getLatestLiveSessions(rigId);
 
     // 3. Check if already stopped
     if (liveSessions.length === 0) {
-      this.cleanupManagedGuidanceFiles(rigId);
+      this.cleanupManagedGuidanceFiles(rigId, liveGuidanceTargets);
       result.alreadyStopped = true;
       // Still tear down services even if no agent sessions are running
       if (this.deps.serviceOrchestrator) {
@@ -123,23 +128,47 @@ export class RigTeardownOrchestrator {
     // 5. Kill each live session
     let killFailures = 0;
     for (const session of liveSessions) {
-      const killResult = await this.deps.tmuxAdapter.killSession(session.sessionName);
+      // An archived rig may retain a stale row for a name now owned by a live rig.
+      // That name cannot identify the archived rig's tmux session for a kill.
+      const ownedByAnotherRig = archived.archived_at !== null && findOtherSessionOwner(
+        this.db, session.sessionName, session.nodeId, { ignoreArchived: true },
+      ) !== null;
+      let absent = ownedByAnotherRig;
+      if (!absent && this.deps.tmuxAdapter.probeSession) {
+        try {
+          const probe = await this.deps.tmuxAdapter.probeSession(session.sessionName);
+          absent = probe.state === "absent" ||
+            (probe.state === "transport_unavailable" && probe.cause?.includes("no server running") === true);
+          if (probe.state !== "present" && !absent) {
+            result.errors.push(`Could not confirm session '${session.sessionName}' is absent: ${probe.state === "transport_unavailable" ? probe.cause : probe.state}`);
+            killFailures++;
+            continue;
+          }
+        } catch (err) {
+          result.errors.push(`Could not check session '${session.sessionName}': ${(err as Error).message}`);
+          killFailures++;
+          continue;
+        }
+      }
+      const killResult = absent ? { ok: false, code: "session_not_found" } :
+        await this.deps.tmuxAdapter.killSession(session.sessionName);
 
       if (killResult.ok || (killResult as { code?: string }).code === "session_not_found") {
         // Stop capture only when termination is confirmed. A failed kill leaves
-        // the session running, so its existing transcript rotation must survive.
-        stopTranscriptRotation(session.sessionName);
+        // the session running. An archived namesake leaves the live owner's
+        // rotation intact even when its stale row is removed.
+        if (!ownedByAnotherRig) stopTranscriptRotation(session.sessionName);
         // Success or already gone — update DB atomically
         this.atomicNodeCleanup(session);
-        this.cleanupManagedGuidanceFileForNode(rigId, session.runtime, session.cwd);
-        result.sessionsKilled++;
+        this.cleanupManagedGuidanceFileForNode(rigId, session.runtime, session.cwd, liveGuidanceTargets);
+        if (killResult.ok) result.sessionsKilled++;
       } else {
         // Real kill failure — don't update this node
         result.errors.push(`Kill failed for session '${session.sessionName}': ${(killResult as { message?: string }).message ?? "unknown"}`);
         killFailures++;
       }
     }
-    this.cleanupManagedGuidanceFiles(rigId);
+    this.cleanupManagedGuidanceFiles(rigId, liveGuidanceTargets);
 
     // 5b. Tear down services if they exist
     if (this.deps.serviceOrchestrator) {
@@ -207,30 +236,54 @@ export class RigTeardownOrchestrator {
     return this.deps.sessionRegistry.getLatestLiveSessions(rigId);
   }
 
-  private cleanupManagedGuidanceFiles(rigId: string): void {
+  private liveGuidanceTargets(rigId: string): Set<string> {
+    const rows = this.db.prepare(`
+      SELECT n.rig_id, n.runtime, n.cwd FROM nodes n
+      JOIN rigs r ON r.id = n.rig_id
+      WHERE r.archived_at IS NULL AND r.id <> ? AND n.cwd IS NOT NULL
+    `).all(rigId) as Array<{ rig_id: string; runtime: string | null; cwd: string }>;
+    const targets = new Set<string>();
+    for (const row of rows) {
+      const target = this.guidanceTargetPath(row.rig_id, row.runtime, row.cwd);
+      if (target) targets.add(this.guidancePathKey(target));
+    }
+    return targets;
+  }
+
+  private cleanupManagedGuidanceFiles(rigId: string, liveGuidanceTargets: ReadonlySet<string>): void {
     const rows = this.db.prepare(`
       SELECT DISTINCT runtime, cwd
       FROM nodes
       WHERE rig_id = ?
     `).all(rigId) as Array<{ runtime: string | null; cwd: string | null }>;
     for (const row of rows) {
-      this.cleanupManagedGuidanceFileForNode(rigId, row.runtime, row.cwd);
+      this.cleanupManagedGuidanceFileForNode(rigId, row.runtime, row.cwd, liveGuidanceTargets);
     }
   }
 
-  private cleanupManagedGuidanceFileForNode(rigId: string, runtime: string | null, cwd: string | null): void {
+  private guidanceTargetPath(rigId: string, runtime: string | null, cwd: string | null): string | null {
     if (!runtime || !cwd) {
-      return;
+      return null;
     }
     // #25: clean only the rig's selected Claude file; the other file is never touched.
-    const targetPath = runtime === "claude-code"
+    return runtime === "claude-code"
       ? nodePath.join(cwd, this.deps.rigRepo.getRigClaudeManagedBlockFile(rigId) ?? DEFAULT_CLAUDE_MANAGED_BLOCK_FILE)
       : runtime === "codex"
         ? nodePath.join(cwd, "AGENTS.md")
         : null;
+  }
+
+  private guidancePathKey(path: string): string {
+    const normalized = nodePath.resolve(path);
+    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+  }
+
+  private cleanupManagedGuidanceFileForNode(rigId: string, runtime: string | null, cwd: string | null, liveGuidanceTargets: ReadonlySet<string>): void {
+    const targetPath = this.guidanceTargetPath(rigId, runtime, cwd);
     if (!targetPath) {
       return;
     }
+    if (liveGuidanceTargets.has(this.guidancePathKey(targetPath))) return;
     removeManagedBlocksFromFile({
       exists: (path) => fs.existsSync(path),
       readFile: (path) => fs.readFileSync(path, "utf-8"),

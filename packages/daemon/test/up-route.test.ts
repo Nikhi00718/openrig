@@ -74,6 +74,21 @@ describe("Up API route", () => {
     expect(body.error).toContain("not found");
   });
 
+  it("does not let an archived namesake make a live rig name ambiguous", async () => {
+    const archived = rigRepo.createRig("restore-name");
+    rigRepo.archiveRig(archived.id);
+    rigRepo.createRig("restore-name");
+
+    const res = await app.request("/api/up", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceRef: "restore-name" }),
+    });
+
+    expect(res.status).toBe(404);
+    expect((await res.json()).code).toBe("no_snapshot");
+  });
+
   // T6: Startup wiring
   it("createDaemon wires /api/up route", async () => {
     db.close();
