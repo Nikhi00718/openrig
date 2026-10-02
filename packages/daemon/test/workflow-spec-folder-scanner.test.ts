@@ -18,6 +18,7 @@ import { workflowSpecsDiagnosticSchema } from "../src/db/migrations/040_workflow
 import { WorkflowSpecCache } from "../src/domain/workflow-spec-cache.js";
 import { scanWorkflowSpecFolder } from "../src/domain/spec-library-workflow-scanner.js";
 import { EventBus } from "../src/domain/event-bus.js";
+import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 
 const VALID_YAML = `workflow:
   id: folder-test
@@ -382,10 +383,70 @@ describe("scanWorkflowSpecFolder: parse error and repair with several cached ver
     expect(rowsForFile()).toEqual([{ spec_id: original!.spec_id, version: "1", status: "valid" }]);
   });
 
+  it("skips a file restored to its cached bytes on the scan after the repair", () => {
+    scanAfterWriting(versioned("1"));
+    scanAfterWriting(BROKEN);
+    expect(scanAfterWriting(versioned("1")).valid).toBe(1);
+    expect(scanAfterWriting()).toMatchObject({ skipped: 1, valid: 0 });
+  });
+
   it("still skips an unchanged broken file on the next scan", () => {
     scanAfterWriting(versioned("1"));
     scanAfterWriting(versioned("2"));
     scanAfterWriting(BROKEN);
     expect(scanAfterWriting()).toMatchObject({ skipped: 1, errors: 0 });
+  });
+});
+
+// Installs upgraded from a release whose diagnostic writer blanked a cached version's columns
+// but kept its spec_json. That row is the only surviving copy of the older version (#503).
+describe("scanWorkflowSpecFolder: an older version damaged by the previous diagnostic writer", () => {
+  let db: Database.Database;
+  let cache: WorkflowSpecCache;
+  let folder: string;
+  let file: string;
+  let tick: number;
+  const base = Math.floor(Date.now() / 1000) - 1000;
+  const v1 = VALID_YAML.replace("A folder-scan fixture", "version one");
+  const v2 = VALID_YAML.replace("version: '1'", "version: '2'").replace("A folder-scan fixture", "version two");
+  const scanAfterWriting = (content: string) => {
+    writeFileSync(file, content);
+    tick += 10;
+    utimesSync(file, base + tick, base + tick);
+    return scanWorkflowSpecFolder({ db, cache, folder, builtinDir: null });
+  };
+
+  beforeEach(() => {
+    db = createDb();
+    migrate(db, ALL_MIGRATIONS);
+    tick = 0;
+    cache = new WorkflowSpecCache(db, () => new Date((base + tick + 1) * 1000));
+    folder = mkdtempSync(join(tmpdir(), "wf-folder-legacy-"));
+    file = join(folder, "wf.yaml");
+  });
+  afterEach(() => {
+    db.close();
+    rmSync(folder, { recursive: true, force: true });
+  });
+
+  it("keeps the damaged row, its spec ID and its full stored spec through a repair", () => {
+    scanAfterWriting(v1);
+    scanAfterWriting(v2);
+    const original = cache.getByNameVersion("folder-test", "1")!;
+    const storedSpec = () => (db.prepare("SELECT spec_json FROM workflow_specs WHERE spec_id = ?").get(original.specId) as { spec_json: string } | undefined)?.spec_json;
+    const storedBefore = storedSpec();
+    expect(storedBefore).toBeTruthy();
+    // The previous writer's in-place rewrite of the oldest row for the path (spec_json untouched).
+    db.prepare(
+      `UPDATE workflow_specs SET status = 'error', error_message = 'old parse error', name = 'wf.yaml', version = '',
+         purpose = NULL, target_rig = NULL, roles_json = '{}', steps_json = '[]', coordination_terminal_turn_rule = 'hot_potato'
+       WHERE spec_id = ?`,
+    ).run(original.specId);
+
+    expect(scanAfterWriting(v2).valid).toBe(1);
+
+    expect(storedSpec()).toBe(storedBefore);
+    expect(cache.getByIdOrThrow(original.specId).spec.objective).toBe("version one");
+    expect(cache.getByNameVersion("folder-test", "2")?.spec.objective).toBe("version two");
   });
 });

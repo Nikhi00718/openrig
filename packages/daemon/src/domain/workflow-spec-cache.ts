@@ -583,18 +583,28 @@ export class WorkflowSpecCache {
       .get(spec.id, spec.version) as SpecRow | undefined;
     // Diagnostic names are filename fallbacks, not parsed workflow identities.
     // Recover the owning source row in place once that file parses again.
+    // An error row that still holds a stored spec was a cached version blanked by an earlier
+    // diagnostic writer: it is the only copy of that version, so it is never reused or removed
+    // here (#503). Only rows with no stored spec are diagnostic-only.
+    const diagnosticOnly = `status = 'error'${this.hasSpecJsonColumn ? " AND spec_json IS NULL" : ""}`;
     const diagnostic = !named && this.hasDiagnosticColumns
-      ? this.db.prepare("SELECT * FROM workflow_specs WHERE source_path = ? AND status = 'error'").get(sourcePath) as SpecRow | undefined
+      ? this.db.prepare(`SELECT * FROM workflow_specs WHERE source_path = ? AND ${diagnosticOnly}`).get(sourcePath) as SpecRow | undefined
       : undefined;
     const existing = named ?? diagnostic;
-    // A successful parse supersedes this file's diagnostic rows. Only diagnostic-only rows
-    // (status error, no version) are removed; a versioned row may still back running work (#503).
-    if (this.hasDiagnosticColumns) {
-      this.db
-        .prepare(`DELETE FROM workflow_specs WHERE source_path = ? AND status = 'error' AND version = '' AND spec_id != ?`)
-        .run(sourcePath, existing?.spec_id ?? "");
-    }
+    // A successful parse supersedes this file's diagnostic-only rows (#503). A versioned row may
+    // still back running work and is never touched here.
+    const cleared = this.hasDiagnosticColumns
+      ? this.db
+        .prepare(`DELETE FROM workflow_specs WHERE source_path = ? AND ${diagnosticOnly} AND version = '' AND spec_id != ?`)
+        .run(sourcePath, existing?.spec_id ?? "").changes
+      : 0;
     if (existing && existing.status !== "error" && existing.source_hash === sourceHash) {
+      // A repair back to the cached bytes records this scan, so the next scan skips the file.
+      if (cleared > 0) {
+        const repairedAt = this.now().toISOString();
+        this.db.prepare(`UPDATE workflow_specs SET cached_at = ? WHERE spec_id = ?`).run(repairedAt, existing.spec_id);
+        existing.cached_at = repairedAt;
+      }
       // readThrough is file-authoritative: return the freshly parsed
       // file spec so validation sees non-column metadata such as
       // workflow.entry and workflow.invariants.
