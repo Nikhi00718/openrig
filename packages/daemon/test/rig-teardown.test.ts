@@ -380,6 +380,43 @@ describe("RigTeardownOrchestrator", () => {
     expect(fs.readFileSync(guidance, "utf-8")).toContain("live guidance");
   });
 
+  it.each([
+    ["claude-code", "CLAUDE.md"],
+    ["claude-code", "CLAUDE.local.md"],
+    ["codex", "AGENTS.md"],
+  ])("preserves %s guidance created while teardown probes tmux (%s)", async (runtime, fileName) => {
+    const stale = seedRigWithNode({ runtime, cwd: tmpDir });
+    rigRepo.archiveRig(stale.rigId);
+    const live = rigRepo.createRig("live-name");
+    rigRepo.addNode(live.id, "dev", { runtime, cwd: tmpDir });
+    if (fileName === "CLAUDE.local.md") {
+      rigRepo.setRigClaudeManagedBlockFile(stale.rigId, fileName);
+      rigRepo.setRigClaudeManagedBlockFile(live.id, fileName);
+    }
+    const guidance = path.join(tmpDir, fileName);
+    expect(fs.existsSync(guidance)).toBe(false);
+    let probeEntered!: () => void;
+    let resumeProbe!: () => void;
+    const entered = new Promise<void>((resolve) => { probeEntered = resolve; });
+    const resume = new Promise<void>((resolve) => { resumeProbe = resolve; });
+    const tmux = mockTmux();
+    tmux.probeSession = vi.fn(async () => {
+      probeEntered();
+      await resume;
+      return { state: "absent" } as const;
+    });
+
+    const teardown = buildTeardown(tmux).teardown(stale.rigId, { delete: true });
+    await entered;
+    fs.writeFileSync(guidance, "<!-- BEGIN OpenRig MANAGED BLOCK: role -->\nlive guidance\n<!-- END OpenRig MANAGED BLOCK: role -->\n");
+    resumeProbe();
+    const result = await teardown;
+
+    expect(result.deleted).toBe(true);
+    expect(tmux.killSession).not.toHaveBeenCalled();
+    expect(fs.readFileSync(guidance, "utf-8")).toContain("live guidance");
+  });
+
   it("preserves guidance shared through a case alias on a case-insensitive volume", async () => {
     const realCwd = path.join(tmpDir, "Workspace");
     const caseAlias = path.join(tmpDir, "workspace");

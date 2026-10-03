@@ -83,7 +83,9 @@ export class RigTeardownOrchestrator {
       deleted: false, deleteBlocked: false, alreadyStopped: false, errors: [],
     };
     const archived = this.db.prepare("SELECT archived_at FROM rigs WHERE id = ?").get(rigId) as { archived_at: string | null };
-    const liveGuidanceTargets = archived.archived_at !== null
+    // A live seat can create its guidance while teardown awaits tmux. Resolve
+    // file identities only after those waits, immediately before each cleanup.
+    const currentLiveGuidanceTargets = () => archived.archived_at !== null
       ? this.liveGuidanceTargets(rigId)
       : new Set<string>();
 
@@ -92,7 +94,7 @@ export class RigTeardownOrchestrator {
 
     // 3. Check if already stopped
     if (liveSessions.length === 0) {
-      this.cleanupManagedGuidanceFiles(rigId, liveGuidanceTargets);
+      this.cleanupManagedGuidanceFiles(rigId, currentLiveGuidanceTargets());
       result.alreadyStopped = true;
       // Still tear down services even if no agent sessions are running
       if (this.deps.serviceOrchestrator) {
@@ -161,7 +163,7 @@ export class RigTeardownOrchestrator {
         if (!ownedByAnotherRig) stopTranscriptRotation(session.sessionName);
         // Success or already gone — update DB atomically
         this.atomicNodeCleanup(session);
-        this.cleanupManagedGuidanceFileForNode(rigId, session.runtime, session.cwd, liveGuidanceTargets);
+        this.cleanupManagedGuidanceFileForNode(rigId, session.runtime, session.cwd, currentLiveGuidanceTargets());
         if (killResult.ok) result.sessionsKilled++;
       } else {
         // Real kill failure — don't update this node
@@ -169,7 +171,7 @@ export class RigTeardownOrchestrator {
         killFailures++;
       }
     }
-    this.cleanupManagedGuidanceFiles(rigId, liveGuidanceTargets);
+    this.cleanupManagedGuidanceFiles(rigId, currentLiveGuidanceTargets());
 
     // 5b. Tear down services if they exist
     if (this.deps.serviceOrchestrator) {
