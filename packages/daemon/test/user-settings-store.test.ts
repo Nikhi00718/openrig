@@ -254,6 +254,20 @@ describe("SettingsStore (User Settings v0)", () => {
     }
   });
 
+  it("falls back from an invalid readiness env value to the file value, then the default", () => {
+    const store = new SettingsStore(configPath);
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      process.env["OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS"] = "0";
+      expect(store.resolveOne("runtime.readiness_timeout_seconds")).toMatchObject({ value: 30, source: "default" });
+      store.set("runtime.readiness_timeout_seconds", "45");
+      expect(store.resolveOne("runtime.readiness_timeout_seconds")).toMatchObject({ value: 45, source: "file" });
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("env override for runtime.readiness_timeout_seconds rejected"));
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
   it("queue integer settings reject partial and fractional strings", () => {
     const store = new SettingsStore(configPath);
     for (const key of [

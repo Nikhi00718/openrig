@@ -307,6 +307,26 @@ describe("SuccessorSessionLauncher", () => {
       expect(Date.now()).toBe(45_000);
     });
 
+    it("falls back to the 30-second window with a warning when the settings read throws", async () => {
+      checkReady.mockImplementation(async () => ({ ready: Date.now() >= 20_000 }));
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const readinessSettings = {
+        resolveOne: () => { throw new Error("config.json is not valid JSON"); },
+      } as unknown as Pick<SettingsStore, "resolveOne">;
+
+      try {
+        const res = await timedLauncher(undefined, readinessSettings).createSuccessor({
+          node: { id: "n", runtime: "codex", cwd: "/w" }, departingSessionName: "a@r",
+        });
+
+        expect(res.ok).toBe(true);
+        expect(Date.now()).toBe(30_000);
+        expect(stderr).toHaveBeenCalledWith(expect.stringContaining("falling back to 30s default"));
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+
     it("accepts a successor ready after 20 seconds within the 30-second allowance", async () => {
       checkReady.mockImplementation(async () => ({ ready: Date.now() >= 20_000 }));
 
@@ -329,7 +349,7 @@ describe("SuccessorSessionLauncher", () => {
 
       expect(Date.now()).toBe(30_000);
       expect(probeTimes).toEqual([0, 1000, 3000, 7000, 15_000, 30_000]);
-      expect(res).toMatchObject({ ok: false, step: "start_agent", code: "successor_not_ready", message: "Successor did not become a ready agent: still starting at deadline" });
+      expect(res).toMatchObject({ ok: false, step: "start_agent", code: "successor_not_ready", message: "Successor did not become a ready agent: readiness timeout after 30s: still starting at deadline" });
       expect(discoveryRepo.listDiscovered()).toHaveLength(0);
       expect(killSession).not.toHaveBeenCalled();
     });

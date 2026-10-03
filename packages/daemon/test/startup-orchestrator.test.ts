@@ -1219,6 +1219,26 @@ describe("StartupOrchestrator", () => {
       expect(await pending).toMatchObject({ ok: true, startupStatus: "ready" });
     });
 
+    it("falls back to the 30-second window with a warning when the settings read throws", async () => {
+      const seed = seedSession();
+      const started = Date.now();
+      const adapter = mockAdapter({ checkReady: vi.fn(async () => ({ ready: Date.now() - started >= 20_000 })) });
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const readinessSettings = {
+        resolveOne: () => { throw new Error("config.json is not valid JSON"); },
+      } as unknown as Pick<SettingsStore, "resolveOne">;
+
+      try {
+        const pending = createOrchestrator({ readinessSettings }).startNode(makeInput(seed, { adapter }));
+        await vi.advanceTimersByTimeAsync(30_000);
+
+        expect(await pending).toMatchObject({ ok: true, startupStatus: "ready" });
+        expect(stderr).toHaveBeenCalledWith(expect.stringContaining("falling back to 30s default"));
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+
     it.each([20_000, 30_000])("accepts readiness at %i ms within the 30-second budget", async (readyAfterMs) => {
       const seed = seedSession();
       const started = Date.now();

@@ -404,7 +404,7 @@ export class SuccessorSessionLauncher {
 
       const remaining = timeoutMs - (Date.now() - startTime);
       if (remaining <= 0) {
-        return { ready: false, reason: result.reason ?? "readiness timeout" };
+        return { ready: false, reason: `readiness timeout after ${timeoutMs / 1000}s: ${result.reason ?? "harness did not become interactive"}` };
       }
 
       await this.sleep(Math.min(delay, remaining));
