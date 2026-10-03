@@ -110,10 +110,9 @@ export interface RiggedConfig {
       auditLog: boolean;
     };
   };
-  // plugin-primitive Phase 3a slice 3.5 — runtime feature flags. Currently
-  // single-flag for Codex; extracts to its own primitive workspace if/when
-  // 3+ flags accumulate (per DESIGN.md §5.8).
+  // Runtime launch settings and the Codex hooks feature flag.
   runtime: {
+    readinessTimeoutSeconds: number;
     codex: {
       hooksEnabled: boolean;
     };
@@ -274,8 +273,9 @@ const DEFAULTS = {
       auditLog: false,
     },
   },
-  // plugin-primitive Phase 3a slice 3.5 — Codex feature flag default ON.
+  // Runtime readiness keeps the existing 30-second default; Codex hooks stay on.
   runtime: {
+    readinessTimeoutSeconds: 30,
     codex: {
       hooksEnabled: true,
     },
@@ -397,6 +397,7 @@ export const VALID_KEYS = [
   "feed.subscriptions.audit_log",
   // plugin-primitive Phase 3a slice 3.5 — Codex feature flag.
   "runtime.codex.hooks_enabled",
+  "runtime.readiness_timeout_seconds",
   // Slice 27 — Claude auto-compaction policy. SC-29 EXCEPTION #10:
   // 7 ConfigStore keys (lockstep with daemon SETTINGS_VALID_KEYS).
   "policies.claude_compaction.enabled",
@@ -491,6 +492,7 @@ export const ENV_MAP: Record<ValidKey, { primary: string; legacy?: string }> = {
   // Net-new key post-rename: OPENRIG_X primary only per the 5-key
   // boundary doctrine (no RIGGED_X legacy on net-new keys).
   "runtime.codex.hooks_enabled": { primary: "OPENRIG_RUNTIME_CODEX_HOOKS_ENABLED" },
+  "runtime.readiness_timeout_seconds": { primary: "OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS" },
   // Slice 27 — Claude auto-compaction policy. OPENRIG_X primary only
   // (net-new keys, no legacy).
   "policies.claude_compaction.enabled": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_ENABLED" },
@@ -570,6 +572,7 @@ const KEY_TO_PATH: Record<ValidKey, string[]> = {
   "feed.subscriptions.progress": ["feed", "subscriptions", "progress"],
   "feed.subscriptions.audit_log": ["feed", "subscriptions", "auditLog"],
   "runtime.codex.hooks_enabled": ["runtime", "codex", "hooksEnabled"],
+  "runtime.readiness_timeout_seconds": ["runtime", "readinessTimeoutSeconds"],
   "policies.claude_compaction.enabled": ["policies", "claudeCompaction", "enabled"],
   "policies.claude_compaction.threshold_percent": ["policies", "claudeCompaction", "thresholdPercent"],
   "policies.claude_compaction.pre_compact_instruction": ["policies", "claudeCompaction", "preCompactInstruction"],
@@ -779,6 +782,11 @@ const KEY_CONSTRAINTS: Partial<Record<ValidKey, (raw: string, coerced: string | 
   "transcripts.poll_interval_seconds": (raw, value) => {
     if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 3600) {
       throw new Error("Invalid transcripts.poll_interval_seconds: must be an integer in [1, 3600]");
+    }
+  },
+  "runtime.readiness_timeout_seconds": (raw, coerced) => {
+    if (!/^\d+$/.test(raw.trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1 || coerced > 600) {
+      throw new Error(`Invalid value for runtime.readiness_timeout_seconds: must be an integer in [1, 600], got "${raw}"`);
     }
   },
   "ui.timezone": (_raw, value) => {
@@ -1096,6 +1104,7 @@ export class ConfigStore {
         },
       },
       runtime: {
+        readinessTimeoutSeconds: v("runtime.readiness_timeout_seconds") as number,
         codex: {
           hooksEnabled: v("runtime.codex.hooks_enabled") as boolean,
         },

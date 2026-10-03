@@ -6,6 +6,7 @@ import { SuccessorSessionLauncher } from "../src/domain/successor-session-launch
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import type { TmuxOptionDefaultsApplier } from "../src/domain/tmux-option-defaults.js";
+import type { SettingsStore } from "../src/domain/user-settings/settings-store.js";
 
 describe("SuccessorSessionLauncher", () => {
   let db: Database.Database;
@@ -282,14 +283,29 @@ describe("SuccessorSessionLauncher", () => {
 
     afterEach(() => vi.useRealTimers());
 
-    function timedLauncher(timeoutMs = 30_000): SuccessorSessionLauncher {
+    function timedLauncher(timeoutMs?: number, readinessSettings?: Pick<SettingsStore, "resolveOne">): SuccessorSessionLauncher {
       const tmux = { createSession, listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
       return new SuccessorSessionLauncher(tmux, discoveryRepo, {
         runtimeAdapters: { codex: fakeAdapter("codex") },
-        readinessTimeoutMs: timeoutMs,
+        readinessTimeoutMs: timeoutMs ?? (readinessSettings ? undefined : 30_000),
+        readinessSettings,
         sleep: async (ms) => { vi.setSystemTime(Date.now() + ms); },
       });
     }
+
+    it("uses the configured window for successor readiness", async () => {
+      checkReady.mockImplementation(async () => ({ ready: Date.now() >= 40_000 }));
+      const readinessSettings = {
+        resolveOne: () => ({ value: 45, source: "file", defaultValue: 30 }),
+      } as unknown as Pick<SettingsStore, "resolveOne">;
+
+      const res = await timedLauncher(undefined, readinessSettings).createSuccessor({
+        node: { id: "n", runtime: "codex", cwd: "/w" }, departingSessionName: "a@r",
+      });
+
+      expect(res.ok).toBe(true);
+      expect(Date.now()).toBe(45_000);
+    });
 
     it("accepts a successor ready after 20 seconds within the 30-second allowance", async () => {
       checkReady.mockImplementation(async () => ({ ready: Date.now() >= 20_000 }));

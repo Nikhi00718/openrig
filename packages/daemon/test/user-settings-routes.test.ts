@@ -106,7 +106,8 @@ describe("config routes (User Settings v0)", () => {
     // + 2 OPR.0.5.10.7 context-pressure policy thresholds → 68 total.
     // + 1 S07 local-time preference.
     // + 1 ui.enabled (web UI and its terminal WebSocket; default off).
-    expect(Object.keys(body.settings).length).toBe(70);
+    expect(Object.keys(body.settings).length).toBe(71);
+    expect(body.settings["runtime.readiness_timeout_seconds"]).toMatchObject({ value: 30, source: "default" });
     expect(body.settings["ui.enabled"]).toMatchObject({ value: false, source: "default" });
     expect(body.settings["ui.timezone"]).toMatchObject({ value: "America/Los_Angeles", source: "default" });
     expect(body.settings["daemon.port"]?.source).toBe("default");

@@ -14,6 +14,7 @@ import { deriveOriented, issueStartupChallenge, verifyStartupProof } from "../sr
 import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
 import { AppliedLaunchObservationStore } from "../src/domain/applied-launch-observation-store.js";
 import { observeClaudePermission } from "../src/domain/permission-drift.js";
+import type { SettingsStore } from "../src/domain/user-settings/settings-store.js";
 
 // -- Mocks --
 
@@ -96,7 +97,7 @@ describe("StartupOrchestrator", () => {
   afterEach(() => { db.close(); });
 
   function createOrchestrator(
-    opts?: TmuxAdapter | { tmux?: TmuxAdapter; readFile?: (path: string) => string },
+    opts?: TmuxAdapter | { tmux?: TmuxAdapter; readFile?: (path: string) => string; readinessSettings?: Pick<SettingsStore, "resolveOne"> },
   ): StartupOrchestrator {
     const normalized = opts && "sendText" in opts
       ? { tmux: opts as TmuxAdapter }
@@ -107,6 +108,9 @@ describe("StartupOrchestrator", () => {
       eventBus,
       tmuxAdapter: normalized.tmux ?? tmux,
       readFile: normalized.readFile,
+      readinessSettings: normalized.readinessSettings ?? ({
+        resolveOne: () => ({ value: 30, source: "default", defaultValue: 30 }),
+      } as unknown as Pick<SettingsStore, "resolveOne">),
       sleep: async () => {},
     });
   }
@@ -1202,6 +1206,19 @@ describe("StartupOrchestrator", () => {
     beforeEach(() => { vi.useFakeTimers(); });
     afterEach(() => { vi.useRealTimers(); });
 
+    it("uses the configured launch window when the caller has no override", async () => {
+      const seed = seedSession();
+      const started = Date.now();
+      const adapter = mockAdapter({ checkReady: vi.fn(async () => ({ ready: Date.now() - started >= 40_000 })) });
+      const readinessSettings = {
+        resolveOne: () => ({ value: 45, source: "file", defaultValue: 30 }),
+      } as unknown as Pick<SettingsStore, "resolveOne">;
+      const pending = createOrchestrator({ readinessSettings }).startNode(makeInput(seed, { adapter }));
+
+      await vi.advanceTimersByTimeAsync(45_000);
+      expect(await pending).toMatchObject({ ok: true, startupStatus: "ready" });
+    });
+
     it.each([20_000, 30_000])("accepts readiness at %i ms within the 30-second budget", async (readyAfterMs) => {
       const seed = seedSession();
       const started = Date.now();
@@ -1289,6 +1306,7 @@ describe("StartupOrchestrator", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.errors.some((e) => e.includes("timeout") || e.includes("Readiness timeout"))).toBe(true);
+      expect(result.errors).toEqual([expect.stringContaining("after 0.1s")]);
     }
   });
 
