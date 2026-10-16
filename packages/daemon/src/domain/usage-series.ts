@@ -130,7 +130,7 @@ export interface SeatBurn {
   tokensPerHour: number;
   /** total positive token delta inside the window */
   tokensDelta: number;
-  /** count of negative total-token transitions (session restarts) inside the window */
+  /** count of negative total-token transitions within a counter history inside the window */
   resets: number;
   /** actual span between first and last in-window context sample, hours */
   spanHours: number;
@@ -187,20 +187,21 @@ export function computeTopBurn(db: Database, q: TopBurnQuery): TopBurnResult {
     }
     let tokensDelta = 0;
     let resets = 0;
-    // A seat name can be reused by a later rig. Cumulative counters only
-    // describe movement within one node; crossing node baselines invents burn.
-    const previousByNode = new Map<string | null, number>();
+    // A node can launch another native session or switch runtimes. Counters
+    // only describe movement within that history; crossing baselines invents burn.
+    const previousByHistory = new Map<string, number>();
     let pairs = 0;
     for (const row of ctx) {
       const cur = row.totalInputTokens + row.totalOutputTokens;
-      const prev = previousByNode.get(row.nodeId);
+      const history = JSON.stringify([row.nodeId, row.source, row.nativeSessionId ?? null]);
+      const prev = previousByHistory.get(history);
       if (prev !== undefined) {
         pairs += 1;
         const delta = cur - prev;
         if (delta >= 0) tokensDelta += delta;
         else resets += 1; // a restart dropped the totals — never negative burn
       }
-      previousByNode.set(row.nodeId, cur);
+      previousByHistory.set(history, cur);
     }
     if (pairs === 0) {
       unknown.push({ seatSession: seat, reason: "insufficient_samples" });
