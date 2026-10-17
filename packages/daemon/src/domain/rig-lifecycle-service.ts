@@ -275,7 +275,7 @@ export class RigLifecycleService {
       return {
         ok: false,
         code: "session_not_current",
-        error: `Claimed session '${session.session_id}' no longer owns this seat. Database custody was not changed.`,
+        error: `Claimed session '${session.session_id}' no longer owns this seat. Database custody was not changed. OpenRig tmux metadata on '${session.tmux_session ?? session.session_name}' may already have been cleared.`,
       };
     }
 

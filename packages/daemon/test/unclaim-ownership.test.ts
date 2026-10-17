@@ -165,7 +165,7 @@ describe("unclaim preserves a successor's custody", () => {
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({
       code: "session_not_current",
-      error: expect.stringContaining("Database custody was not changed."),
+      error: `Claimed session '${claim.sessionId}' no longer owns this seat. Database custody was not changed. OpenRig tmux metadata on 'manual-adoption' may already have been cleared.`,
     });
     expect(setup.sessionRegistry.getBindingForNode(node.id)).toEqual(binding);
     expect(setup.discoveryRepo.getDiscoveredSession(discovered.id)).toEqual(discovery);
