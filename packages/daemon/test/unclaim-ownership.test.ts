@@ -190,17 +190,23 @@ describe("unclaim preserves a successor's custody", () => {
 
   it("keeps an old-ID retry harmless after a newer claim was released", async () => {
     const { rig, node, discovered, claim } = await claimedSeat();
-    await setup.rigLifecycleService.unclaimSession(claim.sessionId);
+    const original = await setup.rigLifecycleService.unclaimSession(claim.sessionId);
     const next = await setup.claimService.bind({ discoveredId: discovered.id, rigId: rig.id, logicalId: node.logicalId });
     if (!next.ok) throw new Error(next.error);
     await setup.rigLifecycleService.unclaimSession(next.sessionId);
     const events = db.prepare("SELECT * FROM events ORDER BY seq").all();
+    const notify = vi.spyOn(setup.eventBus, "notifySubscribers");
     vi.mocked(setup.tmuxAdapter.setSessionOption).mockClear();
     const response = await setup.app.request(`/api/sessions/${claim.sessionId}/unclaim`, { method: "POST" });
     expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(original);
     expect(setup.sessionRegistry.getBindingForNode(node.id)).toBeNull();
     expect(setup.tmuxAdapter.setSessionOption).not.toHaveBeenCalled();
-    expect(db.prepare("SELECT * FROM events ORDER BY seq").all()).toEqual(events);
+    const second = await setup.app.request(`/api/sessions/${claim.sessionId}/unclaim`, { method: "POST" });
+    expect(await second.json()).toEqual(original);
+    expect(db.prepare("SELECT * FROM events ORDER BY seq").all()).toHaveLength(events.length + 2);
+    expect(notify).toHaveBeenCalledTimes(2);
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ type: "session.detached", nodeId: node.id, sessionName: "manual-adoption" }));
   });
 
   it.each([false, true])("does not grant input or launch permission through a custody lease (protected=%s)", async protectedSeat => {
@@ -299,12 +305,14 @@ describe("unclaim preserves a successor's custody", () => {
   it.each([[false, false], [false, true], [true, false], [true, true]])("does not wait on an unaffected seat unless deleting (delete=%s, previouslyClaimed=%s)", async (deleting, previouslyClaimed) => {
     const { rig } = await claimedSeat();
     const unaffected = setup.rigRepo.addNode(rig.id, "external.empty", { runtime: "terminal" });
+    let detachedSessionId: string | undefined;
     if (previouslyClaimed) {
       const discovered = setup.discoveryRepo.upsertDiscoveredSession({
         tmuxSession: "manual-empty", tmuxPane: "%2", cwd: "/tmp", activeCommand: "bash", runtimeHint: "terminal", confidence: "high",
       });
       const claim = await setup.claimService.bind({ discoveredId: discovered.id, rigId: rig.id, logicalId: unaffected.logicalId });
       if (!claim.ok) throw new Error(claim.error);
+      detachedSessionId = claim.sessionId;
       await setup.rigLifecycleService.unclaimSession(claim.sessionId);
     }
     const entered = barrier(), finish = barrier();
@@ -312,6 +320,7 @@ describe("unclaim preserves a successor's custody", () => {
       entered.resolve(); await finish.promise;
     });
     await entered.promise;
+    const notify = vi.spyOn(setup.eventBus, "notifySubscribers");
     let completed = false;
     const request = setup.app.request(`/api/rigs/${rig.id}/release`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ delete: deleting }),
@@ -320,11 +329,18 @@ describe("unclaim preserves a successor's custody", () => {
     const completedWhileBusy = completed;
     finish.resolve();
     await busy;
-    expect((await request).status).toBe(200);
+    const response = await request;
+    expect(response.status).toBe(200);
     expect(completedWhileBusy).toBe(!deleting);
+    if (previouslyClaimed) {
+      expect(await response.json()).toMatchObject({ released: expect.arrayContaining([
+        expect.objectContaining({ nodeId: unaffected.id, sessionId: detachedSessionId, sessionName: "manual-empty" }),
+      ]) });
+      expect(notify).toHaveBeenCalledWith(expect.objectContaining({ type: "session.detached", nodeId: unaffected.id, sessionName: "manual-empty" }));
+    }
   });
 
-  it.each([false, true])("captures every release target before waiting for the first seat (delete=%s)", async deleting => {
+  it.each([[false, "guard", false], [true, "guard", false], [false, "session", false], [true, "session", false], [false, "guard", true], [true, "guard", true]] as const)("captures every release target before waiting (delete=%s, check=%s, detached=%s)", async (deleting, check, detached) => {
     const first = await claimedSeat();
     const node = setup.rigRepo.addNode(first.rig.id, "external.second", { runtime: "terminal" });
     const discovered = setup.discoveryRepo.upsertDiscoveredSession({
@@ -332,7 +348,14 @@ describe("unclaim preserves a successor's custody", () => {
     });
     const claim = await setup.claimService.bind({ discoveredId: discovered.id, rigId: first.rig.id, logicalId: node.logicalId });
     if (!claim.ok) throw new Error(claim.error);
+    const guard = setup.tmuxAdapter.deliveryGuard!;
+    if (check === "session") {
+      // Isolate the service's session-ID check from the guard's occupant check.
+      const target = guard.target.bind(guard);
+      vi.spyOn(guard, "target").mockImplementation(name => ({ ...target(name), occupant: null }));
+    }
     const [blocked, changed] = [first, { rig: first.rig, node, discovered, claim }].sort((a, b) => a.node.id.localeCompare(b.node.id));
+    if (detached) expect((await setup.rigLifecycleService.unclaimSession(changed!.claim.sessionId)).ok).toBe(true);
     const entered = barrier(), finish = barrier();
     const busy = setup.tmuxAdapter.deliveryGuard!.lifecycle([blocked!.node.id], async () => {
       entered.resolve(); await finish.promise;
@@ -349,10 +372,21 @@ describe("unclaim preserves a successor's custody", () => {
     vi.mocked(setup.tmuxAdapter.setSessionOption).mockClear();
     finish.resolve();
     await busy;
-    expect((await request).status).toBe(409);
-    expect(db.prepare("SELECT * FROM bindings ORDER BY id").all()).toEqual(bindings);
+    const response = await request;
+    expect(response.status).toBe(deleting ? 409 : 207);
+    if (deleting) {
+      expect(db.prepare("SELECT * FROM bindings ORDER BY id").all()).toEqual(bindings);
+      expect(setup.tmuxAdapter.setSessionOption).not.toHaveBeenCalled();
+    } else {
+      expect(await response.json()).toMatchObject({ status: "partial", deleted: false,
+        released: [expect.objectContaining({ nodeId: blocked!.node.id, sessionId: blocked!.claim.sessionId })],
+        failed: [expect.objectContaining({ nodeId: changed!.node.id, sessionId: changed!.claim.sessionId })],
+      });
+      expect(setup.sessionRegistry.getBindingForNode(blocked!.node.id)).toBeNull();
+      expect(setup.sessionRegistry.getBindingForNode(changed!.node.id)?.tmuxSession).toBe(changed!.discovered.tmuxSession);
+      expect(vi.mocked(setup.tmuxAdapter.setSessionOption).mock.calls.every(([name]) => name === blocked!.discovered.tmuxSession)).toBe(true);
+    }
     expect(setup.discoveryRepo.getDiscoveredSession(changed!.discovered.id)).toEqual(discovery);
-    expect(setup.tmuxAdapter.setSessionOption).not.toHaveBeenCalled();
     expect(setup.rigRepo.getRig(first.rig.id)).not.toBeNull();
   });
 
@@ -364,6 +398,63 @@ describe("unclaim preserves a successor's custody", () => {
     expect(response.status).toBe(200);
     expect(setup.sessionRegistry.getBindingForNode(node.id)).toBeNull();
     expect(setup.tmuxAdapter.setSessionOption).not.toHaveBeenCalled();
+  });
+
+  it("reports a later custody refusal after preserving an earlier release effect", async () => {
+    const { rig, node } = await claimedSeat();
+    const later = setup.rigRepo.addNode(rig.id, "external.second", { runtime: "terminal" });
+    const discovered = setup.discoveryRepo.upsertDiscoveredSession({
+      tmuxSession: "manual-second", tmuxPane: "%2", cwd: "/tmp", activeCommand: "bash", runtimeHint: "terminal", confidence: "high",
+    });
+    const claim = await setup.claimService.bind({ discoveredId: discovered.id, rigId: rig.id, logicalId: later.logicalId });
+    if (!claim.ok) throw new Error(claim.error);
+    vi.mocked(setup.tmuxAdapter.setSessionOption).mockImplementation(async (name, key) => {
+      if (name === "manual-adoption" && key === "@rigged_logical_id") {
+        // A transport identity change after the full captured-set check.
+        setup.sessionRegistry.updateBinding(later.id, { tmuxPane: "%99" });
+      }
+      return { ok: true };
+    });
+    const response = await setup.app.request(`/api/rigs/${rig.id}/release`, { method: "POST" });
+    expect(response.status).toBe(207);
+    expect(await response.json()).toMatchObject({ status: "partial", deleted: false,
+      released: [expect.objectContaining({ nodeId: node.id })],
+      failed: [expect.objectContaining({ nodeId: later.id, sessionId: claim.sessionId })],
+    });
+    expect(setup.sessionRegistry.getBindingForNode(node.id)).toBeNull();
+    expect(setup.sessionRegistry.getBindingForNode(later.id)?.tmuxPane).toBe("%99");
+    expect(setup.discoveryRepo.getDiscoveredSession(discovered.id)?.status).toBe("claimed");
+  });
+
+  it("does not delete a seat added and claimed during cleanup", async () => {
+    const { rig, node } = await claimedSeat();
+    const entered = barrier(), finish = barrier();
+    vi.mocked(setup.tmuxAdapter.setSessionOption).mockImplementationOnce(async () => {
+      entered.resolve(); await finish.promise; return { ok: true };
+    });
+    const request = setup.app.request(`/api/rigs/${rig.id}/release`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ delete: true }),
+    });
+    await entered.promise;
+    const added = setup.rigRepo.addNode(rig.id, "external.new", { runtime: "terminal" });
+    const discovered = setup.discoveryRepo.upsertDiscoveredSession({
+      tmuxSession: "manual-new", tmuxPane: "%2", cwd: "/tmp", activeCommand: "bash", runtimeHint: "terminal", confidence: "high",
+    });
+    expect((await setup.claimService.bind({ discoveredId: discovered.id, rigId: rig.id, logicalId: added.logicalId })).ok).toBe(true);
+    const binding = setup.sessionRegistry.getBindingForNode(added.id);
+    const discovery = setup.discoveryRepo.getDiscoveredSession(discovered.id);
+    finish.resolve();
+    const response = await request;
+    expect(response.status).toBe(207);
+    expect(await response.json()).toMatchObject({ status: "partial", deleted: false,
+      released: [expect.objectContaining({ nodeId: node.id })],
+      failed: [expect.objectContaining({ nodeId: added.id, sessionId: null })],
+    });
+    expect(setup.rigRepo.getRig(rig.id)).not.toBeNull();
+    expect(setup.sessionRegistry.getBindingForNode(node.id)).toBeNull();
+    expect(setup.sessionRegistry.getBindingForNode(added.id)).toEqual(binding);
+    expect(setup.discoveryRepo.getDiscoveredSession(discovered.id)).toEqual(discovery);
+    expect(db.prepare("SELECT count(*) AS n FROM events WHERE node_id = ? AND type = 'session.detached'").get(added.id)).toEqual({ n: 0 });
   });
 
   it("holds earlier seats through a whole-rig release and deletion", async () => {

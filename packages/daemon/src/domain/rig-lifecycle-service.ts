@@ -208,17 +208,20 @@ export class RigLifecycleService {
     const session = matches[0]!;
 
     const guard = this.tmuxAdapter?.deliveryGuard;
-    if (guard && !guard.ownsCustody(session.node_id)) {
-      return guard.custody([session.node_id], () => this.unclaimSession(session.session_id));
-    }
     const success: UnclaimSessionResult = {
       ok: true, rigId: session.rig_id, nodeId: session.node_id, logicalId: session.logical_id,
       sessionId: session.session_id, sessionName: session.session_name,
     };
-    const latest = this.db.prepare(
-      "SELECT id, status FROM sessions WHERE node_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
-    ).get(session.node_id) as { id: string; status: string } | undefined;
-    if (!this.sessionRegistry.getBindingForNode(session.node_id) && latest?.status === "detached") return success;
+    const isReleased = () => {
+      const latest = this.db.prepare(
+        "SELECT status FROM sessions WHERE node_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+      ).get(session.node_id) as { status: string } | undefined;
+      return !this.sessionRegistry.getBindingForNode(session.node_id) && latest?.status === "detached";
+    };
+    const releasedRetry = isReleased();
+    if (!releasedRetry && guard && !guard.ownsCustody(session.node_id)) {
+      return guard.custody([session.node_id], () => this.unclaimSession(session.session_id));
+    }
     /** Read fresh custody both before metadata cleanup and at the detach commit. */
     const isCurrent = () => {
       const latest = this.db.prepare(
@@ -228,7 +231,7 @@ export class RigLifecycleService {
       return latest?.id === session.session_id
         && (!binding?.tmuxSession || binding.tmuxSession === session.session_name);
     };
-    if (!isCurrent()) {
+    if (!releasedRetry && !isCurrent()) {
       return {
         ok: false,
         code: "session_not_current",
@@ -237,7 +240,7 @@ export class RigLifecycleService {
     }
 
     // Best-effort: clear OpenRig-owned tmux metadata from the adopted session.
-    if (this.tmuxAdapter && session.tmux_session) {
+    if (!releasedRetry && this.tmuxAdapter && session.tmux_session) {
       const keys = [
         "@rigged_node_id",
         "@rigged_session_name",
@@ -257,10 +260,12 @@ export class RigLifecycleService {
     let persistedSeq = 0;
     let persistedAt = "";
     const tx = this.db.transaction(() => {
-      if (!isCurrent()) return false;
+      if (releasedRetry ? !isReleased() : !isCurrent()) return false;
       this.sessionRegistry.markDetached(session.session_id);
-      this.sessionRegistry.clearBinding(session.node_id);
-      this.discoveryRepo.releaseClaimByNodeId(session.node_id);
+      if (!releasedRetry) {
+        this.sessionRegistry.clearBinding(session.node_id);
+        this.discoveryRepo.releaseClaimByNodeId(session.node_id);
+      }
       const event = this.eventBus.persistWithinTransaction({
         type: "session.detached",
         rigId: session.rig_id,
@@ -333,16 +338,19 @@ export class RigLifecycleService {
       };
     }
 
-    const targets = opts?.delete ? rows : rows.filter(row => row.session_origin === "claimed"
-      && (row.session_status !== "detached" || row.tmux_session !== null));
+    const targets = opts?.delete ? rows : rows.filter(row => row.session_origin === "claimed");
+    const leaseTargets = opts?.delete ? targets : targets.filter(row => row.session_status !== "detached" || row.tmux_session !== null);
+    const changed = new Map<string, string>();
+    const matches = (target: RigReleaseRow, row?: RigReleaseRow) => !!row
+      && row.session_id === target.session_id && row.session_name === target.session_name
+      && row.session_origin === target.session_origin && row.logical_id === target.logical_id
+      && row.session_status === target.session_status && row.tmux_session === target.tmux_session;
     const release = async (): Promise<ReleaseRigResult> => {
       const current = new Map(readRows().map(row => [row.node_id, row]));
-      if ((opts?.delete && current.size !== rows.length) || targets.some(target => {
-        const row = current.get(target.node_id);
-        return !row || row.session_id !== target.session_id || row.session_name !== target.session_name
-          || row.session_origin !== target.session_origin || row.logical_id !== target.logical_id
-          || row.session_status !== target.session_status || row.tmux_session !== target.tmux_session;
-      })) {
+      for (const target of targets) {
+        if (!matches(target, current.get(target.node_id))) changed.set(target.node_id, "Release target changed while waiting; no cleanup performed for this seat.");
+      }
+      if (opts?.delete && (current.size !== rows.length || changed.size > 0)) {
         throw new DeliveryGuardError("guard_target_changed", "Release target changed while waiting; no cleanup performed.");
       }
 
@@ -362,7 +370,19 @@ export class RigLifecycleService {
 
       for (const row of targets) {
         if (!row.session_id || row.session_origin !== "claimed") continue;
-        const result = await this.unclaimSession(row.session_id);
+        // Unleased detached seats may be reclaimed while another seat is cleaned.
+        if (!matches(row, readRows().find(current => current.node_id === row.node_id))) {
+          changed.set(row.node_id, "Release target changed; no cleanup performed for this seat.");
+        }
+        const error = changed.get(row.node_id);
+        if (error) {
+          failed.push({ nodeId: row.node_id, logicalId: row.logical_id, sessionId: row.session_id, sessionName: row.session_name, error });
+          continue;
+        }
+        const result = await this.unclaimSession(row.session_id).catch((error: unknown) => {
+          if (!(error instanceof DeliveryGuardError)) throw error;
+          return { ok: false as const, error: error.message };
+        });
         if (result.ok) {
           released.push({
             nodeId: result.nodeId,
@@ -386,6 +406,19 @@ export class RigLifecycleService {
         let persistedSeq = 0;
         let persistedAt = "";
         const tx = this.db.transaction(() => {
+          const current = readRows();
+          const conflicts = current.filter(row => !rows.some(captured => captured.node_id === row.node_id && captured.session_id === row.session_id));
+          const missing = rows.filter(captured => !current.some(row => row.node_id === captured.node_id));
+          if (conflicts.length > 0 || missing.length > 0) {
+            for (const row of [...conflicts, ...missing]) {
+              const captured = rows.find(target => target.node_id === row.node_id);
+              failed.push({ nodeId: row.node_id, logicalId: row.logical_id,
+                sessionId: captured?.session_id ?? null, sessionName: captured?.session_name ?? null,
+                error: "Rig membership or session changed during cleanup; rig was not deleted.",
+              });
+            }
+            return false;
+          }
           const event = this.eventBus.persistWithinTransaction({
             type: "rig.deleted",
             rigId,
@@ -393,16 +426,17 @@ export class RigLifecycleService {
           persistedSeq = event.seq;
           persistedAt = event.createdAt;
           this.rigRepo.deleteRig(rigId);
+          return true;
         });
-        tx();
-
-        this.eventBus.notifySubscribers({
-          type: "rig.deleted",
-          rigId,
-          seq: persistedSeq,
-          createdAt: persistedAt,
-        });
-        deleted = true;
+        if (tx()) {
+          this.eventBus.notifySubscribers({
+            type: "rig.deleted",
+            rigId,
+            seq: persistedSeq,
+            createdAt: persistedAt,
+          });
+          deleted = true;
+        }
       }
 
       return {
@@ -415,7 +449,8 @@ export class RigLifecycleService {
       };
     };
     const guard = this.tmuxAdapter?.deliveryGuard;
-    return guard ? guard.custody(targets.map(row => row.node_id), release) : release();
+    return guard ? guard.custody(leaseTargets.map(row => row.node_id), release,
+      opts?.delete ? undefined : (nodeId, error) => { changed.set(nodeId, error.message); }) : release();
   }
 
   async removeNode(

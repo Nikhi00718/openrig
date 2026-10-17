@@ -154,16 +154,27 @@ export class SeatDeliveryGuard {
 
   /** Serialize metadata/custody cleanup even when typing is paused. Capture every
    * target before waiting, then validate all of them before the first effect. */
-  async custody<T>(nodeIds: string[], fn: () => Promise<T>): Promise<T> {
+  async custody<T>(nodeIds: string[], fn: () => Promise<T>, onTargetChanged?: (nodeId: string, error: DeliveryGuardError) => void): Promise<T> {
     const targets = [...new Set(nodeIds)].sort().map(id => this.target(id));
-    const validate = (target: GuardTarget) => {
-      if (!this.same(target, this.target(target.nodeId))) {
-        throw new DeliveryGuardError("guard_target_changed", "Custody target changed while waiting; no cleanup performed.");
+    const excluded = new Set<string>();
+    const validate = (target: GuardTarget, inherited?: Lease): boolean => {
+      if (excluded.has(target.nodeId)) return false;
+      try {
+        if (inherited) this.assertCurrent(target.nodeId, inherited);
+        if (!this.same(target, this.target(target.nodeId))) {
+          throw new DeliveryGuardError("guard_target_changed", "Custody target changed while waiting; no cleanup performed for this seat.");
+        }
+        return true;
+      } catch (error) {
+        if (!onTargetChanged || !(error instanceof DeliveryGuardError)) throw error;
+        excluded.add(target.nodeId);
+        onTargetChanged(target.nodeId, error);
+        return false;
       }
     };
     const acquire = async (index: number): Promise<T> => {
       const target = targets[index];
-      if (!target) { targets.forEach(validate); return fn(); }
+      if (!target) { for (const captured of targets) validate(captured); return fn(); }
       const inherited = this.scope.getStore()?.get(target.nodeId);
       const run = async () => {
         const lease: Lease = { target, active: true, origin: "custody" };
@@ -173,12 +184,11 @@ export class SeatDeliveryGuard {
         } finally { lease.active = false; }
       };
       if (inherited?.active && inherited.serialOwner?.active) {
-        this.assertCurrent(target.nodeId, inherited);
-        validate(target);
+        if (!validate(target, inherited)) return acquire(index + 1);
         return inherited.origin === "custody" || inherited.lifecycle ? acquire(index + 1) : run();
       }
       return this.serial(target.nodeId, async () => {
-        validate(target);
+        if (!validate(target)) return acquire(index + 1);
         return run();
       });
     };
