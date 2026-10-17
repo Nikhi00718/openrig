@@ -167,6 +167,7 @@ export class RigLifecycleService {
     this.tmuxAdapter = deps.tmuxAdapter ?? null;
   }
 
+  /** Release a current claimed session without killing its external process. */
   async unclaimSession(sessionRef: string): Promise<UnclaimSessionResult> {
     const exactId = this.db.prepare(`
       SELECT s.id AS session_id, s.session_name, n.id AS node_id, n.rig_id, n.logical_id, b.tmux_session
@@ -207,10 +208,16 @@ export class RigLifecycleService {
     if (guard && !guard.ownsLifecycle(session.node_id)) {
       return guard.lifecycle([session.node_id], () => this.unclaimSession(session.session_id));
     }
-    const latest = this.db.prepare(
-      "SELECT id FROM sessions WHERE node_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
-    ).get(session.node_id) as { id: string } | undefined;
-    if (latest?.id !== session.session_id || (session.tmux_session && session.tmux_session !== session.session_name)) {
+    /** Read fresh custody both before metadata cleanup and at the detach commit. */
+    const isCurrent = () => {
+      const latest = this.db.prepare(
+        "SELECT id FROM sessions WHERE node_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+      ).get(session.node_id) as { id: string } | undefined;
+      const binding = this.sessionRegistry.getBindingForNode(session.node_id);
+      return latest?.id === session.session_id
+        && (!binding?.tmuxSession || binding.tmuxSession === session.session_name);
+    };
+    if (!isCurrent()) {
       return {
         ok: false,
         code: "session_not_current",
@@ -239,6 +246,7 @@ export class RigLifecycleService {
     let persistedSeq = 0;
     let persistedAt = "";
     const tx = this.db.transaction(() => {
+      if (!isCurrent()) return false;
       this.sessionRegistry.markDetached(session.session_id);
       this.sessionRegistry.clearBinding(session.node_id);
       this.discoveryRepo.releaseClaimByNodeId(session.node_id);
@@ -250,8 +258,15 @@ export class RigLifecycleService {
       });
       persistedSeq = event.seq;
       persistedAt = event.createdAt;
+      return true;
     });
-    tx();
+    if (!tx()) {
+      return {
+        ok: false,
+        code: "session_not_current",
+        error: `Claimed session '${session.session_id}' no longer owns this seat. Database custody was not changed.`,
+      };
+    }
 
     this.eventBus.notifySubscribers({
       type: "session.detached",
@@ -272,6 +287,7 @@ export class RigLifecycleService {
     };
   }
 
+  /** Release adopted seats under their lifecycle leases, optionally deleting the rig. */
   async releaseRig(rigId: string, opts?: { delete?: boolean }): Promise<ReleaseRigResult> {
     const rig = this.rigRepo.getRig(rigId);
     if (!rig) {

@@ -135,6 +135,44 @@ describe("unclaim preserves a successor's custody", () => {
     expect(setup.tmuxAdapter.setSessionOption).not.toHaveBeenCalled();
   });
 
+  it.each(["claim", "launch", "binding"] as const)("preserves a concurrent %s during unguarded metadata cleanup", async replacement => {
+    const { rig, node, discovered, claim } = await claimedSeat();
+    setup.tmuxAdapter.deliveryGuard = undefined;
+    const entered = barrier();
+    const finish = barrier();
+    vi.mocked(setup.tmuxAdapter.setSessionOption).mockImplementationOnce(async () => {
+      entered.resolve();
+      await finish.promise;
+      return { ok: true };
+    });
+    const request = setup.app.request(`/api/sessions/${claim.sessionId}/unclaim`, { method: "POST" });
+    await entered.promise;
+    if (replacement === "binding") {
+      setup.sessionRegistry.updateBinding(node.id, { tmuxSession: "replacement-adoption", tmuxPane: "%2" });
+    } else {
+      expect((await setup.rigLifecycleService.unclaimSession(claim.sessionId)).ok).toBe(true);
+      const successor = replacement === "claim"
+        ? await setup.claimService.bind({ discoveredId: discovered.id, rigId: rig.id, logicalId: node.logicalId })
+        : await setup.nodeLauncher.launchNode(rig.id, node.logicalId);
+      expect(successor.ok).toBe(true);
+    }
+    const binding = setup.sessionRegistry.getBindingForNode(node.id);
+    const discovery = setup.discoveryRepo.getDiscoveredSession(discovered.id);
+    const sessions = db.prepare("SELECT * FROM sessions WHERE node_id = ? ORDER BY id").all(node.id);
+    const events = db.prepare("SELECT * FROM events ORDER BY seq").all();
+    finish.resolve();
+    const response = await request;
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      code: "session_not_current",
+      error: expect.stringContaining("Database custody was not changed."),
+    });
+    expect(setup.sessionRegistry.getBindingForNode(node.id)).toEqual(binding);
+    expect(setup.discoveryRepo.getDiscoveredSession(discovered.id)).toEqual(discovery);
+    expect(db.prepare("SELECT * FROM sessions WHERE node_id = ? ORDER BY id").all(node.id)).toEqual(sessions);
+    expect(db.prepare("SELECT * FROM events ORDER BY seq").all()).toEqual(events);
+  });
+
   it("refuses cleanup under the existing typing guard before changing custody", async () => {
     const { node, claim } = await claimedSeat();
     await setup.tmuxAdapter.deliveryGuard!.set(node.id, true, "operator", "fixture pause");
