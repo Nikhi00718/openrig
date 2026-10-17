@@ -173,15 +173,187 @@ describe("unclaim preserves a successor's custody", () => {
     expect(db.prepare("SELECT * FROM events ORDER BY seq").all()).toEqual(events);
   });
 
-  it("refuses cleanup under the existing typing guard before changing custody", async () => {
-    const { node, claim } = await claimedSeat();
+  it.each(["unclaim", "release", "delete"] as const)("allows %s custody cleanup with typing protection enabled", async operation => {
+    const { rig, node, discovered, claim } = await claimedSeat();
     await setup.tmuxAdapter.deliveryGuard!.set(node.id, true, "operator", "fixture pause");
-    const binding = setup.sessionRegistry.getBindingForNode(node.id);
+    vi.mocked(setup.tmuxAdapter.setSessionOption).mockClear();
+    const response = await setup.app.request(operation === "unclaim"
+      ? `/api/sessions/${claim.sessionId}/unclaim` : `/api/rigs/${rig.id}/release`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ delete: operation === "delete" }),
+    });
+    expect(response.status).toBe(200);
+    expect(setup.sessionRegistry.getBindingForNode(node.id)).toBeNull();
+    expect(setup.discoveryRepo.getDiscoveredSession(discovered.id)?.status).toBe("active");
+    expect(setup.tmuxAdapter.killSession).not.toHaveBeenCalled();
+    if (operation !== "delete") expect(setup.tmuxAdapter.deliveryGuard!.preference(node.id).desired).toBe(true);
+  });
+
+  it("keeps an old-ID retry harmless after a newer claim was released", async () => {
+    const { rig, node, discovered, claim } = await claimedSeat();
+    await setup.rigLifecycleService.unclaimSession(claim.sessionId);
+    const next = await setup.claimService.bind({ discoveredId: discovered.id, rigId: rig.id, logicalId: node.logicalId });
+    if (!next.ok) throw new Error(next.error);
+    await setup.rigLifecycleService.unclaimSession(next.sessionId);
+    const events = db.prepare("SELECT * FROM events ORDER BY seq").all();
     vi.mocked(setup.tmuxAdapter.setSessionOption).mockClear();
     const response = await setup.app.request(`/api/sessions/${claim.sessionId}/unclaim`, { method: "POST" });
-    expect(response.status).toBe(409);
-    expect(setup.sessionRegistry.getBindingForNode(node.id)).toEqual(binding);
+    expect(response.status).toBe(200);
+    expect(setup.sessionRegistry.getBindingForNode(node.id)).toBeNull();
     expect(setup.tmuxAdapter.setSessionOption).not.toHaveBeenCalled();
+    expect(db.prepare("SELECT * FROM events ORDER BY seq").all()).toEqual(events);
+  });
+
+  it.each([false, true])("does not grant input or launch permission through a custody lease (protected=%s)", async protectedSeat => {
+    const { rig, node } = await claimedSeat();
+    const guard = setup.tmuxAdapter.deliveryGuard!;
+    if (protectedSeat) await guard.set(node.id, true, "operator", "fixture pause");
+    const write = vi.fn(async () => {});
+    await guard.custody([node.id], async () => {
+      expect(guard.ownsCustody(node.id)).toBe(true);
+      expect(guard.ownsLifecycle(node.id)).toBe(false);
+      expect(() => guard.checkInput(node.id)).toThrow("Custody cleanup does not authorize");
+      await expect(guard.input(node.id, write)).rejects.toMatchObject({ code: "guard_lease_required" });
+      await expect(guard.operation(node.id, write)).rejects.toMatchObject({ code: "guard_lease_required" });
+      await expect(guard.lifecycle([node.id], write)).rejects.toMatchObject({ code: "guard_lease_required" });
+      await expect(setup.nodeLauncher.launchNode(rig.id, node.logicalId)).rejects.toMatchObject({ code: "guard_lease_required" });
+    });
+    expect(write).not.toHaveBeenCalled();
+    expect(setup.tmuxAdapter.createSession).not.toHaveBeenCalled();
+    if (protectedSeat) await expect(guard.operation(node.id, write)).rejects.toMatchObject({ code: "typing_guard_enabled" });
+    else await guard.operation(node.id, write);
+    expect(write).toHaveBeenCalledTimes(protectedSeat ? 0 : 1);
+  });
+
+  it.each(["operation", "humanInput"] as const)("scopes nested custody cleanup inside %s", async origin => {
+    const { node, claim } = await claimedSeat();
+    const guard = setup.tmuxAdapter.deliveryGuard!;
+    const write = vi.fn(async () => {});
+    await guard[origin](node.id, async () => {
+      await guard.custody([node.id], async () => {
+        expect(guard.ownsCustody(node.id)).toBe(true);
+        await expect(guard.input(node.id, write)).rejects.toMatchObject({ code: "guard_lease_required" });
+        expect((await setup.rigLifecycleService.unclaimSession(claim.sessionId)).ok).toBe(true);
+      });
+    });
+    expect(write).not.toHaveBeenCalled();
+    expect(setup.sessionRegistry.getBindingForNode(node.id)).toBeNull();
+  });
+
+  it("serializes human-scoped cleanup with an existing automatic operation", async () => {
+    const { node, claim } = await claimedSeat();
+    const guard = setup.tmuxAdapter.deliveryGuard!;
+    const binding = setup.sessionRegistry.getBindingForNode(node.id);
+    const entered = barrier(), finish = barrier();
+    const busy = guard.operation(node.id, async () => { entered.resolve(); await finish.promise; });
+    await entered.promise;
+    let completed = false;
+    const cleanup = guard.humanInput(node.id, () => setup.rigLifecycleService.unclaimSession(claim.sessionId))
+      .then(result => { completed = true; return result; });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const completedWhileBusy = completed;
+    const bindingWhileBusy = setup.sessionRegistry.getBindingForNode(node.id);
+    finish.resolve();
+    await busy;
+    expect((await cleanup).ok).toBe(true);
+    expect(completedWhileBusy).toBe(false);
+    expect(bindingWhileBusy).toEqual(binding);
+    expect(setup.sessionRegistry.getBindingForNode(node.id)).toBeNull();
+  });
+
+  it("joins the serial lock when a human scope is nested inside its owner", async () => {
+    const { node, claim } = await claimedSeat();
+    const guard = setup.tmuxAdapter.deliveryGuard!;
+    const result = await guard.operation(node.id, () => guard.humanInput(node.id,
+      () => setup.rigLifecycleService.unclaimSession(claim.sessionId)));
+    expect(result.ok).toBe(true);
+    expect(setup.sessionRegistry.getBindingForNode(node.id)).toBeNull();
+  });
+
+  it("does not retain a finished parent's serial ownership in detached human cleanup", async () => {
+    const { node, claim } = await claimedSeat();
+    const guard = setup.tmuxAdapter.deliveryGuard!;
+    const humanEntered = barrier(), resumeHuman = barrier(), busyEntered = barrier(), finishBusy = barrier();
+    let cleanup!: Promise<unknown>;
+    let completed = false;
+    await guard.operation(node.id, async () => {
+      cleanup = guard.humanInput(node.id, async () => {
+        humanEntered.resolve(); await resumeHuman.promise;
+        return setup.rigLifecycleService.unclaimSession(claim.sessionId);
+      }).then(result => { completed = true; return result; });
+      await humanEntered.promise;
+    });
+    const busy = guard.operation(node.id, async () => { busyEntered.resolve(); await finishBusy.promise; });
+    await busyEntered.promise;
+    const binding = setup.sessionRegistry.getBindingForNode(node.id);
+    resumeHuman.resolve();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const completedWhileBusy = completed;
+    const bindingWhileBusy = setup.sessionRegistry.getBindingForNode(node.id);
+    finishBusy.resolve();
+    await busy;
+    expect(await cleanup).toMatchObject({ ok: true });
+    expect(completedWhileBusy).toBe(false);
+    expect(bindingWhileBusy).toEqual(binding);
+  });
+
+  it.each([[false, false], [false, true], [true, false], [true, true]])("does not wait on an unaffected seat unless deleting (delete=%s, previouslyClaimed=%s)", async (deleting, previouslyClaimed) => {
+    const { rig } = await claimedSeat();
+    const unaffected = setup.rigRepo.addNode(rig.id, "external.empty", { runtime: "terminal" });
+    if (previouslyClaimed) {
+      const discovered = setup.discoveryRepo.upsertDiscoveredSession({
+        tmuxSession: "manual-empty", tmuxPane: "%2", cwd: "/tmp", activeCommand: "bash", runtimeHint: "terminal", confidence: "high",
+      });
+      const claim = await setup.claimService.bind({ discoveredId: discovered.id, rigId: rig.id, logicalId: unaffected.logicalId });
+      if (!claim.ok) throw new Error(claim.error);
+      await setup.rigLifecycleService.unclaimSession(claim.sessionId);
+    }
+    const entered = barrier(), finish = barrier();
+    const busy = setup.tmuxAdapter.deliveryGuard!.lifecycle([unaffected.id], async () => {
+      entered.resolve(); await finish.promise;
+    });
+    await entered.promise;
+    let completed = false;
+    const request = setup.app.request(`/api/rigs/${rig.id}/release`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ delete: deleting }),
+    }).then(response => { completed = true; return response; });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const completedWhileBusy = completed;
+    finish.resolve();
+    await busy;
+    expect((await request).status).toBe(200);
+    expect(completedWhileBusy).toBe(!deleting);
+  });
+
+  it.each([false, true])("captures every release target before waiting for the first seat (delete=%s)", async deleting => {
+    const first = await claimedSeat();
+    const node = setup.rigRepo.addNode(first.rig.id, "external.second", { runtime: "terminal" });
+    const discovered = setup.discoveryRepo.upsertDiscoveredSession({
+      tmuxSession: "manual-second", tmuxPane: "%2", cwd: "/tmp", activeCommand: "bash", runtimeHint: "terminal", confidence: "high",
+    });
+    const claim = await setup.claimService.bind({ discoveredId: discovered.id, rigId: first.rig.id, logicalId: node.logicalId });
+    if (!claim.ok) throw new Error(claim.error);
+    const [blocked, changed] = [first, { rig: first.rig, node, discovered, claim }].sort((a, b) => a.node.id.localeCompare(b.node.id));
+    const entered = barrier(), finish = barrier();
+    const busy = setup.tmuxAdapter.deliveryGuard!.lifecycle([blocked!.node.id], async () => {
+      entered.resolve(); await finish.promise;
+    });
+    await entered.promise;
+    const request = setup.app.request(`/api/rigs/${first.rig.id}/release`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ delete: deleting }),
+    });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect((await setup.rigLifecycleService.unclaimSession(changed!.claim.sessionId)).ok).toBe(true);
+    expect((await setup.claimService.bind({ discoveredId: changed!.discovered.id, rigId: first.rig.id, logicalId: changed!.node.logicalId })).ok).toBe(true);
+    const bindings = db.prepare("SELECT * FROM bindings ORDER BY id").all();
+    const discovery = setup.discoveryRepo.getDiscoveredSession(changed!.discovered.id);
+    vi.mocked(setup.tmuxAdapter.setSessionOption).mockClear();
+    finish.resolve();
+    await busy;
+    expect((await request).status).toBe(409);
+    expect(db.prepare("SELECT * FROM bindings ORDER BY id").all()).toEqual(bindings);
+    expect(setup.discoveryRepo.getDiscoveredSession(changed!.discovered.id)).toEqual(discovery);
+    expect(setup.tmuxAdapter.setSessionOption).not.toHaveBeenCalled();
+    expect(setup.rigRepo.getRig(first.rig.id)).not.toBeNull();
   });
 
   it("keeps a repeat of an already released current ID harmless", async () => {

@@ -6,6 +6,7 @@ import type { EventBus } from "./event-bus.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { QueueRepository } from "./queue-repository.js";
 import { findOtherSessionOwner } from "./session-owner.js";
+import { DeliveryGuardError } from "./seat-delivery-guard.js";
 
 type ClaimedSessionRow = {
   session_id: string;
@@ -34,6 +35,8 @@ type RigReleaseRow = {
   session_id: string | null;
   session_name: string | null;
   session_origin: string | null;
+  session_status: string | null;
+  tmux_session: string | null;
 };
 
 type FallbackValidationFailure = {
@@ -205,9 +208,17 @@ export class RigLifecycleService {
     const session = matches[0]!;
 
     const guard = this.tmuxAdapter?.deliveryGuard;
-    if (guard && !guard.ownsLifecycle(session.node_id)) {
-      return guard.lifecycle([session.node_id], () => this.unclaimSession(session.session_id));
+    if (guard && !guard.ownsCustody(session.node_id)) {
+      return guard.custody([session.node_id], () => this.unclaimSession(session.session_id));
     }
+    const success: UnclaimSessionResult = {
+      ok: true, rigId: session.rig_id, nodeId: session.node_id, logicalId: session.logical_id,
+      sessionId: session.session_id, sessionName: session.session_name,
+    };
+    const latest = this.db.prepare(
+      "SELECT id, status FROM sessions WHERE node_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+    ).get(session.node_id) as { id: string; status: string } | undefined;
+    if (!this.sessionRegistry.getBindingForNode(session.node_id) && latest?.status === "detached") return success;
     /** Read fresh custody both before metadata cleanup and at the detach commit. */
     const isCurrent = () => {
       const latest = this.db.prepare(
@@ -277,14 +288,7 @@ export class RigLifecycleService {
       createdAt: persistedAt,
     });
 
-    return {
-      ok: true,
-      rigId: session.rig_id,
-      nodeId: session.node_id,
-      logicalId: session.logical_id,
-      sessionId: session.session_id,
-      sessionName: session.session_name,
-    };
+    return success;
   }
 
   /** Release adopted seats under their lifecycle leases, optionally deleting the rig. */
@@ -294,20 +298,17 @@ export class RigLifecycleService {
       return { ok: false, code: "rig_not_found", error: `Rig '${rigId}' not found.` };
     }
 
-    const guard = this.tmuxAdapter?.deliveryGuard;
-    const nodeIds = rig.nodes.map(node => node.id);
-    if (guard && nodeIds.some(id => !guard.ownsLifecycle(id))) {
-      return guard.lifecycle(nodeIds, () => this.releaseRig(rigId, opts));
-    }
-
-    const rows = this.db.prepare(`
+    const readRows = () => this.db.prepare(`
       SELECT
         n.id AS node_id,
         n.logical_id,
         s.id AS session_id,
         s.session_name,
-        s.origin AS session_origin
+        s.origin AS session_origin,
+        s.status AS session_status,
+        b.tmux_session
       FROM nodes n
+      LEFT JOIN bindings b ON b.node_id = n.id
       LEFT JOIN sessions s ON s.id = (
         SELECT s2.id
         FROM sessions s2
@@ -318,6 +319,7 @@ export class RigLifecycleService {
       WHERE n.rig_id = ?
       ORDER BY n.logical_id
     `).all(rigId) as RigReleaseRow[];
+    const rows = readRows();
 
     const launchedLogicalIds = rows
       .filter((row) => row.session_id && row.session_origin === "launched")
@@ -331,73 +333,89 @@ export class RigLifecycleService {
       };
     }
 
-    const released: Array<{
-      nodeId: string;
-      logicalId: string;
-      sessionId: string;
-      sessionName: string;
-    }> = [];
-    const failed: Array<{
-      nodeId: string;
-      logicalId: string;
-      sessionId: string | null;
-      sessionName: string | null;
-      error: string;
-    }> = [];
-
-    for (const row of rows) {
-      if (!row.session_id || row.session_origin !== "claimed") continue;
-      const result = await this.unclaimSession(row.session_id);
-      if (result.ok) {
-        released.push({
-          nodeId: result.nodeId,
-          logicalId: result.logicalId,
-          sessionId: result.sessionId,
-          sessionName: result.sessionName,
-        });
-      } else {
-        failed.push({
-          nodeId: row.node_id,
-          logicalId: row.logical_id,
-          sessionId: row.session_id,
-          sessionName: row.session_name,
-          error: result.error,
-        });
+    const targets = opts?.delete ? rows : rows.filter(row => row.session_origin === "claimed"
+      && (row.session_status !== "detached" || row.tmux_session !== null));
+    const release = async (): Promise<ReleaseRigResult> => {
+      const current = new Map(readRows().map(row => [row.node_id, row]));
+      if ((opts?.delete && current.size !== rows.length) || targets.some(target => {
+        const row = current.get(target.node_id);
+        return !row || row.session_id !== target.session_id || row.session_name !== target.session_name
+          || row.session_origin !== target.session_origin || row.logical_id !== target.logical_id
+          || row.session_status !== target.session_status || row.tmux_session !== target.tmux_session;
+      })) {
+        throw new DeliveryGuardError("guard_target_changed", "Release target changed while waiting; no cleanup performed.");
       }
-    }
 
-    let deleted = false;
-    if (failed.length === 0 && opts?.delete) {
-      let persistedSeq = 0;
-      let persistedAt = "";
-      const tx = this.db.transaction(() => {
-        const event = this.eventBus.persistWithinTransaction({
+      const released: Array<{
+        nodeId: string;
+        logicalId: string;
+        sessionId: string;
+        sessionName: string;
+      }> = [];
+      const failed: Array<{
+        nodeId: string;
+        logicalId: string;
+        sessionId: string | null;
+        sessionName: string | null;
+        error: string;
+      }> = [];
+
+      for (const row of targets) {
+        if (!row.session_id || row.session_origin !== "claimed") continue;
+        const result = await this.unclaimSession(row.session_id);
+        if (result.ok) {
+          released.push({
+            nodeId: result.nodeId,
+            logicalId: result.logicalId,
+            sessionId: result.sessionId,
+            sessionName: result.sessionName,
+          });
+        } else {
+          failed.push({
+            nodeId: row.node_id,
+            logicalId: row.logical_id,
+            sessionId: row.session_id,
+            sessionName: row.session_name,
+            error: result.error,
+          });
+        }
+      }
+
+      let deleted = false;
+      if (failed.length === 0 && opts?.delete) {
+        let persistedSeq = 0;
+        let persistedAt = "";
+        const tx = this.db.transaction(() => {
+          const event = this.eventBus.persistWithinTransaction({
+            type: "rig.deleted",
+            rigId,
+          });
+          persistedSeq = event.seq;
+          persistedAt = event.createdAt;
+          this.rigRepo.deleteRig(rigId);
+        });
+        tx();
+
+        this.eventBus.notifySubscribers({
           type: "rig.deleted",
           rigId,
+          seq: persistedSeq,
+          createdAt: persistedAt,
         });
-        persistedSeq = event.seq;
-        persistedAt = event.createdAt;
-        this.rigRepo.deleteRig(rigId);
-      });
-      tx();
+        deleted = true;
+      }
 
-      this.eventBus.notifySubscribers({
-        type: "rig.deleted",
+      return {
+        ok: true,
+        status: failed.length > 0 ? "partial" : "ok",
         rigId,
-        seq: persistedSeq,
-        createdAt: persistedAt,
-      });
-      deleted = true;
-    }
-
-    return {
-      ok: true,
-      status: failed.length > 0 ? "partial" : "ok",
-      rigId,
-      deleted,
-      released,
-      failed,
+        deleted,
+        released,
+        failed,
+      };
     };
+    const guard = this.tmuxAdapter?.deliveryGuard;
+    return guard ? guard.custody(targets.map(row => row.node_id), release) : release();
   }
 
   async removeNode(
