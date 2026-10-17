@@ -99,6 +99,7 @@ export class ContextMonitor {
     this.compactionEnforcer?.reconcilePreparations?.();
     const sessions = this.getEligibleSessions();
     for (const session of sessions) {
+      if (!this.isCurrentSession(session)) continue;
       let observed: ContextUsage | null = null;
       const canReadContextUsage = session.runtime !== "codex" || !!session.resume_token;
       if (canReadContextUsage) {
@@ -179,6 +180,7 @@ export class ContextMonitor {
           usedPercentage: usage.usedPercentage,
           transcriptPath: usage.transcriptPath,
           sessionId: usage.sessionId,
+          isObservationCurrent: () => this.isCurrentSession(session),
         });
         return;
       }
@@ -189,11 +191,20 @@ export class ContextMonitor {
         runtime: session.runtime,
         transcriptPath: usage?.transcriptPath ?? null,
         sessionId: usage?.sessionId ?? null,
+        isObservationCurrent: () => this.isCurrentSession(session),
       });
     } catch {
       // Defensive: enforcer should not throw, but absorb here so the
       // polling loop continues to make progress for remaining sessions.
     }
+  }
+
+  /** Readiness normalization changes these two fields itself; all other snapshot
+   * fields, including the launch event sequence, must still describe this seat. */
+  private isCurrentSession(session: EligibleSession): boolean {
+    const current = this.getEligibleSessions(session.node_id)[0];
+    return current !== undefined && Object.entries(session).every(([key, value]) =>
+      key === "startup_status" || key === "startup_completed_at" || current[key as keyof EligibleSession] === value);
   }
 
   /** Start polling at the given interval. Idempotent. */
