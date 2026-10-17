@@ -53,7 +53,7 @@ export type UnclaimSessionResult =
     }
   | {
       ok: false;
-      code: "session_not_found" | "session_ambiguous";
+      code: "session_not_found" | "session_ambiguous" | "session_not_current";
       error: string;
     };
 
@@ -203,6 +203,21 @@ export class RigLifecycleService {
 
     const session = matches[0]!;
 
+    const guard = this.tmuxAdapter?.deliveryGuard;
+    if (guard && !guard.ownsLifecycle(session.node_id)) {
+      return guard.lifecycle([session.node_id], () => this.unclaimSession(session.session_id));
+    }
+    const latest = this.db.prepare(
+      "SELECT id FROM sessions WHERE node_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+    ).get(session.node_id) as { id: string } | undefined;
+    if (latest?.id !== session.session_id || (session.tmux_session && session.tmux_session !== session.session_name)) {
+      return {
+        ok: false,
+        code: "session_not_current",
+        error: `Claimed session '${session.session_id}' no longer owns this seat. No metadata or custody was changed.`,
+      };
+    }
+
     // Best-effort: clear OpenRig-owned tmux metadata from the adopted session.
     if (this.tmuxAdapter && session.tmux_session) {
       const keys = [
@@ -261,6 +276,12 @@ export class RigLifecycleService {
     const rig = this.rigRepo.getRig(rigId);
     if (!rig) {
       return { ok: false, code: "rig_not_found", error: `Rig '${rigId}' not found.` };
+    }
+
+    const guard = this.tmuxAdapter?.deliveryGuard;
+    const nodeIds = rig.nodes.map(node => node.id);
+    if (guard && nodeIds.some(id => !guard.ownsLifecycle(id))) {
+      return guard.lifecycle(nodeIds, () => this.releaseRig(rigId, opts));
     }
 
     const rows = this.db.prepare(`
