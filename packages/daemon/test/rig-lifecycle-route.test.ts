@@ -60,7 +60,10 @@ describe("Rig lifecycle routes", () => {
       expect(result.sessionsKilled).toBe(1);
       expect(nodes).toContain("infra.server");
       expect(queue.getById(arrived)?.destinationSession).toBe(session);
-      expect(result.error).toContain("session has already been stopped");
+      expect(result.error).toContain(`session '${session}' was stopped and stays stopped`);
+      if (target.startsWith("nodes/")) expect(result).toMatchObject({ retained: true, sessionStopped: true });
+      else expect(result.nodes).toMatchObject([{ logicalId: "infra.server", status: "failed", code: "active_qitems",
+        retained: true, sessionStopped: true, sessionsKilled: 1, activeQitemIds: [arrived] }]);
       expect(db.prepare("SELECT status, intentionally_stopped FROM sessions WHERE session_name = ?").get(session))
         .toEqual({ status: "exited", intentionally_stopped: 1 });
       expect(stopped).toEqual([session]);
@@ -92,10 +95,76 @@ describe("Rig lifecycle routes", () => {
     const result = await response.json();
     expect(result).toMatchObject({ status: "partial", sessionsKilled: 2, removedLogicalIds: ["infra.a"],
       nodes: [{ logicalId: "infra.a", status: "removed", sessionsKilled: 1 },
-        { logicalId: "infra.b", status: "failed", sessionsKilled: 1 }] });
+        { logicalId: "infra.b", status: "failed", sessionsKilled: 1, code: "active_qitems", retained: true, sessionStopped: true }] });
     expect(result.nodes[1].error).toContain(arrived);
     expect(setup.rigRepo.getRig(rig.id)!.nodes.map(node => node.logicalId)).toEqual(["infra.b"]);
     expect(queue.getById(arrived)?.destinationSession).toBe(second.sessionName);
+  });
+
+  it("completes a pod shrink whose unused fallback stops running after the pod-level check", async () => {
+    migrate(db, ALL_MIGRATIONS);
+    const rig = setup.rigRepo.createRig("unused-fallback");
+    const expand = (id: string, members: string[]) => setup.rigExpansionService.expand({ rigId: rig.id,
+      pod: { id, label: id, members: members.map(member => ({ id: member, runtime: "terminal", agentRef: "builtin:terminal",
+        profile: "none", cwd: "/tmp" })), edges: [] } });
+    const worker = await expand("infra", ["a", "b"]);
+    const receiver = await expand("safe", ["fallback"]);
+    expect(worker.ok && receiver.ok).toBe(true);
+    if (!worker.ok || !receiver.ok) return;
+    const fallbackSession = receiver.nodes[0]!.sessionName;
+    Object.assign(setup.tmuxAdapter, { deliveryGuard: new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name)) });
+    vi.mocked(setup.tmuxAdapter.hasSession).mockResolvedValueOnce(true).mockResolvedValue(false);
+    vi.mocked(setup.tmuxAdapter.killSession).mockResolvedValue({ ok: true });
+
+    const response = await setup.app.request(`/api/rigs/${rig.id}/pods/infra?fallback=${encodeURIComponent(fallbackSession)}`, { method: "DELETE" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "ok", sessionsKilled: 2, removedLogicalIds: ["infra.a", "infra.b"], reroutedQitemIds: [] });
+    expect(setup.tmuxAdapter.hasSession).toHaveBeenCalledTimes(1);
+    expect(setup.rigRepo.getRig(rig.id)!.nodes.map(node => node.logicalId)).toEqual(["safe.fallback"]);
+  });
+
+  it.each(["nodes/infra.server", "pods/infra"])("reports the real code and effects when the fallback is lost before late work in %s removal", async (target) => {
+    migrate(db, ALL_MIGRATIONS);
+    const rig = setup.rigRepo.createRig("lost-fallback");
+    const expand = (id: string, member: string) => setup.rigExpansionService.expand({ rigId: rig.id,
+      pod: { id, label: id, members: [{ id: member, runtime: "terminal", agentRef: "builtin:terminal", profile: "none", cwd: "/tmp" }], edges: [] } });
+    const worker = await expand("infra", "server");
+    const receiver = await expand("safe", "fallback");
+    expect(worker.ok && receiver.ok).toBe(true);
+    if (!worker.ok || !receiver.ok) return;
+    const session = worker.nodes[0]!.sessionName;
+    const fallbackSession = receiver.nodes[0]!.sessionName;
+    const queue = new QueueRepository(db, setup.eventBus);
+    Object.assign(setup.tmuxAdapter, { deliveryGuard: new SeatDeliveryGuard(db, name => resolveGuardTarget(db, name)) });
+    const early = (await queue.create({ sourceSession: "source@lost-fallback", destinationSession: session,
+      body: "queued before removal", nudge: false })).qitemId;
+    let fallbackRunning = true;
+    vi.mocked(setup.tmuxAdapter.hasSession).mockImplementation(async () => fallbackRunning);
+    let late = "";
+    vi.mocked(setup.tmuxAdapter.killSession).mockImplementationOnce(async () => {
+      late = (await queue.create({ sourceSession: "source@lost-fallback", destinationSession: session,
+        body: "accepted while tmux was stopping", nudge: false })).qitemId;
+      fallbackRunning = false;
+      return { ok: true };
+    });
+
+    const response = await setup.app.request(`/api/rigs/${rig.id}/${target}?fallback=${encodeURIComponent(fallbackSession)}`, { method: "DELETE" });
+    expect(response.status).toBe(409);
+    const result = await response.json();
+    expect(result).toMatchObject({ code: "fallback_not_running", sessionsKilled: 1, fallbackDestination: fallbackSession,
+      reroutedQitemIds: [early], activeQitemIds: [late] });
+    if (target.startsWith("nodes/")) expect(result).toMatchObject({ retained: true, sessionStopped: true });
+    else expect(result.nodes).toMatchObject([{ logicalId: "infra.server", status: "failed", code: "fallback_not_running",
+      retained: true, sessionStopped: true, sessionsKilled: 1, activeQitemIds: [late] }]);
+    expect(result.error).not.toContain("No queue or topology changes were made");
+    expect(result.error).toContain(early);
+    expect(result.error).toContain(late);
+    expect(result.error).toContain("stays stopped");
+    expect(queue.getById(early)?.destinationSession).toBe(fallbackSession);
+    expect(queue.getById(late)).toMatchObject({ destinationSession: session, state: "pending" });
+    expect(setup.rigRepo.getRig(rig.id)!.nodes.map(node => node.logicalId)).toContain("infra.server");
+    expect(db.prepare("SELECT status, intentionally_stopped FROM sessions WHERE session_name = ?").get(session))
+      .toEqual({ status: "exited", intentionally_stopped: 1 });
   });
 
   it("POST /api/sessions/:sessionRef/unclaim releases a claimed session and reactivates discovery", async () => {
