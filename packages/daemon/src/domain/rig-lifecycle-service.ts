@@ -79,6 +79,7 @@ export type RemoveNodeResult =
       activeQitemIds?: string[];
       fallbackDestination?: string;
       reroutedQitemIds?: string[];
+      sessionsKilled?: number;
     };
 
 export type ReleaseRigResult =
@@ -524,9 +525,27 @@ export class RigLifecycleService {
       sessionsKilled = !kill || kill.ok ? 1 : 0;
     }
 
+    // Queue writes can be accepted while tmux termination awaits, even while
+    // this operation owns the seat's lifecycle lease. Honor the same fallback
+    // for those arrivals, then recheck inside the topology transaction.
+    const addressedSessions = node.latest_session_name && !sessionOwner ? [node.latest_session_name] : [];
+    if (fallbackDestination !== undefined) {
+      for (const qitemId of this.activeQitemIdsForSessionNames(addressedSessions)) {
+        this.queueRepo.routeToFallback(qitemId, fallbackDestination, `explicit fallback while removing node ${node.logical_id}`);
+        if (!activeQitemIds.includes(qitemId)) activeQitemIds.push(qitemId);
+      }
+    }
+
     const persisted: Array<{ type: "session.detached" | "node.removed"; seq: number; createdAt: string }> = [];
     let rosterEvent: ReturnType<EventBus["persistWithinTransaction"]> | null = null;
     const tx = this.db.transaction(() => {
+      const remaining = this.activeQitemIdsForSessionNames(addressedSessions);
+      if (remaining.length > 0) {
+        if (!keepSession && node.latest_session_name && node.latest_session_id) {
+          this.sessionRegistry.markIntentionallyStopped(node.latest_session_id);
+          this.sessionRegistry.clearBinding(node.node_id);
+        }
+      }
       if (node.latest_session_name && !keepSession) {
         const detached = this.eventBus.persistWithinTransaction({
           type: "session.detached",
@@ -536,6 +555,7 @@ export class RigLifecycleService {
         });
         persisted.push({ type: "session.detached", seq: detached.seq, createdAt: detached.createdAt });
       }
+      if (remaining.length > 0) return remaining;
       const removed = this.eventBus.persistWithinTransaction({
         type: "node.removed",
         rigId,
@@ -549,8 +569,9 @@ export class RigLifecycleService {
         intendedNodeIds: this.rigRepo.getRig(rigId)?.nodes.map((candidate) => candidate.id) ?? [],
         source: "materialized_topology",
       });
+      return [];
     });
-    tx();
+    const remaining = tx();
 
     for (const event of persisted) {
       if (event.type === "session.detached" && node.latest_session_name) {
@@ -574,6 +595,17 @@ export class RigLifecycleService {
       }
     }
     if (rosterEvent) this.eventBus.notifySubscribers(rosterEvent);
+
+    if (remaining.length > 0) {
+      return {
+        ok: false, code: "active_qitems", activeQitemIds: remaining,
+        fallbackDestination, reroutedQitemIds: activeQitemIds, sessionsKilled,
+        error: this.activeQitemsError(
+          `Node '${node.logical_id}' received active queue work during removal and was retained.${!keepSession && node.latest_session_name ? " Its session has already been stopped." : ""}`,
+          remaining,
+        ),
+      };
+    }
 
     return {
       ok: true,
@@ -661,8 +693,12 @@ export class RigLifecycleService {
       error?: string;
     }> = [];
     for (const node of nodes) {
-      const removed = await this.removeNode(rigId, node.id);
+      const removed = await this.removeNode(rigId, node.id, opts);
+      for (const qitemId of removed.reroutedQitemIds ?? []) {
+        if (!activeQitemIds.includes(qitemId)) activeQitemIds.push(qitemId);
+      }
       if (!removed.ok) {
+        sessionsKilled += removed.sessionsKilled ?? 0;
         const error = removed.code === "node_not_found"
           ? `Node '${node.logical_id}' disappeared while shrinking pod '${pod.namespace}'.`
           : removed.error;
@@ -672,7 +708,7 @@ export class RigLifecycleService {
             nodeId: node.id,
             logicalId: node.logical_id,
             status: "failed",
-            sessionsKilled: 0,
+            sessionsKilled: removed.sessionsKilled ?? 0,
             error,
           });
           return {
@@ -706,6 +742,9 @@ export class RigLifecycleService {
             fallbackDestination,
             reroutedQitemIds: activeQitemIds,
           };
+        }
+        if (removed.code === "active_qitems") {
+          return { ...removed, code: "active_qitems", fallbackDestination, reroutedQitemIds: activeQitemIds };
         }
         return {
           ok: false,
