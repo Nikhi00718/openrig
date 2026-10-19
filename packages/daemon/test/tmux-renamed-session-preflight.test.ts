@@ -84,6 +84,32 @@ describe("managed launch refuses a session name tmux would rename", () => {
     expect(createSession()).not.toHaveBeenCalled();
   });
 
+  it("materialize-only (import --materialize-only, rig adopt) still creates a dotted rig, without a session", async () => {
+    const result = await setup.podInstantiator.materialize(RigSpecCodec.serialize(podSpec("demo.v2")), "/tmp");
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    expect(setup.rigRepo.listRigs().map((r) => r.name)).toContain("demo.v2");
+    expect(createSession()).not.toHaveBeenCalled();
+  });
+
+  it("legacy instantiate reports the rename instead of probing the dotted name", async () => {
+    // Real tmux reads ".v2" in a has-session target as a pane and fails rather than answering absent.
+    const hasSession = vi.fn(async (name: string) => {
+      if (name.includes(".")) throw new Error("can't find pane: v2-solo");
+      return name === "r00-taken-solo";
+    });
+    (setup.tmuxAdapter as unknown as { hasSession: typeof hasSession }).hasSession = hasSession;
+
+    const dotted = await setup.rigInstantiator.instantiate(flatSpec("demo.v2") as never);
+    expect(dotted).toMatchObject({ ok: false, code: "preflight_failed" });
+    expect(((dotted as { errors?: string[] }).errors ?? []).join(" ")).toContain(renamed("r00-demo_v2-solo"));
+    expect(hasSession).not.toHaveBeenCalledWith("r00-demo.v2-solo");
+
+    // An ordinary collision is still probed and reported.
+    const taken = await setup.rigInstantiator.instantiate(flatSpec("taken") as never);
+    expect(((taken as { errors?: string[] }).errors ?? []).join(" ")).toContain("tmux session 'r00-taken-solo' already exists");
+    expect(createSession()).not.toHaveBeenCalled();
+  });
+
   it("legacy instantiate control: a name without dots launches", async () => {
     const result = await setup.rigInstantiator.instantiate(flatSpec("demo-v2") as never);
     expect(result.ok, JSON.stringify(result)).toBe(true);

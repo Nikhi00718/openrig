@@ -547,6 +547,8 @@ export class PodRigInstantiator {
       rigNameOverride: targetRig?.rig.name,
       externalQualifiedIds: targetRig?.nodes.map((node) => node.logicalId),
       inheritedPermissionPolicy: this.inheritedPermissionPolicy(opts?.targetRigId),
+      // No session follows a materialize; `rig adopt` binds sessions already running under their own names.
+      materializeOnly: true,
       exec: this.deps.exec,
       claudeActivityAssets: this.deps.claudeActivityAssets, // §6: restore main's activity-hook asset threading
     });
