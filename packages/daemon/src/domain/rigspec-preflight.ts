@@ -6,7 +6,7 @@ import type { ExecFn } from "../adapters/tmux.js";
 import { runtimeProbeFailure, runtimeProbeTimeout } from "../adapters/preflight-exec.js";
 import { piVersionNotice } from "../adapters/pi-readiness.js";
 import type { LegacyRigSpec as RigSpec, PreflightResult, RigSpec as PodRigSpec, RigSpecPod, RigSpecPodMember } from "./types.js"; // TODO: AS-T08b — migrate to pod-aware RigSpec
-import { deriveSessionName, validateSessionName, validateSessionComponents, VIRTUAL_DOMAIN_TOKENS } from "./session-name.js";
+import { deriveCanonicalSessionName, deriveSessionName, tmuxRenamedSessionError, validateSessionName, validateSessionComponents, VIRTUAL_DOMAIN_TOKENS } from "./session-name.js";
 
 const RUNTIME_COMMANDS: Record<string, string> = {
   "claude-code": "claude --version",
@@ -47,6 +47,9 @@ export class RigSpecPreflight {
       const sessionName = deriveSessionName(spec.name, node.id);
       if (!validateSessionName(sessionName)) {
         errors.push(`Derived session name '${sessionName}' is invalid for node '${node.id}'`);
+      } else {
+        const renamed = tmuxRenamedSessionError(sessionName);
+        if (renamed) errors.push(`${node.id}: ${renamed}`);
       }
     }
 
@@ -295,6 +298,8 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
       for (const err of nameErrors) {
         errors.push(`${pod.id}.${member.id}: ${err}`);
       }
+      const renamed = nameErrors.length === 0 ? tmuxRenamedSessionError(deriveCanonicalSessionName(pod.id, member.id, effectiveRigName)) : null;
+      if (renamed) errors.push(`${pod.id}.${member.id}: ${renamed}`);
     }
   }
 
