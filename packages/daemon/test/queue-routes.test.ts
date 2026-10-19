@@ -1600,6 +1600,60 @@ describe("queue routes", () => {
     expect(data).toHaveLength(1);
   });
 
+  it("GET /api/queue/list trims each state name and otherwise keeps today's matching", async () => {
+    const post = (path: string, session: string, body: Record<string, unknown>) => app.request(path, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": session }, body: JSON.stringify(body),
+    });
+    const create = async (body: Record<string, unknown>) =>
+      ((await (await post("/api/queue/create", "a@r", { nudge: false, ...body })).json()) as { qitemId: string }).qitemId;
+    const pending = await create({ destinationSession: "b@r", body: "pending" });
+    const inProgress = await create({ destinationSession: "b@r", body: "in progress" });
+    const done = await create({ destinationSession: "b@r", body: "done" });
+    expect((await post(`/api/queue/${inProgress}/claim`, "b@r", {})).status).toBe(200);
+    expect((await post(`/api/queue/${done}/claim`, "b@r", {})).status).toBe(200);
+    expect((await post(`/api/queue/${done}/update`, "b@r", { state: "done", closureReason: "no-follow-on", transitionNote: "done" })).status).toBe(200);
+    const gate = await create({
+      destinationSession: "human-founder@external", body: "approve me", tier: "human-gate",
+      summary: "approve", evidenceRef: "proof/evidence.md",
+    });
+
+    const ids = async (query: string) => {
+      const res = await app.request(`/api/queue/list?${query}`);
+      expect(res.status).toBe(200);
+      return ((await res.json()) as Array<{ qitemId: string }>).map((q) => q.qitemId).sort();
+    };
+    const plain = (rest: string) => ids(`destinationSession=b@r${rest}`);
+    const attention = (rest: string) => ids(`attention=1&destinationSession=human-founder@external${rest}`);
+    const state = (value: string) => `&state=${encodeURIComponent(value)}`;
+
+    // The fix: a space around a name no longer drops it.
+    expect(await plain(state("pending, in-progress"))).toEqual([pending, inProgress].sort());
+    expect(await plain(state(" pending , in-progress "))).toEqual([pending, inProgress].sort());
+    expect(await attention(state(" pending"))).toEqual([gate]);
+    expect(await plain(`&activeOnly=1${state(" done")}`)).toEqual([done]);
+
+    // Unchanged: an unknown name matches nothing, alone or beside a known one.
+    expect(await plain(state("pending,in-progress"))).toEqual([pending, inProgress].sort());
+    expect(await plain(state("pending,inprogress"))).toEqual([pending]);
+    expect(await plain(state("in_progress"))).toEqual([]);
+    expect(await attention(state("pending,inprogress"))).toEqual([gate]);
+    expect(await attention(state("in_progress"))).toEqual([]);
+
+    // Unchanged: only commas or spaces is an explicit filter that matches nothing, with or without activeOnly.
+    for (const value of [",", " ", " , "]) {
+      expect(await plain(state(value))).toEqual([]);
+      expect(await plain(`&activeOnly=1${state(value)}`)).toEqual([]);
+      expect(await attention(state(value))).toEqual([]);
+    }
+
+    // Unchanged: an absent or empty state keeps each path's default.
+    for (const rest of ["", "&state="]) {
+      expect(await plain(rest)).toEqual([pending, inProgress, done].sort());
+      expect(await plain(`&activeOnly=1${rest}`)).toEqual([pending, inProgress].sort());
+      expect(await attention(rest)).toEqual([gate]);
+    }
+  });
+
   // OPR.0.3.2.20 — `?attention=1` filter for the For You priority
   // windowing slice. Returns OPEN attention-class qitems (the durable
   // source of truth) so the UI Action-required + Approval lenses don't

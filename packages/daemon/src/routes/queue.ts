@@ -966,8 +966,10 @@ export function queueRoutes(): Hono {
     const activeOnly = c.req.query("activeOnly") === "1";
     const attention = c.req.query("attention") === "1";
 
+    // Trim each name so "pending, in-progress" matches like "pending,in-progress". A blank name
+    // stays in the filter (it matches no row), so a filter of only commas or spaces stays explicit.
     const state: QueueState[] | undefined = stateRaw
-      ? (stateRaw.split(",") as QueueState[])
+      ? (stateRaw.split(",").map((s) => s.trim()) as QueueState[])
       : attention
         ? ["pending", "in-progress", "blocked"]
         : undefined;
