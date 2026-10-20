@@ -32,13 +32,21 @@ describe("workflow boot recovery with durable wake intents", () => {
       db.prepare("UPDATE outbox_entries SET delivery_state = ? WHERE outbox_id = ?").run(state, id);
       const send = vi.fn(async (_session: string, _text: string, _opts?: SendOpts) => ({ ok: true, verified: true }));
       repo.attachTransport({ send });
+      db.prepare("UPDATE queue_items SET ts_created = '2000-01-01T00:00:00.000Z' WHERE qitem_id = ?").run(packet.qitemId);
+      const log: string[] = [];
+      const ensureStuckExceptionItem = vi.fn(async () => ({ outcome: "created" as const, qitemId: "exception" }));
 
       // This is startup.ts's order: workflow sweep, abandoned-claim reconciliation, intent drain.
-      await runWorkflowBootSweep({ instanceStore: instances, queueRepo: repo, watchdogJobsRepo: new WatchdogJobsRepository(db) });
+      const result = await runWorkflowBootSweep({ instanceStore: instances, queueRepo: repo,
+        watchdogJobsRepo: new WatchdogJobsRepository(db), log: line => log.push(line), ensureStuckExceptionItem });
       repo.reconcileAbandonedWakeIntents();
       await repo.drainPendingWakeIntents();
 
       expect(send).toHaveBeenCalledTimes(state === "pending" ? 1 : 0);
+      expect(result).toMatchObject({ lostNudgeRecoveryAttempts: 1, stuckSurfaced: 1, exceptionItemsCreated: 1 });
+      expect(log.at(-1)).toContain("1 lost-nudge recovery attempt(s)");
+      expect(log.at(-1)).not.toContain("reissued");
+      expect(ensureStuckExceptionItem).toHaveBeenCalledOnce();
       expect(outbox.getById(id)?.deliveryState).toBe(state === "pending" ? "delivered" : state === "sending" ? "indeterminate" : state);
       if (state === "pending") expect(send.mock.calls[0]?.[2]).toMatchObject({ committedOutboxIds: [id] });
     },
@@ -62,7 +70,7 @@ describe("workflow boot recovery with durable wake intents", () => {
     const result = await runWorkflowBootSweep({ instanceStore: instances, queueRepo: repo, watchdogJobsRepo: new WatchdogJobsRepository(db), ensureStuckExceptionItem });
 
     expect(send).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({ lostNudgesReissued: 1, stuckSurfaced: 1 });
+    expect(result).toMatchObject({ lostNudgeRecoveryAttempts: 1, stuckSurfaced: 1 });
     expect(ensureStuckExceptionItem).toHaveBeenCalledOnce();
   });
 });

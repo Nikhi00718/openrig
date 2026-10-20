@@ -653,7 +653,7 @@ describe("S06 lifecycle productization", () => {
       watchdogJobsRepo: watchdogRepo,
     });
     expect(swept.keepalivesArmed).toBe(2);
-    expect(swept.lostNudgesReissued).toBe(2);
+    expect(swept.lostNudgeRecoveryAttempts).toBe(2);
     expect(sentNudges.sort()).toEqual(["left@rig", "right@rig"]);
     for (const packet of [left, right]) {
       expect(new OutboxHandler(db).getById(`${WAKE_INTENT_PREFIX}${packet.packetId}`)?.deliveryState).toBe("delivered");

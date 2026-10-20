@@ -35,7 +35,8 @@ import { ensureWorkflowKeepaliveArmed } from "./workflow-keepalive-arming.js";
 export interface WorkflowBootSweepResult {
   instancesSwept: number;
   keepalivesArmed: number;
-  lostNudgesReissued: number;
+  /** Packets routed through recovery; a retained or terminal intent need not send input. */
+  lostNudgeRecoveryAttempts: number;
   stuckSurfaced: number;
   /** OPR.0.4.6.WF5 FR-2 class (b): stuck exception items created this
    *  sweep (deduped re-detections not counted). */
@@ -71,7 +72,7 @@ export async function runWorkflowBootSweep(
   const result: WorkflowBootSweepResult = {
     instancesSwept: instances.length,
     keepalivesArmed: 0,
-    lostNudgesReissued: 0,
+    lostNudgeRecoveryAttempts: 0,
     stuckSurfaced: 0,
     exceptionItemsCreated: 0,
   };
@@ -108,7 +109,7 @@ export async function runWorkflowBootSweep(
     const recoveredPackets = new Set<string>();
     for (const packet of packets) {
       if (packet.state === "pending" && packet.lastNudgeAttempt === null) {
-        result.lostNudgesReissued += 1;
+        result.lostNudgeRecoveryAttempts += 1;
         await deps.queueRepo.recoverLostNudge(
           packet.qitemId,
           packet.destinationSession,
@@ -171,7 +172,7 @@ export async function runWorkflowBootSweep(
   }
 
   log(
-    `workflow boot sweep: ${result.instancesSwept} in-flight instance(s) — ${result.keepalivesArmed} keepalive(s) armed, ${result.lostNudgesReissued} lost nudge(s) reissued, ${result.stuckSurfaced} stuck surfaced, ${result.exceptionItemsCreated} exception item(s) created`,
+    `workflow boot sweep: ${result.instancesSwept} in-flight instance(s) — ${result.keepalivesArmed} keepalive(s) armed, ${result.lostNudgeRecoveryAttempts} lost-nudge recovery attempt(s), ${result.stuckSurfaced} stuck surfaced, ${result.exceptionItemsCreated} exception item(s) created`,
   );
   return result;
 }
