@@ -10,10 +10,28 @@ import {
 
 /** Marks the outbox entries that bind a digest's members to its one attempt. */
 export const WATCHDOG_DIGEST_TAG = "watchdog:digest";
+const LEGACY_OCCURRENCE_TAG = "watchdog:cadence:";
 
 /** The outbox id a watchdog occurrence is delivered under, alone or inside a digest. */
 export function watchdogDeliveryId(occurrenceId: string): string {
   return `guard-watchdog-${occurrenceId}`;
+}
+
+/** Bind an old receipt to the cadence that recovers it, before any input. The
+ * same cadence keeps that identity across crashes; a later cadence cannot
+ * borrow it again. An unmarked pre-upgrade receipt is conservatively adopted
+ * once because it may have been written before its job was accounted. */
+function bindLegacyOccurrence(outbox: OutboxHandler, id: string, occurrence: string): boolean {
+  return outbox.db.transaction(() => {
+    const entry = outbox.getById(id);
+    if (!entry) return false;
+    const binding = entry.tags?.find(tag => tag.startsWith(LEGACY_OCCURRENCE_TAG));
+    const tag = `${LEGACY_OCCURRENCE_TAG}${occurrence}`;
+    if (binding) return binding === tag;
+    outbox.db.prepare("UPDATE outbox_entries SET tags = ? WHERE outbox_id = ?")
+      .run(JSON.stringify([...(entry.tags ?? []), tag]), id);
+    return true;
+  })();
 }
 
 /**
@@ -58,13 +76,25 @@ export function makeWatchdogDeliver(deps: {
         continuityActionCompleted = true;
       }
       if (source.members) return await sendDigest(deps, targetSession, message, source, bindDigest(deps, targetSession, message, source));
-      const prior = priorDigestAttempt(outbox, source.occurrenceId ?? source.jobId);
+      const occurrence = source.occurrenceId ?? source.jobId;
+      let deliveryId = watchdogDeliveryId(occurrence);
+      let deliveryOccurrence = occurrence;
+      const legacyId = source.legacyOccurrenceId ? watchdogDeliveryId(source.legacyOccurrenceId) : undefined;
+      // A new-format receipt wins. Otherwise preserve an outstanding old-format
+      // attempt rather than typing the same input under a different identity.
+      if (legacyId && (legacyId === deliveryId || !outbox.getById(deliveryId)) && bindLegacyOccurrence(outbox, legacyId, occurrence)) {
+        deliveryId = legacyId;
+        deliveryOccurrence = source.legacyOccurrenceId!;
+      }
+      const prior = priorDigestAttempt(outbox, deliveryOccurrence);
       if (prior) return prior;
-      const deliveryId = watchdogDeliveryId(source.occurrenceId ?? source.jobId);
       const previous = outbox.getById(deliveryId);
       const payload = previous?.guardBinding ? previous.body : formatWatchdogDeliveryMessage(source, message);
       const result = await sessionTransport.send(targetSession, payload,
         { deliveryId, actorSession: "watchdog@system", auditPointer: source.jobId });
+      // A new first fire uses the old three-field ID too. Mark its receipt
+      // before returning to job accounting so a later cadence cannot adopt it.
+      if (deliveryId === legacyId) bindLegacyOccurrence(outbox, deliveryId, occurrence);
       if (result.outcome === "retained") return { status: "retained", outboxIds: result.outboxIds, continuityActionCompleted };
       return result.ok
         ? { status: "ok", continuityActionCompleted }

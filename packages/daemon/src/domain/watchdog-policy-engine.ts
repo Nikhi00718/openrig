@@ -61,6 +61,8 @@ export interface DeliveryOutcome {
 
 export interface WatchdogDeliverySource {
   occurrenceId?: string;
+  /** Pre-cadence identity: an unfinished old-format receipt may still own this attempt. */
+  legacyOccurrenceId?: string;
   jobId: string;
   policy: string;
   /** A digest's members, when one send carries several reminders: each job and the occurrence it was due for. */
@@ -535,10 +537,12 @@ export class WatchdogPolicyEngine {
     );
 
     const occurrence = [job.jobId, occupantGeneration, outcome.conditionReceipt ?? (job.policy === "periodic-reminder" ? job.lastFireAt : outcome.message)];
+    const recurring = outcome.conditionReceipt === undefined && job.policy !== "periodic-reminder" && job.policy !== "context-usage-threshold";
+    const legacyOccurrenceId = recurring ? createHash("sha256").update(JSON.stringify(occurrence)).digest("hex") : undefined;
     // A recurring policy may send identical text on later cadences. Once an
     // attempt is accounted, its next fire needs a new delivery identity. Keep
     // first-fire IDs and generation-bound threshold IDs stable for recovery.
-    if (job.policy !== "periodic-reminder" && job.policy !== "context-usage-threshold" && job.lastFireAt !== null) {
+    if (recurring && job.lastFireAt !== null) {
       occurrence.push(job.lastFireAt);
     }
     const occurrenceId = createHash("sha256").update(JSON.stringify(occurrence)).digest("hex");
@@ -565,7 +569,7 @@ export class WatchdogPolicyEngine {
         message: outcome.message,
         ...(continuityAction ? { continuityAction } : {}),
       },
-      { jobId: job.jobId, policy: job.policy, occurrenceId },
+      { jobId: job.jobId, policy: job.policy, occurrenceId, ...(legacyOccurrenceId ? { legacyOccurrenceId } : {}) },
     );
     if (
       isContextUsageThreshold &&

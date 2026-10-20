@@ -3,6 +3,9 @@
 // another identity, and a new reminder still goes.
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import stringWidth from "string-width";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
@@ -23,6 +26,7 @@ import { WatchdogPolicyEngine } from "../src/domain/watchdog-policy-engine.js";
 import { WatchdogScheduler } from "../src/domain/watchdog-scheduler.js";
 import { WorkflowInstanceStore } from "../src/domain/workflow-instance-store.js";
 import { makeWorkflowKeepalivePolicy } from "../src/domain/policies/workflow-keepalive.js";
+import { makeIdleGateQitemPolicy } from "../src/domain/policies/idle-gate-qitem.js";
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -76,6 +80,98 @@ function fixture(saved?: Buffer) {
 const seat = "worker@test";
 
 describe("recurring watchdog delivery to a draft-aware seat", () => {
+  it("finishes an interrupted condition receipt after reopening, and still delivers a changed condition", async () => {
+    const f = fixture();
+    await f.enable();
+    const s = scheduled(f);
+    await s.repo.create({ sourceSession: seat, destinationSession: seat, body: "review", tags: ["gate:review"], nudge: false });
+    const policy = (db: Database.Database) => makeIdleGateQitemPolicy({ db, seatActivity: {
+      getSeatStateBySession: () => ({ activity: "idle-at-prompt", needsInput: { count: 0 } }),
+    } as never });
+    const history = new WatchdogHistoryLog(f.db);
+    const engine = new WatchdogPolicyEngine({ jobsRepo: s.jobs, historyLog: history, eventBus: new EventBus(f.db),
+      deliver: f.deliver, additionalPolicies: [policy(f.db)] });
+    const job = s.jobs.register({ policy: "idle-gate-qitem", targetSession: seat, intervalSeconds: 60, registeredBySession: seat,
+      specYaml: "message: Gate ready\n" });
+    vi.spyOn(s.jobs, "recordConditionReceipt").mockImplementationOnce(() => { throw new Error("receipt interrupted"); });
+    await expect(engine.evaluate(job)).rejects.toThrow("receipt interrupted");
+    expect(f.submissions).toHaveLength(1);
+    expect(s.jobs.getByIdOrThrow(job.jobId).lastFireAt).not.toBeNull();
+
+    const g = fixture(f.db.serialize());
+    const jobs = new WatchdogJobsRepository(g.db);
+    const reopened = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: new WatchdogHistoryLog(g.db),
+      eventBus: new EventBus(g.db), deliver: g.deliver, additionalPolicies: [policy(g.db)] });
+    expect((await reopened.evaluate(jobs.getByIdOrThrow(job.jobId))).delivery).toMatchObject({ status: "ok" });
+    expect(g.submissions).toEqual([]);
+    const receipt = (g.db.prepare("SELECT last_fired_condition AS value FROM watchdog_jobs WHERE job_id = ?").get(job.jobId) as { value: string }).value;
+    expect(receipt).toEqual(expect.any(String));
+    expect((await reopened.evaluate(jobs.getByIdOrThrow(job.jobId))).outcome).toMatchObject({ action: "skip", reason: "gate_condition_unchanged" });
+    await scheduled(g).repo.create({ sourceSession: seat, destinationSession: seat, body: "another review", tags: ["gate:review"], nudge: false });
+    await reopened.evaluate(jobs.getByIdOrThrow(job.jobId));
+    expect(g.submissions).toHaveLength(1);
+    expect((g.db.prepare("SELECT last_fired_condition AS value FROM watchdog_jobs WHERE job_id = ?").get(job.jobId) as { value: string }).value).not.toBe(receipt);
+  });
+
+  it.each(["sending", "indeterminate", "delivered"] as const)("keeps an unfinished pre-upgrade %s occurrence, then sends the later cadence", async (state) => {
+    const f = fixture();
+    await f.enable();
+    const pool = mkdtempSync(join(tmpdir(), "watchdog-upgrade-"));
+    cleanup.push(async () => { rmSync(pool, { recursive: true, force: true }); });
+    writeFileSync(join(pool, "ready.md"), "ready");
+    let at = Date.now() - 120_000;
+    const jobs = new WatchdogJobsRepository(f.db, () => new Date(at));
+    const job = jobs.register({ policy: "artifact-pool-ready", targetSession: seat, intervalSeconds: 60, registeredBySession: seat,
+      specYaml: JSON.stringify({ message: "Pool B", context: { pools: [{ path: pool }] } }) });
+    // The old release accounted A at T0, then attempted B under its three-field identity.
+    jobs.recordEvaluation(job.jobId, new Date(at).toISOString(), true);
+    new WatchdogHistoryLog(f.db).record({ jobId: job.jobId, evaluatedAt: new Date(at).toISOString(), outcome: "sent",
+      deliveryMessage: "Pool A", deliveryTargetSession: seat, deliveryStatus: "ok" });
+    const oldOccurrence = createHash("sha256").update(JSON.stringify([job.jobId, null, "Pool B"])).digest("hex");
+    const source = { jobId: job.jobId, policy: job.policy, occurrenceId: oldOccurrence };
+    let saved: Buffer;
+    if (state === "sending") {
+      let reached!: () => void, release!: () => void;
+      const started = new Promise<void>(resolve => { reached = resolve; });
+      f.hooks.paste = () => { reached(); return new Promise<void>(resolve => { release = resolve; }); };
+      const pending = f.deliver({ targetSession: seat, message: "Pool B" }, source);
+      await started;
+      saved = f.db.serialize();
+      release();
+      await pending;
+    } else {
+      if (state === "indeterminate") f.hooks.paste = async () => { throw new Error("lost paste acknowledgement"); };
+      await f.deliver({ targetSession: seat, message: "Pool B" }, source);
+      expect(f.outbox.getById(watchdogDeliveryId(oldOccurrence))?.deliveryState).toBe(state);
+      saved = f.db.serialize();
+    }
+    let g = fixture(saved);
+    let reopenedJobs = new WatchdogJobsRepository(g.db);
+    at += 60_000;
+    const history = new WatchdogHistoryLog(g.db);
+    let engine = new WatchdogPolicyEngine({ jobsRepo: reopenedJobs, historyLog: history,
+      eventBus: new EventBus(g.db), deliver: g.deliver, now: () => new Date(at) });
+    if (state === "delivered") {
+      vi.spyOn(history, "record").mockImplementationOnce(() => { throw new Error("bridge accounting interrupted"); });
+      await expect(engine.evaluate(reopenedJobs.getByIdOrThrow(job.jobId))).rejects.toThrow("bridge accounting interrupted");
+      expect(g.submissions).toEqual([]);
+      // The adoption itself is durable even if this upgraded process also stops.
+      g = fixture(g.db.serialize());
+      reopenedJobs = new WatchdogJobsRepository(g.db);
+      engine = new WatchdogPolicyEngine({ jobsRepo: reopenedJobs, historyLog: new WatchdogHistoryLog(g.db),
+        eventBus: new EventBus(g.db), deliver: g.deliver, now: () => new Date(at) });
+    }
+    const outcome = await engine.evaluate(reopenedJobs.getByIdOrThrow(job.jobId));
+    expect(g.submissions).toEqual([]);
+    expect(outcome.delivery?.status).toBe(state === "delivered" ? "ok" : "failed");
+    expect(g.outbox.getById(watchdogDeliveryId(oldOccurrence))?.deliveryState).toBe(state === "sending" ? "indeterminate" : state);
+    expect(g.db.prepare("SELECT count(*) AS n FROM outbox_entries").get()).toEqual({ n: 1 });
+    at += 60_000;
+    expect((await engine.evaluate(reopenedJobs.getByIdOrThrow(job.jobId))).delivery).toMatchObject({ status: "ok" });
+    expect(g.submissions).toHaveLength(1);
+    expect(g.db.prepare("SELECT count(*) AS n FROM outbox_entries").get()).toEqual({ n: 2 });
+  });
+
   it.each([false, true])("sends the next keepalive after accounting the previous occurrence (interrupted: %s)", async (interrupted) => {
     const f = fixture();
     await f.enable();
