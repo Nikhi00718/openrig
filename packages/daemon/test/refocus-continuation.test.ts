@@ -84,6 +84,25 @@ describe("refocus continuation", () => {
     expect(f.calls()[0].match(/--id (\S+)/)?.[1]).not.toBe(f.calls()[1].match(/--id (\S+)/)?.[1]);
   });
 
+  it("labels a retried post-compaction refocus as a retry with the failure, and a new compaction as fresh", () => {
+    const f = fixture();
+    f.run("PostCompact");
+    expect(f.run("UserPromptSubmit", "continue", false)).toContain("REFOCUS (just compacted — your picture is lossy)");
+    expect(f.state().pendingOn).toBe("PostCompact");
+
+    const retry = f.run("UserPromptSubmit");
+    expect(retry).toContain("REFOCUS (retrying the post-compaction refocus; the last attempt failed: trace gap: trace exited 1)");
+    expect(retry).not.toContain("just compacted");
+    expect(f.state().pendingOn).toBeUndefined();
+    expect(f.state().pendingFailure).toBeUndefined();
+
+    f.run("PostCompact");
+    f.run("UserPromptSubmit", "continue", false);
+    f.run("PostCompact");
+    expect(f.state().pendingFailure).toBeUndefined();
+    expect(f.run("UserPromptSubmit")).toContain("REFOCUS (just compacted — your picture is lossy)");
+  });
+
   it("retries an unconfirmed stream write under the same id and isolates occupants", () => {
     const f = fixture();
     f.run("PostCompact");

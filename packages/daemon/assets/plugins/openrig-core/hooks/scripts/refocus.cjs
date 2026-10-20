@@ -286,15 +286,17 @@ function renderTrace() {
       timeout,
       maxBuffer: 16 * 1024 * 1024,
     });
-  const reason = result.error?.message || result.stderr?.trim() || `trace exited ${result.status ?? "without a status"}`;
+  const reason = String(result.error?.message || result.stderr?.trim() || `trace exited ${result.status ?? "without a status"}`)
+    .replace(/\s+/g, " ").trim();
   const failed = Boolean(result.error) || result.status !== 0 || !result.stdout?.trim();
   const trace = [
-    ...(failed ? [`TRACE GAP — ${String(reason).replace(/\s+/g, " ").trim()}`] : []),
+    ...(failed ? [`TRACE GAP — ${reason}`] : []),
     result.stdout?.trim(),
   ].filter(Boolean).join("\n");
   return {
     text: [trace, role].filter(Boolean).join("\n\n"),
     failed,
+    failure: failed ? `trace gap: ${reason}` : null,
   };
 }
 
@@ -429,6 +431,7 @@ function runsForThisSeatsProject(env = process.env) {
     if (state.pendingOn !== "PostCompact") {
       delete state.pendingOn;
       delete state.pendingAt;
+      delete state.pendingFailure;
     }
     state.lastReset = { at: new Date().toISOString(), fromBytes: Number(state.lastBytes || 0), toBytes: size };
     state.lastBytes = size;
@@ -463,6 +466,8 @@ function runsForThisSeatsProject(env = process.env) {
       if (state.managedRestorePending) state.managedRestorePendingAt = new Date().toISOString();
       else delete state.managedRestorePendingAt;
     }
+    // A new compaction is a fresh obligation, not a retry of the refocus before it.
+    if (event === "PostCompact") delete state.pendingFailure;
     if (event === "PostCompact" || !state.pendingOn) state.pendingOn = event;
     state.pendingAt ||= new Date().toISOString();
     persist();
@@ -487,10 +492,13 @@ function runsForThisSeatsProject(env = process.env) {
   const trace = rendered.text;
   const configured = readConfiguredContent(home);
   const failed = rendered.failed || Boolean(configured.failure);
+  // A post-compaction refocus still pending after a failed attempt is a retry of it, not a second compaction.
   const why = onDemand
     ? "on demand"
     : state.pendingOn === "PostCompact"
-      ? "just compacted — your picture is lossy"
+      ? state.pendingFailure
+        ? `retrying the post-compaction refocus; the last attempt failed: ${state.pendingFailure}`
+        : "just compacted — your picture is lossy"
       : `${Math.round(grown / 1e6 * 10) / 10}MB of work since your last refocus`;
 
   const body = configured.failure
@@ -541,6 +549,9 @@ function runsForThisSeatsProject(env = process.env) {
     if (failed || error) {
       state.pendingOn ||= event;
       state.pendingAt ||= new Date().toISOString();
+      state.pendingFailure = rendered.failure
+        || (configured.failure ? `content ref ${configured.contentRef}: ${configured.failure}` : null)
+        || `the refocus could not be written: ${String(error?.message ?? error).replace(/\s+/g, " ").trim()}`;
       persist();
       return;
     }
@@ -549,6 +560,7 @@ function runsForThisSeatsProject(env = process.env) {
     state.firedOn = event;
     delete state.pendingOn;
     delete state.pendingAt;
+    delete state.pendingFailure;
     persist();
   });
 })();
