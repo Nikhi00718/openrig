@@ -431,6 +431,10 @@ export class HerdrAdapter implements TerminalProvider {
     }
 
     // A fresh workspace per open (BR-5 fresh-on-relaunch, strongest form).
+    // Herdr accepts a duplicate label, so a re-open would otherwise sit beside the earlier
+    // view under the same name. The existing labels are read first: when this rig's view is
+    // already open, the new workspace takes the next numbered suffix and the result says so.
+    // An unreadable list keeps the plain label.
     // The labeled create is tried first. If herdr refuses it and a workspace with
     // that label already exists, retry once with a numbered suffix and say so;
     // otherwise fall back ONCE to a bare create before degrading.
@@ -438,10 +442,22 @@ export class HerdrAdapter implements TerminalProvider {
     let workspaceId: string | null = null;
     let defaultTabId: string | null = null;
     let createErr: unknown = null;
+    let label = plan.workspaceLabel;
     try {
-      const created = await this.transport.request("workspace.create", { focus: false, label: plan.workspaceLabel });
+      const open = extractWorkspaceLabels(await this.transport.request("workspace.list", {}));
+      if (open.includes(label)) {
+        let n = 2;
+        while (open.includes(`${plan.workspaceLabel} (${n})`)) n++;
+        label = `${plan.workspaceLabel} (${n})`;
+      }
+    } catch { /* unknown → the plain label */ }
+    try {
+      const created = await this.transport.request("workspace.create", { focus: false, label });
       workspaceId = extractWorkspaceId(created);
       defaultTabId = extractTabId(created);
+      if (workspaceId != null && label !== plan.workspaceLabel) {
+        notes.push(`A view named "${plan.workspaceLabel}" is already open, so this one is "${label}".`);
+      }
     } catch (err) {
       createErr = err;
     }
