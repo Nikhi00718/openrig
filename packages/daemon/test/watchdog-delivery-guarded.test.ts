@@ -2,6 +2,7 @@
 // bound to the one attempt before any input, so an interrupted or partly accounted attempt is never written again under
 // another identity, and a new reminder still goes.
 import Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import stringWidth from "string-width";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
@@ -20,6 +21,8 @@ import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.j
 import { WatchdogHistoryLog } from "../src/domain/watchdog-history-log.js";
 import { WatchdogPolicyEngine } from "../src/domain/watchdog-policy-engine.js";
 import { WatchdogScheduler } from "../src/domain/watchdog-scheduler.js";
+import { WorkflowInstanceStore } from "../src/domain/workflow-instance-store.js";
+import { makeWorkflowKeepalivePolicy } from "../src/domain/policies/workflow-keepalive.js";
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -71,6 +74,42 @@ function fixture(saved?: Buffer) {
 }
 
 const seat = "worker@test";
+
+describe("recurring watchdog delivery to a draft-aware seat", () => {
+  it.each([false, true])("sends the next keepalive after accounting the previous occurrence (interrupted: %s)", async (interrupted) => {
+    const f = fixture();
+    await f.enable();
+    const instance = new WorkflowInstanceStore(f.db).create({ workflowName: "ongoing", workflowVersion: "1", createdBySession: seat });
+    let at = Date.now();
+    const jobs = new WatchdogJobsRepository(f.db, () => new Date(at));
+    const history = new WatchdogHistoryLog(f.db);
+    const engine = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: history, eventBus: new EventBus(f.db),
+      deliver: f.deliver, now: () => new Date(at), additionalPolicies: [makeWorkflowKeepalivePolicy({ db: f.db })] });
+    const job = jobs.register({ policy: "workflow-keepalive", targetSession: seat, intervalSeconds: 60, registeredBySession: seat,
+      specYaml: `message: Continue the current step\ncontext:\n  workflow_instance_id: ${instance.instanceId}\n` });
+
+    if (interrupted) {
+      vi.spyOn(history, "record").mockImplementationOnce(() => { throw new Error("accounting interrupted"); });
+      await expect(engine.evaluate(jobs.getByIdOrThrow(job.jobId))).rejects.toThrow("accounting interrupted");
+      expect(f.submissions).toHaveLength(1);
+      // The same unaccounted occurrence must read the saved receipt, without another input.
+    }
+    expect((await engine.evaluate(jobs.getByIdOrThrow(job.jobId))).delivery).toMatchObject({ status: "ok" });
+    expect(f.submissions).toHaveLength(1);
+    const firstOccurrence = createHash("sha256").update(JSON.stringify([job.jobId, null, "Continue the current step"])).digest("hex");
+    expect(f.outbox.getById(watchdogDeliveryId(firstOccurrence))?.deliveryState).toBe("delivered");
+    at += 60_000;
+    if (interrupted) {
+      vi.spyOn(history, "record").mockImplementationOnce(() => { throw new Error("later accounting interrupted"); });
+      await expect(engine.evaluate(jobs.getByIdOrThrow(job.jobId))).rejects.toThrow("later accounting interrupted");
+      expect(f.submissions).toHaveLength(2);
+    }
+    await engine.evaluate(jobs.getByIdOrThrow(job.jobId));
+    expect(f.submissions).toHaveLength(2);
+    expect(f.submissions[1]).toContain("Continue the current step");
+    expect(f.db.prepare("SELECT count(*) AS n FROM outbox_entries WHERE delivery_state = 'delivered'").get()).toEqual({ n: 2 });
+  });
+});
 
 /** The queue, watchdog engine and scheduler on a fixture's store, wired as the daemon wires them. */
 function scheduled(f: ReturnType<typeof fixture>) {
