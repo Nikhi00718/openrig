@@ -24,6 +24,7 @@ import {
   buildStaleMessage,
   checkMode,
   checkModeAbsolute,
+  RSYNC_MISSING_MESSAGE,
 } from "./mirror-skills.mjs";
 import { buildEdgeDigests } from "../packages/daemon/scripts/gen-control-plane-json.mjs";
 
@@ -1240,6 +1241,23 @@ test("checkModeAbsolute retains its one-source/one-target checksum contract", ()
   assert.ok(calls[0].args.includes("--checksum"));
   assert.equal(calls[0].args.at(-2), "/source/");
   assert.equal(calls[0].args.at(-1), "/target/");
+});
+
+test("a missing rsync is reported by name with how to install it, not as a bare ENOENT", () => {
+  const missing = () => {
+    const err = new Error("spawnSync rsync ENOENT");
+    err.code = "ENOENT";
+    throw err;
+  };
+  assert.throws(() => checkModeAbsolute("/source", "/target", missing), (err) => {
+    assert.equal(err.message, RSYNC_MISSING_MESSAGE);
+    assert.match(err.message, /rsync on PATH/);
+    assert.equal(err.cause.code, "ENOENT");
+    return true;
+  });
+  // Any other rsync failure keeps its own error.
+  const other = new Error("rsync exited 23");
+  assert.throws(() => checkModeAbsolute("/source", "/target", () => { throw other; }), (err) => err === other);
 });
 
 // --- helpers (test-only) ---

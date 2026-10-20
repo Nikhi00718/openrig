@@ -91,11 +91,26 @@ export function buildStaleMessage(changes) {
   ].join("\n");
 }
 
+// Every copy and comparison goes through rsync. macOS ships it; many Linux installs don't, and a
+// bare `spawnSync rsync ENOENT` stack doesn't say what to install.
+export const RSYNC_MISSING_MESSAGE =
+  "mirror-skills needs rsync on PATH. macOS includes it; on Debian or Ubuntu run `sudo apt-get install rsync`, " +
+  "on Fedora `sudo dnf install rsync`, on Alpine `apk add rsync`.";
+
+function rsync(args, exec) {
+  try {
+    return exec("rsync", args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+  } catch (err) {
+    if (err && err.code === "ENOENT") throw new Error(RSYNC_MISSING_MESSAGE, { cause: err });
+    throw err;
+  }
+}
+
 function runRsync({ dryRun }, exec = execFileSync) {
-  return exec("rsync", rsyncArgs({ dryRun }), {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "inherit"],
-  });
+  return rsync(rsyncArgs({ dryRun }), exec);
 }
 
 function ensureTargetExists() {
@@ -112,14 +127,7 @@ export function checkMode(exec = execFileSync) {
 }
 
 export function checkModeAbsolute(sourceDir, targetDir, exec = execFileSync) {
-  const output = exec(
-    "rsync",
-    rsyncAbsoluteArgs({ sourceDir, targetDir, dryRun: true }),
-    {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "inherit"],
-    },
-  );
+  const output = rsync(rsyncAbsoluteArgs({ sourceDir, targetDir, dryRun: true }), exec);
   const changes = parseChanges(output);
   return { stale: changes.length > 0, changes, output };
 }
@@ -547,7 +555,13 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
 }
 
 if (import.meta.url === `file://${resolve(process.argv[1])}`) {
-  await main();
+  try {
+    await main();
+  } catch (err) {
+    if (err?.message !== RSYNC_MISSING_MESSAGE) throw err;
+    console.error(err.message);
+    process.exitCode = 1;
+  }
 }
 
 function readGeneratedCheckInputs() {
@@ -843,17 +857,13 @@ function undeclaredSkills(edgeRoot, edge, layout) {
 }
 
 function runRsyncAbsolute(sourceRoot, targetRoot, exec) {
-  return exec(
-    "rsync",
+  return rsync(
     rsyncAbsoluteArgs({
       sourceDir: sourceRoot,
       targetDir: targetRoot,
       dryRun: false,
     }),
-    {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "inherit"],
-    },
+    exec,
   );
 }
 

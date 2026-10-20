@@ -46,7 +46,9 @@ function firstString(...values) {
   return null;
 }
 
-function buildOpenRigPayload(providerPayload, env = process.env, now = () => new Date()) {
+// The route this run reports by, so the daemon can count one event once per route: "plugin" for the plugin's hook
+// (started with --from-plugin), "managed" for the settings or managed hook copy.
+function buildOpenRigPayload(providerPayload, env = process.env, now = () => new Date(), argv = process.argv) {
   const sessionName = firstString(env.OPENRIG_SESSION_NAME, env.RIGGED_SESSION_NAME);
   const nodeId = firstString(env.OPENRIG_NODE_ID, env.RIGGED_NODE_ID);
   const runtime = firstString(env.OPENRIG_RUNTIME, env.RIGGED_RUNTIME);
@@ -80,6 +82,7 @@ function buildOpenRigPayload(providerPayload, env = process.env, now = () => new
     subtype,
     turnId: firstString(providerPayload.turn_id, providerPayload.turnId),
     occurredAt: now().toISOString(),
+    relayRoute: argv.includes("--from-plugin") ? "plugin" : "managed",
   };
 }
 
@@ -170,6 +173,10 @@ function buildSessionIdentityPayload(providerPayload, env = process.env, now = (
 
   if ((!sessionName && !nodeId) || !runtime) return null;
 
+  // #1524 (a): whether the runtime sent transcript_path, and its raw value. Codex sends an explicit null for a
+  // thread it never persists; the daemon tells that apart from an absent key, an empty string or a malformed value.
+  const transcriptPathPresent = Object.prototype.hasOwnProperty.call(providerPayload, "transcript_path");
+
   return {
     eventFamily: "session_identity",
     sessionName,
@@ -182,6 +189,8 @@ function buildSessionIdentityPayload(providerPayload, env = process.env, now = (
     // The daemon finds the Claude that ran this hook from its parent chain.
     hookPid: process.pid,
     sessionId,
+    transcriptPathPresent,
+    ...(transcriptPathPresent ? { transcriptPath: providerPayload.transcript_path } : {}),
     occurredAt: now().toISOString(),
   };
 }
@@ -268,6 +277,10 @@ function settingsRelayReports(hookEvent, providerPayload, env = process.env) {
 function pluginRunIsRedundant(providerPayload, argv = process.argv, env = process.env) {
   if (!argv.includes("--from-plugin")) return false;
   const hookEvent = firstString(providerPayload.hookEvent, providerPayload.hookEventName, providerPayload.hook_event_name, providerPayload.event, providerPayload.eventName);
+  // Codex: the plugin's run always reports. Whether Codex runs the daemon's managed relay for this event depends on hook
+  // state merged from every user layer (a selected profile included) and session flags, which this script can't see, so it
+  // never assumes so. With both routes active an event is reported twice; it is never lost.
+  if (firstString(env.OPENRIG_RUNTIME, env.RIGGED_RUNTIME) === "codex") return false;
   return settingsRelayReports(hookEvent, providerPayload, env);
 }
 

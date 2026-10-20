@@ -16,6 +16,7 @@ import { resolveActiveOccupantRow, resolveActiveSnapshotSession, deriveRehydrate
 import type { RigWithRelations, Snapshot } from "./types.js";
 import { parseSqliteUtcMs } from "./sqlite-time.js";
 import { effectiveRestorePolicy, isOrdinaryTerminalSeat, type RestoreSeatFacts } from "./restore-policy.js";
+import { assessSnapshotCurrentOccupants, stoppedFreshSnapshotReason } from "./rehydrate-eligibility.js";
 
 /** OPR.0.4.3.20 FR-6 — a present token whose last verification is older than this
  *  is surfaced as `stale` (age-based staleness — the "stale while running" signal
@@ -68,6 +69,8 @@ export interface RestorePlanPreview {
 }
 
 export interface PreviewSessionRow {
+  /** Current stop proved against this snapshot; never persisted as new history. */
+  stoppedFresh?: boolean;
   nodeId: string;
   restorePolicy: string | null;
   resumeType: string | null;
@@ -133,7 +136,7 @@ function intendedActionFor(
   resolution: ActiveOccupantResolution<PreviewSessionRow>,
   freshRequested: boolean,
   seat: RestoreSeatFacts,
-  absentHistory: { logicalId: string; rigName: string; row: PreviewSessionRow | null },
+  absentHistory: { logicalId: string; rigName: string; row: PreviewSessionRow | null; stoppedFresh: boolean },
 ): { intendedAction: RestorePlanPreviewNode["intendedAction"]; reason?: string } {
   // OPR.0.5.7.1 — a broken authoritative relation beats --fresh, exactly as
   // execution fails loudly before its fresh check: --fresh cannot override
@@ -149,6 +152,9 @@ function intendedActionFor(
       intendedAction: "fresh-primed",
       reason: "listed in --fresh — apply would deliberately skip the resume (operation B)",
     };
+  }
+  if (resolution.kind === "none" && absentHistory.stoppedFresh) {
+    return { intendedAction: "awaiting-decision", reason: stoppedFreshSnapshotReason(absentHistory.logicalId) };
   }
   // No occupant, but an earlier one left a resume token: apply stops for the same decision.
   if (resolution.kind === "none" && absentHistory.row) {
@@ -182,7 +188,9 @@ export function collectPreviewSessionRows(
   snapshot: Snapshot | null,
 ): PreviewSessionRow[] {
   if (snapshot) {
+    const { stoppedFreshNodeIds } = assessSnapshotCurrentOccupants(db, rig, snapshot);
     return (snapshot.data.sessions ?? []).map((s) => ({
+      stoppedFresh: stoppedFreshNodeIds.has(s.nodeId),
       nodeId: s.nodeId,
       restorePolicy: s.restorePolicy ?? null,
       resumeType: s.resumeType ?? null,
@@ -250,10 +258,11 @@ export function buildRestorePlanPreview(
       currentRuntime: node.runtime,
       recordedSessions: sessionRows.filter((row) => row.nodeId === savedNodeId),
     };
+    const stoppedFresh = sessionRows.some(row => row.nodeId === savedNodeId && row.stoppedFresh);
     const { intendedAction, reason } = runtimeError
       ? { intendedAction: "awaiting-decision" as const, reason: runtimeError }
       : intendedActionFor(resolution, freshRequested, seat,
-        { logicalId: node.logicalId, rigName: rig.rig.name, row: absentSeatResumeHistory(sessionRows, savedNodeId) });
+        { logicalId: node.logicalId, rigName: rig.rig.name, row: absentSeatResumeHistory(sessionRows, savedNodeId), stoppedFresh });
     // OPR.0.4.3.20 FR-6 — per-seat token state (read-only), derived from the
     // RESOLVED occupant only — never from a historical row.
     const occupant = resolution.kind === "resolved" ? resolution.session : null;
@@ -272,7 +281,7 @@ export function buildRestorePlanPreview(
       // silent); runtime mismatches and broken relations cannot be resolved
       // by a fresh request, so --fresh must not be suggested as their remedy.
       // A terminal has no token to find and relaunches fresh on its own.
-      freshRequired: runtimeError || resolution.kind === "ambiguous" ? false : tokenState === "missing" && !isOrdinaryTerminalSeat(seat),
+      freshRequired: stoppedFresh || runtimeError || resolution.kind === "ambiguous" ? false : tokenState === "missing" && !isOrdinaryTerminalSeat(seat),
       ...(runtimePrompt ? { runtimePrompt } : {}),
     };
   });

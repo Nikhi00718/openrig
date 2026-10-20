@@ -17,14 +17,16 @@ export interface CurrentStateRehydrateEligibility {
  * not permission to revive a historical occupant; current-state capture
  * preserves the ambiguity and restore refuses it explicitly.
  */
-export function snapshotMatchesCurrentOccupants(
+export function assessSnapshotCurrentOccupants(
   db: Database.Database,
   rig: RigWithRelations,
   snapshot: Snapshot,
-): boolean {
-  if (rig.nodes.length === 0) return true;
+): { matches: boolean; stoppedFreshNodeIds: Set<string> } {
+  const stoppedFreshNodeIds = new Set<string>();
+  const mismatch = () => ({ matches: false, stoppedFreshNodeIds: new Set<string>() });
+  if (rig.nodes.length === 0) return { matches: true, stoppedFreshNodeIds };
   const rows = db.prepare(
-    `SELECT s.id, s.node_id AS nodeId, s.status,
+    `SELECT s.*, s.node_id AS nodeId,
             s.resume_type AS resumeType, s.resume_token AS resumeToken
        FROM sessions s
        JOIN nodes n ON n.id = s.node_id
@@ -35,6 +37,7 @@ export function snapshotMatchesCurrentOccupants(
     status: string;
     resumeType: string | null;
     resumeToken: string | null;
+    intentionally_stopped?: number;
   }>;
 
   const recorded = readFreshOccupantRelations(db, rig.rig.id);
@@ -44,18 +47,40 @@ export function snapshotMatchesCurrentOccupants(
   for (const node of rig.nodes) {
     const current = resolveActiveOccupantRow(candidates, Object.prototype.hasOwnProperty.call(recorded, node.id) ? recorded : undefined, node.id);
     if (current.kind === "none") continue;
-    if (current.kind === "ambiguous") return false;
+    if (current.kind === "ambiguous") return mismatch();
     const captured = resolveActiveSnapshotSession(snapshot.data, node.id);
+    const stoppedHistory = snapshot.data.sessions.filter(s => s.nodeId === node.id && s.id === current.session.id);
+    // An absent occupant is current only with the deliberate stop, the exact
+    // exited/native history, and a fresh effect fenced to the current tenure.
+    // Missing/ambiguous legacy relations never qualify as recorded absence.
+    if (captured.kind === "none" && snapshot.data.activeOccupantsByNode?.[node.id]?.kind === "absent"
+      && current.session.status === "exited" && current.session.intentionally_stopped === 1
+      && recorded[node.id] === current.session.id && stoppedHistory.length === 1
+      && stoppedHistory[0]!.status === "exited"
+      && (stoppedHistory[0]!.resumeType ?? null) === current.session.resumeType
+      && (stoppedHistory[0]!.resumeToken ?? null) === current.session.resumeToken
+      && (db.prepare("SELECT kind FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1").get(node.id) as { kind: string } | undefined)?.kind === "fresh") {
+      stoppedFreshNodeIds.add(node.id);
+      continue;
+    }
     if (
       captured.kind !== "resolved"
       || captured.session.id !== current.session.id
       || (captured.session.resumeType ?? null) !== current.session.resumeType
       || (captured.session.resumeToken ?? null) !== current.session.resumeToken
     ) {
-      return false;
+      return mismatch();
     }
   }
-  return true;
+  return { matches: true, stoppedFreshNodeIds };
+}
+
+export function snapshotMatchesCurrentOccupants(db: Database.Database, rig: RigWithRelations, snapshot: Snapshot): boolean {
+  return assessSnapshotCurrentOccupants(db, rig, snapshot).matches;
+}
+
+export function stoppedFreshSnapshotReason(logicalId: string): string {
+  return `Seat '${logicalId}' was deliberately stopped in the current fresh generation and this snapshot. It remains stopped; choose an explicit per-seat launch to start it.`;
 }
 
 /**

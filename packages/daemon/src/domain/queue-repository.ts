@@ -804,6 +804,7 @@ export class QueueRepository {
    *     fallback real code rather than a promise in a comment). */
   private outbox: OutboxHandler | undefined;
   private resolveOccupantGeneration?: (sessionName: string) => string | null;
+  private readonly resolveSessionAddresses: (name: string) => string[];
   private readonly wakeRepo: QueueWakeRepository;
   private watchdogJobsRepo: WatchdogJobsRepository | undefined;
   /** PL-007 Workspace Primitive — true when migration 038 has applied the
@@ -861,6 +862,7 @@ export class QueueRepository {
        * is omitted (never forged).
        */
       resolveOccupantGeneration?: (sessionName: string) => string | null;
+      resolveSessionAddresses?: (name: string) => string[];
       loadHumanRegistry?: () => LoadResult;
     }
   ) {
@@ -873,6 +875,7 @@ export class QueueRepository {
     if (opts?.transport) this.attachTransport(opts.transport);
     this.workflowFrontierPredicate = opts?.workflowFrontierPredicate;
     this.resolveOccupantGeneration = opts?.resolveOccupantGeneration;
+    this.resolveSessionAddresses = opts?.resolveSessionAddresses ?? ((name) => [name]);
     this.loadHumanRegistryFn = opts?.loadHumanRegistry ?? (() => loadHumanRegistry());
     this.hasTargetRepoColumn = detectQueueColumn(db, "target_repo");
     this.hasSummaryColumn = detectQueueColumn(db, "summary");
@@ -1420,6 +1423,17 @@ export class QueueRepository {
     if (!this.transport) return;
     const outcome = await this.performWakeSend(qitemId, destinationSession, sourceSession, bodyOverride);
     this.recordNudgeAttempt(qitemId, outcome.nudgeResult);
+  }
+
+  /** Boot recovery must respect an existing intent's claim and terminal outcome.
+   * Older entry packets have no intent and still need the legacy nudge path. */
+  async recoverLostNudge(qitemId: string, destinationSession: string, sourceSession?: string): Promise<void> {
+    const outboxId = `${WAKE_INTENT_PREFIX}${qitemId}`;
+    if (this.outbox?.getById(outboxId)) {
+      await this.deliverWakeIntent(outboxId);
+      return;
+    }
+    await this.maybeNudge(qitemId, destinationSession, undefined, sourceSession);
   }
 
   /**
@@ -2270,27 +2284,29 @@ export class QueueRepository {
     asDestination: { pending: number; inProgress: number; blocked: number; recent: QueueItem[] };
     asSource: { total: number };
   } {
+    const addresses = this.resolveSessionAddresses(session);
+    const slots = addresses.map(() => "?").join(",");
     const limit = Math.max(1, Math.min(opts?.recentLimit ?? 25, 200));
     const countByState = (state: string): number => {
       const row = this.db
         .prepare(
-          `SELECT COUNT(*) AS n FROM queue_items WHERE destination_session = ? AND state = ?`
+          `SELECT COUNT(*) AS n FROM queue_items WHERE destination_session IN (${slots}) AND state = ?`
         )
-        .get(session, state) as { n: number };
+        .get(...addresses, state) as { n: number };
       return row.n;
     };
     const recent = this.db
       .prepare(
         `SELECT * FROM queue_items
-          WHERE destination_session = ?
+          WHERE destination_session IN (${slots})
             AND state IN ('pending','in-progress','blocked')
           ORDER BY ts_updated DESC
           LIMIT ?`
       )
-      .all(session, limit) as QueueItemRow[];
+      .all(...addresses, limit) as QueueItemRow[];
     const sourceTotalRow = this.db
-      .prepare(`SELECT COUNT(*) AS n FROM queue_items WHERE source_session = ?`)
-      .get(session) as { n: number };
+      .prepare(`SELECT COUNT(*) AS n FROM queue_items WHERE source_session IN (${slots})`)
+      .get(...addresses) as { n: number };
     return {
       session,
       asDestination: {
@@ -2313,11 +2329,13 @@ export class QueueRepository {
    * silently degrades into a confident answer. This is that authoritative input.
    */
   listInProgressForDestination(session: string): QueueItem[] {
+    const addresses = this.resolveSessionAddresses(session);
+    const slots = addresses.map(() => "?").join(",");
     const rows = this.db
       .prepare(
-        `SELECT * FROM queue_items WHERE destination_session = ? AND state = 'in-progress'`
+        `SELECT * FROM queue_items WHERE destination_session IN (${slots}) AND state = 'in-progress'`
       )
-      .all(session) as QueueItemRow[];
+      .all(...addresses) as QueueItemRow[];
     return rows.map((r) => this.rowToItem(r));
   }
 
@@ -2332,7 +2350,7 @@ export class QueueRepository {
         `qitem ${input.qitemId} not found`
       );
     }
-    if (qitem.destinationSession !== input.destinationSession) {
+    if (!this.resolveSessionAddresses(input.destinationSession).includes(qitem.destinationSession)) {
       throw new QueueRepositoryError(
         "claim_destination_mismatch",
         `qitem ${input.qitemId} destination is ${qitem.destinationSession}, not ${input.destinationSession}`
@@ -3217,8 +3235,9 @@ export class QueueRepository {
   /** The parked row an ordinary due park timer reminds about, when its reminder may share one message with other
    *  reminders due for the same seat in the same scheduler pass: a one-shot `--wake-after` timer serving exactly one
    *  live parked row, carrying its default message. Null keeps the reminder's own send: a custom message, a shared
-   *  or attached watchdog, a repeating wait and a provider-limit timer each deliver as before. */
-  parkReminderDigestEntry(jobId: string, message: string): { qitemId: string; summary: string | null } | null {
+   *  or attached watchdog, a repeating wait and a provider-limit timer each deliver as before. The entry carries the
+   *  current park's recorded continuation, or null, for the wake's preview. */
+  parkReminderDigestEntry(jobId: string, message: string): { qitemId: string; summary: string | null; continuation: string | null } | null {
     const generated = this.wakeRepo.findCurrentQitemsByGeneratedTimer(jobId);
     const bound = this.wakeRepo.findBlockedQitemsByWatchdog(jobId, true);
     if (generated.length !== 1 || bound.length !== 1 || bound[0]!.qitemId !== generated[0]!.qitemId) return null;
@@ -3227,7 +3246,7 @@ export class QueueRepository {
     const job = (this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db)).getById(jobId);
     if (!job || job.policy !== "periodic-reminder" || isQueueWait(job.specYaml)) return null;
     if (message !== defaultParkWakeMessage(row.qitemId)) return null;
-    return { qitemId: row.qitemId, summary: row.summary ?? null };
+    return { qitemId: row.qitemId, summary: row.summary ?? null, continuation: this.currentParkContinuation(row.qitemId) };
   }
 
   /** Called by the watchdog engine after the delivery attempt is durably
@@ -3466,11 +3485,13 @@ export class QueueRepository {
   /** The parked query's obligation face: open rows to one destination, newest first, without the per-row
    *  projections list() derives (pickup, waiting view, delivery ledger), which this read never uses. */
   listOpenObligations(destinationSession: string, limit: number): Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked"; summary: string | null }> {
+    const addresses = this.resolveSessionAddresses(destinationSession);
+    const slots = addresses.map(() => "?").join(",");
     const rows = this.db.prepare(
       `SELECT qitem_id, state${this.hasSummaryColumn ? ", summary" : ""} FROM queue_items
-        WHERE destination_session = ? AND state IN ('pending', 'in-progress', 'blocked')
+        WHERE destination_session IN (${slots}) AND state IN ('pending', 'in-progress', 'blocked')
         ORDER BY ts_created DESC LIMIT ?`,
-    ).all(destinationSession, limit) as Array<{ qitem_id: string; state: "pending" | "in-progress" | "blocked"; summary?: string | null }>;
+    ).all(...addresses, limit) as Array<{ qitem_id: string; state: "pending" | "in-progress" | "blocked"; summary?: string | null }>;
     return rows.map((r) => ({ qitemId: r.qitem_id, state: r.state, summary: r.summary ?? null }));
   }
 
@@ -3492,19 +3513,23 @@ export class QueueRepository {
       params.push(`%@${escaped}`, `%@${escaped}`);
     }
     if (opts?.asSession) {
-      conditions.push("(destination_session = ? OR source_session = ?)");
-      params.push(opts.asSession, opts.asSession);
+      const addresses = this.resolveSessionAddresses(opts.asSession);
+      const slots = addresses.map(() => "?").join(",");
+      conditions.push(`(destination_session IN (${slots}) OR source_session IN (${slots}))`);
+      params.push(...addresses, ...addresses);
     }
     if (opts?.activeOnly && !opts?.state) {
       conditions.push("state IN ('pending', 'in-progress', 'blocked')");
     }
     if (opts?.destinationSession) {
-      conditions.push("destination_session = ?");
-      params.push(opts.destinationSession);
+      const addresses = this.resolveSessionAddresses(opts.destinationSession);
+      conditions.push(`destination_session IN (${addresses.map(() => "?").join(",")})`);
+      params.push(...addresses);
     }
     if (opts?.sourceSession) {
-      conditions.push("source_session = ?");
-      params.push(opts.sourceSession);
+      const addresses = this.resolveSessionAddresses(opts.sourceSession);
+      conditions.push(`source_session IN (${addresses.map(() => "?").join(",")})`);
+      params.push(...addresses);
     }
     if (opts?.state) {
       const states = Array.isArray(opts.state) ? opts.state : [opts.state];
@@ -3644,12 +3669,14 @@ export class QueueRepository {
     if (this.hasHumanIntentColumn) conditions.push("COALESCE(human_intent, 'decision') <> 'update'");
     const params: unknown[] = [...states];
     if (opts?.destinationSession) {
-      conditions.push("destination_session = ?");
-      params.push(opts.destinationSession);
+      const addresses = this.resolveSessionAddresses(opts.destinationSession);
+      conditions.push(`destination_session IN (${addresses.map(() => "?").join(",")})`);
+      params.push(...addresses);
     }
     if (opts?.sourceSession) {
-      conditions.push("source_session = ?");
-      params.push(opts.sourceSession);
+      const addresses = this.resolveSessionAddresses(opts.sourceSession);
+      conditions.push(`source_session IN (${addresses.map(() => "?").join(",")})`);
+      params.push(...addresses);
     }
     if (opts?.targetRepo && this.hasTargetRepoColumn) {
       conditions.push("target_repo = ?");

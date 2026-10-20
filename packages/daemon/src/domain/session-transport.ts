@@ -1,3 +1,4 @@
+import { physicalSessionName } from "./session-registry.js";
 import { currentClaudeMcpMenu } from "./claude-mcp-menu.js";
 import stringWidth from "string-width";
 import { CODEX_TURN_STATUS_PATTERN } from "./codex-pane-patterns.js";
@@ -644,6 +645,7 @@ export async function probeSessionActivity(input: {
   binding?: Omit<ObservedBinding, "sessionName">;
   /** See ClassifyPaneOptions.timerlessStatusIsLive. */
   timerlessStatusIsLive?: boolean;
+  visibleScreenOnly?: boolean;
   /** Supplied only by an active draft-aware send; ordinary observations stay unchanged. */
   composerSnapshot?: () => Promise<ComposerSnapshot | null>;
   /** The seat's community harness (`communityHarnessOf`): its idle-looking screen reads unknown. */
@@ -651,7 +653,7 @@ export async function probeSessionActivity(input: {
 }): Promise<AgentActivity> {
   // Capture routing and observation labels must share the entry context. The
   // caller may reuse/mutate its input while hasSession is pending.
-  const { sessionName, runtime, attachmentType, tmuxAdapter, now, captureObserver, binding } = input;
+  const { sessionName, runtime, attachmentType, tmuxAdapter, now, captureObserver, binding, visibleScreenOnly } = input;
   const sampledAt = (now ?? new Date()).toISOString();
   // P2: attempt identity frozen at entry, before any await. Early returns below
   // take no capture and are not observed.
@@ -758,8 +760,11 @@ export async function probeSessionActivity(input: {
   };
   const captureSeq = observed ? nextCaptureSeq++ : 0;
   try {
+    const capture = (opts?: { escapeSequences?: boolean }) => visibleScreenOnly
+      ? opts ? tmuxAdapter.capturePaneScreen(sessionName, opts) : tmuxAdapter.capturePaneScreen(sessionName)
+      : opts ? tmuxAdapter.capturePaneContent(sessionName, 20, opts) : tmuxAdapter.capturePaneContent(sessionName, 20);
     const snapshot = input.composerSnapshot ? await input.composerSnapshot().catch(() => null) : null;
-    const paneContent = snapshot?.screen ?? await tmuxAdapter.capturePaneContent(sessionName, 20);
+    const paneContent = snapshot?.screen ?? await capture();
     const capturedAt = new Date().toISOString();
     const classifyOptions = { timerlessStatusIsLive: input.timerlessStatusIsLive === true };
     let classification = communityHarnessPaneActivity(classifyPaneActivity(paneContent ?? "", { ...classifyOptions,
@@ -770,7 +775,7 @@ export async function probeSessionActivity(input: {
     // the verdict is then the styled frame's, as an empty composer. Anything else leaves the draft standing.
     let slot = captureSlot(paneContent, capturedAt, captureSeq);
     if (classification.reason === "prompt_draft" && runtime === "claude-code" && paneContent) {
-      const styled = await tmuxAdapter.capturePaneContent(sessionName, 20, { escapeSequences: true }).catch(() => null);
+      const styled = await capture({ escapeSequences: true }).catch(() => null);
       const later = styled ? classifyStyledFrame(styled, classifyOptions) : null;
       const newer = !later ? null
         : later.asIs.state === "agent_active" || (later.asIs.state === "attention" && later.asIs.reason !== "prompt_draft") ? later.asIs
@@ -1823,6 +1828,7 @@ export class SessionTransport {
 
   /** Freeze the registration and binding before asking tmux about this name. */
   private absenceProbeTarget(sessionName: string): AbsenceProbeTarget | undefined {
+    sessionName = physicalSessionName(this.db, sessionName);
     return this.db
       .prepare(`
         SELECT s.id AS session_id, n.id AS node_id, s.session_name AS session_name, b.tmux_pane AS tmux_pane
@@ -1858,6 +1864,7 @@ export class SessionTransport {
     runtime: string | null; attachmentType: string | null; nodeId: string | null; pane: string | null; occupant: string | null; resumeToken: string | null;
     rotation: ClaudeResumeRotation | null;
   } {
+    sessionName = physicalSessionName(this.db, sessionName);
     // One existing statement; P2 reads the binding columns it already joins plus the
     // same current-occupant subselect the delivery guard uses. No extra query.
     const row = this.db.prepare(`
@@ -1929,6 +1936,8 @@ export class SessionTransport {
   }
 
   private resolveBySessionName(sessionName: string): ResolveResult {
+    const current = this.sessionRegistry.resolveAddress(sessionName);
+    if (current) return { ok: true, sessions: [{ sessionName, rigName: current.rigName, nodeLogicalId: current.logicalId }] };
     const sessionRows = this.db
       .prepare("SELECT node_id, session_name FROM sessions WHERE session_name = ? ORDER BY id DESC")
       .all(sessionName) as SessionRow[];
@@ -1989,8 +1998,9 @@ export class SessionTransport {
     const sessions: ResolvedTarget[] = [];
     const seen = new Set<string>();
     for (const name of sessionNames) {
-      if (seen.has(name)) continue;
-      seen.add(name);
+      const identity = this.sessionRegistry.resolveAddress(name)?.nodeId ?? name;
+      if (seen.has(identity)) continue;
+      seen.add(identity);
       const resolved = this.resolveBySessionName(name);
       if (!resolved.ok) return resolved;
       sessions.push(...resolved.sessions);
@@ -2333,6 +2343,7 @@ export class SessionTransport {
       if (prePref.effective || prePref.desired || prePref.desiredMode === "draft-aware" || prePref.effectiveMode === "draft-aware") return null;
       meta = this.getSessionMeta(sessionName);
       bound = guard.target(sessionName);
+      sessionName = bound.session;
     } catch {
       return null;
     }
@@ -2434,6 +2445,7 @@ export class SessionTransport {
   }
 
   private async sendUnguarded(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
+    sessionName = physicalSessionName(this.db, sessionName);
     let preVerifyContent: string | null = null;
     const sessionMeta = this.getSessionMeta(sessionName);
     const runtime = sessionMeta.runtime;
@@ -3535,6 +3547,7 @@ export class SessionTransport {
    *  use it: the capture route asks when its request does (`rig capture`, the MCP tool). `inputBoxBudget` is the time
    *  those reads may still take, shared across a fan-out; a single capture gets its own CAPTURE_INPUT_BOX_DEADLINE_MS. */
   async capture(sessionName: string, opts?: { lines?: number; inputBox?: boolean; inputBoxBudget?: InputBoxBudget }): Promise<CaptureResult> {
+    sessionName = physicalSessionName(this.db, sessionName);
     const sessionMeta = this.getSessionMeta(sessionName);
     if (sessionMeta.attachmentType === "external_cli") {
       return {
@@ -3713,6 +3726,7 @@ export class SessionTransport {
    * re-check readiness via the runtime adapter with currentness verification and atomic commit.
    */
   async reconcileStartupReadiness(sessionName: string): Promise<boolean> {
+    sessionName = physicalSessionName(this.db, sessionName);
     const existing = this.inFlightReconciliations.get(sessionName);
     if (existing) return existing;
 

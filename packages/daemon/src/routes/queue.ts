@@ -1,3 +1,4 @@
+import type { SessionRegistry } from "../domain/session-registry.js";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { EventBus } from "../domain/event-bus.js";
@@ -108,7 +109,12 @@ export function queueRoutes(): Hono {
     const parsedSource = parseSessionName(sourceSession);
     if (parsedSource.kind !== "canonical") return { ok: true };
     const rigName = parsedSource.rig;
-    const rigs = rigRepo.findRigsByName(rigName);
+    let rigs = rigRepo.findRigsByName(rigName);
+    if (rigs.length > 1) {
+      // An archived rig of the same name counts only when no active one has it
+      const activeRigs = rigRepo.findUnarchivedRigsByName(rigName);
+      if (activeRigs.length > 0) rigs = activeRigs;
+    }
     if (rigs.length === 0) return { ok: true };
     const rigId = rigs[0]!.id;
     const ws = rigRepo.getRigWorkspace(rigId);
@@ -1281,7 +1287,8 @@ export function queueRoutes(): Hono {
     if (!senderSession) return c.json({ error: "senderSession is required" }, 400);
     const parsed = queryLimit(c);
     if (!parsed.ok) return parsed.response;
-    return c.json(getOutbox(c).listForSender(senderSession, parsed.limit));
+    const sessions = c.get("sessionRegistry" as never) as SessionRegistry | undefined;
+    return c.json(getOutbox(c).listForSender(senderSession, parsed.limit, sessions?.sessionAddresses(senderSession)));
   });
 
   return app;

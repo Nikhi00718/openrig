@@ -1,5 +1,6 @@
 // OPR.0.7.0.5 — in-place restart of one Codex seat: every gate and every outcome, driven through the
 // public SeatLifecycleService surface against a fake tmux, process table, Codex launcher and OS reads.
+import { createHash } from "node:crypto";
 import { defaultTmuxFileOps, isStagedSendScriptPath } from "../src/adapters/tmux.js";
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import type Database from "better-sqlite3";
@@ -13,7 +14,7 @@ import type { NativeProcessRow } from "../src/domain/native-process-lineage.js";
 import type { HarnessLaunchResult, NodeBinding } from "../src/domain/runtime-adapter.js";
 import type { ArbitratedSeatState } from "../src/domain/activity-taxonomy.js";
 import type { InPlaceRestartIo, ProcessFacts } from "../src/domain/seat-restart-in-place.js";
-import { accountLineNames, parseEffectiveSettings, shellWords } from "../src/domain/seat-restart-in-place.js";
+import { accountLineNames, accountTextMark, linesAfterAnchor, parseEffectiveSettings, shellWords } from "../src/domain/seat-restart-in-place.js";
 import { CodexRuntimeAdapter } from "../src/adapters/codex-runtime-adapter.js";
 import { CodexThreadIdResolver, type CodexThreadEvidence } from "../src/domain/codex-thread-id.js";
 
@@ -62,6 +63,10 @@ interface WorldOptions {
   screen?: string;
   /** Already in the pane before the restart. */
   screenBefore?: string;
+  /** How many of the pane's last lines are its visible screen; the rest is history (default 3). */
+  screenRows?: number;
+  /** History as the restart's history-only capture read it, when the pane moved before the whole-pane capture. */
+  historyCapture?: string;
   throwAt?: "signalPid" | "sendResumeCommand" | "readProcessAfter" | "signalPaneProcess" | "respawnPane" | "verifyResumeInPane" | "restorePaneOption";
   daemonStartedAt?: Date;
   /** Only post-relaunch process observations; preflight and stop retain the existing table. */
@@ -170,6 +175,10 @@ function world(options: WorldOptions = {}) {
     },
     respawnPane: async (_pane: string, command?: string): Promise<TmuxResult> => { calls.push(`respawn ${command}`); maybeThrow("respawnPane"); relaunch(); return { ok: true }; },
     capturePaneHistory: async () => paneLines.join("\n"),
+    capturePaneHistoryParts: async () => {
+      const history = paneLines.slice(0, Math.max(0, paneLines.length - (options.screenRows ?? 3)));
+      return { history: options.historyCapture ?? history.join("\n"), all: paneLines.join("\n") };
+    },
   } as unknown as TmuxAdapter;
 
   const launches: Array<{ command: string; resumeToken: string }> = [];
@@ -243,7 +252,11 @@ function world(options: WorldOptions = {}) {
   return { db, service, node, session, calls, launches, builds, events, sessionRegistry, tmux,
     replacementYields, get replacementReads() { return replacementReads; }, get relaunched() { return relaunched; },
     setRows: (next: NativeProcessRow[]) => { rows = next; },
-    print: (text: string) => { paneLines.push(...text.split("\n").filter(Boolean)); } };
+    print: (text: string) => { paneLines.push(...text.split("\n").filter(Boolean)); },
+    /** tmux dropping the oldest history lines once the history is full. */
+    trim: (count: number) => { paneLines.splice(0, count); },
+    /** A redraw clearing the screen's last rows. */
+    erase: (count: number) => { paneLines.splice(paneLines.length - count, count); } };
 }
 
 function state(activity: string, needs = 0): ArbitratedSeatState {
@@ -469,6 +482,19 @@ describe("rig seat restart --keep-conversation: outcomes", () => {
     expect(w.launches).toHaveLength(1);
   });
 
+  it("#1524 (b): an unproven resume asks for the live Codex to be checked and adopted first, not for another resume", async () => {
+    const error = "Codex resume could not be proven within the resume window: no_log_row. The session was preserved; nothing was restarted.";
+    const w = world({ launch: { ok: false, error, recovery: "attention_required", resumeUnproven: true, verifierInput: "none" } });
+    const result = await w.service.restartInPlace({ seatRef: SEAT, reason: "x" });
+    expect(result).toMatchObject({ ok: true, outcome: "incomplete", account: { startupGate: error } });
+    const remaining = (result as { remainingStep: string }).remainingStep;
+    expect(remaining).toContain("may still be running in the pane");
+    expect(remaining).toContain(`rig reconcile-session ${SEAT} --no-launch`);
+    expect(remaining).toContain("only if the original is gone");
+    expect(remaining).not.toMatch(/^Resolve what Codex shows in the pane, then resume/);
+    expect(w.launches).toHaveLength(1);
+  });
+
   it.each([
     ["hook_trust_gate", "Codex is waiting for hook trust approval before the session can become interactive.", "Codex is waiting for a hook review decision in the pane"],
     ["trust_gate", "Codex is waiting for the folder trust prompt to be answered.", "Codex is waiting for a folder trust decision in the pane"],
@@ -506,6 +532,37 @@ describe("rig seat restart --keep-conversation: outcomes", () => {
     expect(remaining).toContain("Codex is waiting for an update decision OpenRig could not skip");
     expect(remaining).toContain("OpenRig sent the update prompt's skip key (3) once while checking the resume; nothing was retried or relaunched.");
     expect(remaining).not.toMatch(/typed nothing|answered/);
+  });
+
+  // #1524 (b), through the real adapter: what the adapter itself reports decides the step, not a flag the test supplies.
+  it("through the adapter: a capture that times out before any proof result asks for the live Codex first, not another resume", async () => {
+    const tmux = { getPanePid: async () => 901, capturePaneScreen: async () => "OpenAI Codex (v0.120.0)\n› Ask Codex to do anything",
+      capturePaneContent: async () => "OpenAI Codex (v0.120.0)\n› Ask Codex to do anything",
+      getPaneCommand: () => new Promise<string>((resolve) => setTimeout(() => resolve("codex"), 120)) } as unknown as TmuxAdapter;
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: {} as never, sleep: async () => {}, resumeProofWindowMs: 40,
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex resume tok" }],
+      readResumeEvidence: () => ({ threadId: "tok" }) });
+    const launch = await adapter.verifyResumeInPane("impl", "tok");
+    expect(launch).toMatchObject({ ok: false, recovery: "attention_required", resumeUnproven: true });
+    const r = await report(launch);
+    expect(r.remainingStep).toContain("may still be running in the pane");
+    expect(r.remainingStep).toContain(`rig reconcile-session ${SEAT} --no-launch`);
+    expect(r.remainingStep).not.toMatch(/^Resolve what Codex shows in the pane, then resume/);
+  });
+
+  it("through the adapter: a resume whose records name another conversation gets its own step, not the unproven one", async () => {
+    const ready = "OpenAI Codex (v0.120.0)\n› Ask Codex to do anything";
+    const tmux = { getPanePid: async () => 901, getPaneCommand: async () => "codex", capturePaneScreen: async () => ready, capturePaneContent: async () => ready } as unknown as TmuxAdapter;
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: {} as never, sleep: async () => {},
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex resume tok" }],
+      readResumeEvidence: () => ({ threadId: "another-thread" }) });
+    const launch = await adapter.verifyResumeInPane("impl", "tok");
+    expect(launch).toMatchObject({ ok: false, recovery: "attention_required", resumeMismatch: { opened: "another-thread" } });
+    expect(launch).not.toHaveProperty("resumeUnproven");
+    const r = await report(launch);
+    expect(r.remainingStep).toContain("The resumed Codex opened another-thread, not the seat's conversation");
+    expect(r.remainingStep).toContain("find the seat's conversation before resuming again");
+    expect(r.remainingStep).not.toContain("didn't prove the conversation in time");
   });
 
   // Round 4: the report's message, startupGate and step all describe the newest moment, through the real adapter.
@@ -900,7 +957,7 @@ describe("#1196 round 2: account evidence only from lines produced after the res
   it("no record of the pane's text at the restart means not_observed", async () => {
     const w = world({ rollout });
     await w.service.restartInPlace({ seatRef: SEAT, reason: "x" });
-    w.db.prepare("UPDATE events SET payload = json_set(payload, '$.accountLinesAtRestart', NULL) WHERE type = 'seat.restart_in_place_finished'").run();
+    w.db.prepare("UPDATE events SET payload = json_set(payload, '$.accountTextAtRestart', NULL) WHERE type = 'seat.restart_in_place_finished'").run();
     w.print("Account: me@example.com");
     expect(await w.service.verifyRestartInPlace({ seatRef: SEAT, expectAccount: "me@example.com" }))
       .toMatchObject({ outcome: "restarted_account_unverified", accountEvidence: { state: "not_observed" } });
@@ -910,8 +967,124 @@ describe("#1196 round 2: account evidence only from lines produced after the res
     const w = world({ screenBefore: "Account: me@example.com" });
     await w.service.restartInPlace({ seatRef: SEAT, reason: "x" });
     const finished = w.events().at(-1)!;
-    expect(Object.values(finished.accountLinesAtRestart)).toEqual([1]);
+    expect(Object.values(finished.accountTextAtRestart.counts)).toEqual([1]);
     expect(JSON.stringify(finished)).not.toContain("example.com");
+  });
+});
+
+// #1264: tmux trims the oldest history once it's full, so the verdict can't depend on how much is kept.
+describe("--verify compares only text after the restart, however much history tmux has trimmed since", () => {
+  const rollout = JSON.stringify({ timestamp: "2099-01-01T00:00:00Z", type: "response_item", payload: { type: "function_call_output" } });
+  const OLD = "  Account:  me@example.com (Pro)";
+  const filler = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => `output line ${from + i}`).join("\n");
+  const verify = (w: ReturnType<typeof world>) => w.service.verifyRestartInPlace({ seatRef: SEAT, expectAccount: "me@example.com" });
+
+  // Two old /status lines, then twelve lines of output; the last three are the visible screen.
+  async function restartedAfterOldStatus() {
+    const w = world({ screenBefore: [OLD, OLD, filler(1, 12)].join("\n"), rollout });
+    expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "x" })).toMatchObject({ outcome: "restarted_account_unverified" });
+    return w;
+  }
+
+  it("a new /status line counts after the old copies are trimmed (main reported it unverified)", async () => {
+    const w = await restartedAfterOldStatus();
+    w.print(filler(13, 20));
+    w.trim(2);
+    w.print(OLD);
+    expect(await verify(w)).toMatchObject({ outcome: "moved", accountEvidence: { state: "matched" } });
+  });
+
+  it("still counts it when trimming has cut into the anchor, or removed all of it", async () => {
+    const partly = await restartedAfterOldStatus();
+    partly.trim(5);
+    partly.print(OLD);
+    expect(await verify(partly)).toMatchObject({ outcome: "moved" });
+
+    const whole = await restartedAfterOldStatus();
+    whole.print(filler(13, 20));
+    whole.trim(11);
+    whole.print(OLD);
+    expect(await verify(whole)).toMatchObject({ outcome: "moved" });
+  });
+
+  it("a line from before the restart never counts as new, trimmed or not", async () => {
+    // In history above the anchor, with nothing new printed.
+    const above = await restartedAfterOldStatus();
+    above.print(filler(13, 20));
+    above.trim(1);
+    expect(await verify(above)).toMatchObject({ outcome: "restarted_account_unverified", accountEvidence: { state: "not_observed" } });
+
+    // On the screen at the restart (after the anchor), with the whole anchor trimmed since.
+    const onScreen = world({ screenBefore: [filler(1, 12), OLD].join("\n"), rollout });
+    await onScreen.service.restartInPlace({ seatRef: SEAT, reason: "x" });
+    onScreen.print(filler(13, 20));
+    onScreen.trim(12);
+    expect(await verify(onScreen)).toMatchObject({ outcome: "restarted_account_unverified", accountEvidence: { state: "not_observed" } });
+
+    // Inside the anchor itself, with the anchor's start trimmed.
+    const inAnchor = world({ screenBefore: [filler(1, 4), OLD, filler(5, 12)].join("\n"), rollout });
+    await inAnchor.service.restartInPlace({ seatRef: SEAT, reason: "x" });
+    inAnchor.trim(4);
+    expect(await verify(inAnchor)).toMatchObject({ outcome: "restarted_account_unverified", accountEvidence: { state: "not_observed" } });
+  });
+
+  it("a copy of the anchor on the screen at the restart doesn't move where counting starts", async () => {
+    // History ends with the anchor (a to h) and one more line; the screen shows an old /status, then the anchor again.
+    const anchor = "abcdefgh".split("").map((letter) => `step ${letter}`);
+    const w = world({ screenBefore: [...anchor, "tail", OLD, ...anchor].join("\n"), screenRows: 9, rollout });
+    expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "x" })).toMatchObject({ outcome: "restarted_account_unverified" });
+    w.erase(8);
+    expect(await verify(w)).toMatchObject({ outcome: "restarted_account_unverified", accountEvidence: { state: "not_observed" } });
+  });
+
+  it("captures that don't line up give a whole-pane baseline: a new /status line still counts, the old one never does", async () => {
+    // The history-only capture read a, b, tail; by the whole-pane capture the pane read b, tail, then an old /status.
+    const restartMisaligned = async () => {
+      const w = world({ screenBefore: ["b", "tail", OLD].join("\n"), historyCapture: "a\nb\ntail", rollout });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "x" })).toMatchObject({ outcome: "restarted_account_unverified" });
+      expect(w.events().at(-1)!.accountTextAtRestart.anchor).toEqual([]);
+      return w;
+    };
+    const fresh = await restartMisaligned();
+    fresh.print(OLD);
+    expect(await verify(fresh)).toMatchObject({ outcome: "moved", accountEvidence: { state: "matched" } });
+
+    const unchanged = await restartMisaligned();
+    expect(await verify(unchanged)).toMatchObject({ outcome: "restarted_account_unverified", accountEvidence: { state: "not_observed" } });
+  });
+
+  it("a restart recorded with the earlier whole-pane counts is still compared as before", async () => {
+    const w = await restartedAfterOldStatus();
+    w.db.prepare("UPDATE events SET payload = json_remove(json_set(payload, '$.accountLinesAtRestart', json(?)), '$.accountTextAtRestart') WHERE type = 'seat.restart_in_place_finished'")
+      .run(JSON.stringify({ [createHash("sha256").update(OLD.trim()).digest("hex").slice(0, 16)]: 2 }));
+    w.print(OLD);
+    expect(await verify(w)).toMatchObject({ outcome: "moved" });
+  });
+});
+
+describe("accountTextMark", () => {
+  const key = (line: string) => createHash("sha256").update(line).digest("hex").slice(0, 16);
+  it("counts from where the anchor ends in history, not from a later copy on the screen", () => {
+    expect(accountTextMark({ history: "a\nb\ntail", all: "a\nb\ntail\nAccount: x\na\nb" }))
+      .toEqual({ anchor: [key("a"), key("b")], counts: { [key("Account: x")]: 1 } });
+  });
+  it("counts the whole pane, with no anchor, when the two captures don't line up", () => {
+    expect(accountTextMark({ history: "a\nb\ntail", all: "b\ntail\nAccount: x" })).toEqual({ anchor: [], counts: { [key("Account: x")]: 1 } });
+  });
+  it("records nothing when the pane couldn't be read", () => {
+    expect(accountTextMark(null)).toBeNull();
+  });
+});
+
+describe("linesAfterAnchor", () => {
+  const key = (line: string) => createHash("sha256").update(line).digest("hex").slice(0, 16);
+  it("takes the anchor's last occurrence, so a repeat only shortens what is compared", () => {
+    expect(linesAfterAnchor(["a", "b", "x", "a", "b", "y"], [key("a"), key("b")])).toEqual(["y"]);
+  });
+  it("uses the longest surviving end of a trimmed anchor, and everything when none survives", () => {
+    expect(linesAfterAnchor(["b", "c", "y"], [key("a"), key("b"), key("c")])).toEqual(["y"]);
+    expect(linesAfterAnchor(["y", "z"], [key("a"), key("b")])).toEqual(["y", "z"]);
+    expect(linesAfterAnchor(["y"], [])).toEqual(["y"]);
   });
 });
 

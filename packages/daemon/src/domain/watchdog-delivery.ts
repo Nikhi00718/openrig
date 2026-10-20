@@ -90,15 +90,18 @@ export function makeWatchdogDeliver(deps: {
       if (prior) return prior;
       const previous = outbox.getById(deliveryId);
       const payload = previous?.guardBinding ? previous.body : formatWatchdogDeliveryMessage(source, message);
+      // An occurrence already bound keeps its earlier body; the outcome names what was bound, for the history.
+      const header = formatWatchdogDeliveryMessage(source, "");
+      const sentMessage = payload.startsWith(header) ? payload.slice(header.length) : payload;
       const result = await sessionTransport.send(targetSession, payload,
         { deliveryId, actorSession: "watchdog@system", auditPointer: source.jobId });
       // A new first fire uses the old three-field ID too. Mark its receipt
       // before returning to job accounting so a later cadence cannot adopt it.
       if (deliveryId === legacyId) bindLegacyOccurrence(outbox, deliveryId, occurrence);
-      if (result.outcome === "retained") return { status: "retained", outboxIds: result.outboxIds, continuityActionCompleted };
+      if (result.outcome === "retained") return { status: "retained", outboxIds: result.outboxIds, continuityActionCompleted, sentMessage };
       return result.ok
-        ? { status: "ok", continuityActionCompleted }
-        : { status: "failed", error: result.error, continuityActionCompleted };
+        ? { status: "ok", continuityActionCompleted, sentMessage }
+        : { status: "failed", error: result.error, continuityActionCompleted, sentMessage };
     } catch (err) {
       if (err instanceof DigestBindingRefused) throw err;
       return {
