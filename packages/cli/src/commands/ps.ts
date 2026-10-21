@@ -1016,6 +1016,18 @@ Exit codes:
         ? visible.filter((e) => (e.rigName ?? e.name) === opts.rig)
         : visible;
 
+      // A --rig that names no rig is a lookup that missed, not an empty fleet: say so (as rig chatroom,
+      // env and parked do) instead of "No rigs" or a zero summary. --json keeps its empty result.
+      if (!opts.json && opts.rig && rigScoped.length === 0) {
+        if (all.some((e) => (e.rigName ?? e.name) === opts.rig)) {
+          console.error(`Rig '${opts.rig}' is archived. Show it with: rig ps --rig ${opts.rig} --include-archived`);
+        } else {
+          console.error(`Rig '${opts.rig}' not found. List rigs with: rig ps`);
+        }
+        process.exitCode = 1;
+        return;
+      }
+
       // Apply CLI-side filter (Amendment A: prefer CLI shaping).
       const filtered = parsedFilter ? applyRigFilter(rigScoped, parsedFilter) : rigScoped;
 
@@ -1057,17 +1069,6 @@ Exit codes:
       }
 
       if (limited.length === 0) {
-        // A --rig that names no rig is a lookup that missed, not an empty fleet: say so (as rig chatroom,
-        // env and parked do) instead of "No rigs". --json keeps its empty array.
-        if (opts.rig && !visible.some((e) => (e.rigName ?? e.name) === opts.rig)) {
-          if (all.some((e) => (e.rigName ?? e.name) === opts.rig)) {
-            console.error(`Rig '${opts.rig}' is archived. Show it with: rig ps --rig ${opts.rig} --include-archived`);
-          } else {
-            console.error(`Rig '${opts.rig}' not found. List rigs with: rig ps`);
-          }
-          process.exitCode = 1;
-          return;
-        }
         if (parsedFilter) {
           console.log(`No rigs match --filter ${parsedFilter.key}=${parsedFilter.value}`);
         } else if (archivedCount > 0 && !opts.includeArchived) {
@@ -1200,6 +1201,14 @@ async function handleNodes(
   if (opts.rig) narrowed = narrowed.filter((n) => n.rigName === opts.rig);
   if (opts.session) narrowed = narrowed.filter((n) => n.canonicalSessionName === opts.session);
 
+  // A --rig that names no rig is a lookup that missed, not a rig without seats (or a zero summary).
+  // --json keeps its empty result.
+  if (!opts.json && opts.rig && effectiveRigs.length === 0) {
+    console.error(`Rig '${opts.rig}' not found. List rigs with: rig ps`);
+    process.exitCode = 1;
+    return;
+  }
+
   const filtered = parsedFilter ? applyNodeFilter(narrowed, parsedFilter) : narrowed;
 
   if (opts.summary) {
@@ -1258,12 +1267,6 @@ async function handleNodes(
   }
 
   if (limited.length === 0) {
-    // A --rig that names no rig is a lookup that missed, not a rig without seats. --json keeps its empty array.
-    if (opts.rig && effectiveRigs.length === 0) {
-      console.error(`Rig '${opts.rig}' not found. List rigs with: rig ps`);
-      process.exitCode = 1;
-      return;
-    }
     if (parsedFilter) {
       console.log(`No nodes match --filter ${parsedFilter.key}=${parsedFilter.value}`);
     } else {

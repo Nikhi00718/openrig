@@ -91,6 +91,17 @@ describe("rig ps --rig with a name no rig has", () => {
     expect(exitCode).toBe(1);
   });
 
+  it("--summary says the rig wasn't found instead of zero totals, in both views; --json --summary is unchanged", async () => {
+    for (const args of [["--rig", "delivry", "--summary"], ["--nodes", "--rig", "delivry", "--summary"]]) {
+      const { out, exitCode } = await ps(...args);
+      expect(out).toBe("Rig 'delivry' not found. List rigs with: rig ps");
+      expect(exitCode).toBe(1);
+    }
+    const json = await ps("--rig", "delivry", "--summary", "--json");
+    expect(JSON.parse(json.out)).toMatchObject({ totalRigs: 0 });
+    expect(json.exitCode).toBeUndefined();
+  });
+
   it("--json keeps its empty array, and an existing rig lists as before", async () => {
     expect(await ps("--rig", "delivry", "--json")).toEqual({ out: "[]", exitCode: undefined });
 
