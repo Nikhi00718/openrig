@@ -17,6 +17,8 @@ const DEFAULT_THRESHOLD = 2_600_000;
 const FALSE_VALUES = new Set(["0", "false", "off", "no"]);
 // The issue report after a failed attempt gets this long once the attempt's lookups are done.
 const REPORT_MS = 1_500;
+// A failed attempt's reason, kept for the retry's label. The attempt's own TRACE GAP line keeps the full text.
+const PENDING_FAILURE_MAX = 300;
 // The hook's time budget. Both registrations allow this hook 60 s (hooks/claude.json, hooks/codex.json). With no budget
 // selected, every lookup keeps its fixed 2 s cap exactly as before. OPENRIG_REFOCUS_BUDGET_MS selects a longer one, up
 // to 52 s: each lookup's cap then scales with it and every lookup is also clipped to what's left of it, so a slow lookup
@@ -555,9 +557,10 @@ function runsForThisSeatsProject(env = process.env) {
     if (failed || error) {
       state.pendingOn ||= event;
       state.pendingAt ||= new Date().toISOString();
-      state.pendingFailure = rendered.failure
+      const failure = rendered.failure
         || (configured.failure ? `content ref ${configured.contentRef}: ${configured.failure}` : null)
         || `the refocus could not be written: ${String(error?.message ?? error).replace(/\s+/g, " ").trim()}`;
+      state.pendingFailure = failure.length > PENDING_FAILURE_MAX ? `${failure.slice(0, PENDING_FAILURE_MAX - 1)}…` : failure;
       persist();
       return;
     }

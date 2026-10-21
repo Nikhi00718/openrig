@@ -19,7 +19,7 @@ function fixture() {
   const calls = join(root, "calls");
   const transcript = join(root, "transcript.jsonl");
   writeFileSync(transcript, "x".repeat(100));
-  writeFileSync(trace, '#!/bin/sh\nprintf "%s" "$TRACE_RESULT"\nexit "${TRACE_STATUS:-0}"\n');
+  writeFileSync(trace, '#!/bin/sh\nprintf "%s" "$TRACE_RESULT"\nprintf "%s" "$TRACE_STDERR" >&2\nexit "${TRACE_STATUS:-0}"\n');
   writeFileSync(rig, '#!/bin/sh\nif [ "$1 $2" = "stream emit" ]; then\n printf "%s\\n" "$*" >> "$CALLS"\n exit "${STREAM_EXIT:-0}"\nfi\nprintf "{}"\n');
   chmodSync(trace, 0o755);
   chmodSync(rig, 0o755);
@@ -111,6 +111,17 @@ describe("refocus continuation", () => {
     f.run("PostCompact");
     expect(f.state().pendingFailure).toBeUndefined();
     expect(f.run("UserPromptSubmit")).toContain("REFOCUS (just compacted — your picture is lossy)");
+  });
+
+  it("caps a long failure reason in the retry label; the failed attempt's trace gap keeps it whole", () => {
+    const f = fixture();
+    const stderr = `Traceback: ${"frame ".repeat(200)}end`;
+    f.run("PostCompact");
+    expect(f.run("UserPromptSubmit", "continue", false, { TRACE_STDERR: stderr })).toContain(`TRACE GAP — ${stderr.trim()}`);
+    const saved = f.state().pendingFailure as string;
+    expect(saved).toHaveLength(300);
+    expect(saved).toBe(`${`trace gap: ${stderr}`.slice(0, 299)}…`);
+    expect(f.run("UserPromptSubmit")).toContain(`REFOCUS (retrying the post-compaction refocus; the last attempt failed: ${saved})`);
   });
 
   it("retries an unconfirmed stream write under the same id and isolates occupants", () => {
