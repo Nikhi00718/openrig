@@ -120,6 +120,8 @@ describe("rig snapshot, rig export and rig restore --rig", () => {
     const { out } = await run(snapshotCommand(d.deps), ["snapshot", "solo"]);
     expect(d.requests).toContain(`POST /api/rigs/${RIG_ID}/snapshots`);
     expect(out).toContain("Snapshot created: snap-new");
+    // The printed restore command names the rig by id, so it stays unambiguous if the name is reused.
+    expect(out).toContain(`To restore: rig restore snap-new --rig ${RIG_ID}`);
   });
 
   it("export reads the named rig's spec", async () => {

@@ -93,7 +93,7 @@ export function restoreCommand(depsOverride?: StatusDeps): Command {
         console.log(`Restore attempt id: ${res.data.attemptId}`);
         console.log(`Status: ${res.data.status ?? "started"}`);
         console.log("Daemon is restoring per-node in the background; follow progress with 'rig ps --nodes' or 'rig restore-check'.");
-        console.log(`Read the completed attempt and its startup warnings with: rig restore status ${res.data.attemptId} --rig ${rigId}`);
+        console.log(`Read the completed attempt and its startup warnings with: rig restore status ${res.data.attemptId} --rig ${target.id}`);
       } else {
         // Defensive: server responded ok=true but didn't include attemptId.
         // Fall back to the legacy summary if it's present (back-compat with
