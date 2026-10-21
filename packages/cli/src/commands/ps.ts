@@ -1204,7 +1204,17 @@ async function handleNodes(
   // A --rig that names no rig is a lookup that missed, not a rig without seats (or a zero summary).
   // --json keeps its empty result.
   if (!opts.json && opts.rig && effectiveRigs.length === 0) {
-    console.error(`Rig '${opts.rig}' not found. List rigs with: rig ps`);
+    // The list above leaves archived rigs out unless asked; look once more so an archived rig's name gets
+    // the same --include-archived pointer as the rig view.
+    let archived = false;
+    if (!opts.includeArchived) {
+      const withArchived = await client.get<PsEntry[]>("/api/ps?includeArchived=true", requestHeaders ? { headers: requestHeaders } : undefined);
+      archived = withArchived.status < 400 && Array.isArray(withArchived.data)
+        && withArchived.data.some((r) => (r.rigName ?? r.name) === opts.rig);
+    }
+    console.error(archived
+      ? `Rig '${opts.rig}' is archived. Show it with: rig ps --nodes --rig ${opts.rig} --include-archived`
+      : `Rig '${opts.rig}' not found. List rigs with: rig ps`);
     process.exitCode = 1;
     return;
   }

@@ -43,7 +43,8 @@ describe("rig ps --rig with a name no rig has", () => {
   beforeAll(async () => {
     server = http.createServer((req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
-      if (req.url?.startsWith("/api/ps")) res.end(JSON.stringify(PS_DATA));
+      // Like the daemon, /api/ps leaves archived rigs out unless includeArchived=true.
+      if (req.url?.startsWith("/api/ps")) res.end(JSON.stringify(req.url.includes("includeArchived=true") ? PS_DATA : PS_DATA.filter((r) => !r.isArchived)));
       else if (req.url?.startsWith("/api/rigs/rig-a/nodes")) res.end(JSON.stringify([NODE]));
       else res.end(JSON.stringify([]));
     });
@@ -88,6 +89,12 @@ describe("rig ps --rig with a name no rig has", () => {
   it("an archived rig's name points at --include-archived", async () => {
     const { out, exitCode } = await ps("--rig", "old-rig");
     expect(out).toBe("Rig 'old-rig' is archived. Show it with: rig ps --rig old-rig --include-archived");
+    expect(exitCode).toBe(1);
+  });
+
+  it("the node view also points an archived rig's name at --include-archived", async () => {
+    const { out, exitCode } = await ps("--nodes", "--rig", "old-rig");
+    expect(out).toBe("Rig 'old-rig' is archived. Show it with: rig ps --nodes --rig old-rig --include-archived");
     expect(exitCode).toBe(1);
   });
 
