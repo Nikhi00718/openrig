@@ -76,10 +76,14 @@ export function snapshotCommand(depsOverride?: StatusDeps): Command {
         return;
       }
 
-      console.log("ID                         Kind    Status    Created");
-      for (const snap of snapshots) {
-        console.log(`${snap.id.padEnd(27)} ${snap.kind.padEnd(8)} ${snap.status.padEnd(10)} ${snap.createdAt}`);
-      }
+      // Size each column to its widest value, so a long kind such as auto-pre-down (every rig down makes one)
+      // keeps Status and Created in their columns.
+      const header = ["ID", "Kind", "Status", "Created"];
+      const rows = snapshots.map((snap) => [snap.id, snap.kind, snap.status, snap.createdAt]);
+      const widths = header.map((title, i) => Math.max(title.length, ...rows.map((row) => row[i]!.length)));
+      const line = (cells: string[]) => cells.map((cell, i) => (i < cells.length - 1 ? cell.padEnd(widths[i]!) : cell)).join("  ");
+      console.log(line(header));
+      for (const row of rows) console.log(line(row));
     });
 
   return cmd;
