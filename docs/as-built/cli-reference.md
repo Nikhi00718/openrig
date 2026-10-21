@@ -755,7 +755,7 @@ Only Claude and Codex tenures can be woken.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig expand <rig-id> <pod-fragment-path>` | — | `--json`<br>`--rig-root <path>` |
+| `rig expand <rig> <pod-fragment-path>` | — | `--json`<br>`--rig-root <path>` |
 
 ### add
 
@@ -818,7 +818,7 @@ Only Claude and Codex tenures can be woken.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig shrink <rigId> <podRef>` | — | `--fallback <live-seat>`<br>`--json` |
+| `rig shrink <rig> <podRef>` | — | `--fallback <live-seat>`<br>`--json` |
 
 ### destroy
 
