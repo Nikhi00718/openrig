@@ -139,6 +139,19 @@ describe("rig snapshot, rig export and rig restore --rig", () => {
     expect(d.requests).toContain(`POST /api/rigs/${RIG_ID}/restore/snap-1`);
   });
 
+  it("restore status --json reports a shared name as rig_ambiguous JSON, like rig grow and rig remove", async () => {
+    const other = "01M5F0OTHERRIGIDXXXXXXXXXX";
+    const d = fakeDaemon([{ id: RIG_ID, name: "twin" }, { id: other, name: "twin" }]);
+    const { out, exitCode } = await run(restoreCommand(d.deps), ["restore", "status", "45", "--rig", "twin", "--json"]);
+    expect(JSON.parse(out)).toMatchObject({ ok: false, code: "rig_ambiguous", candidates: [RIG_ID, other] });
+    expect(d.requests.filter((r) => r.includes("/restore/"))).toEqual([]);
+    expect(exitCode).toBe(1);
+
+    const plain = await run(restoreCommand(fakeDaemon([{ id: RIG_ID, name: "twin" }, { id: other, name: "twin" }]).deps), ["restore", "status", "45", "--rig", "twin"]);
+    expect(plain.out).toContain("'twin' matches 2 rigs");
+    expect(plain.exitCode).toBe(1);
+  });
+
   it("an id still goes to that id", async () => {
     const d = fakeDaemon();
     await run(snapshotCommand(d.deps), ["snapshot", RIG_ID]);

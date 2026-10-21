@@ -130,7 +130,13 @@ export function restoreCommand(depsOverride?: StatusDeps): Command {
       if (!daemonStatusGuard(status)) return;
       const client = deps.clientFactory(getDaemonUrl(status));
       const target = await rigIdForHandle(client, opts.rig);
-      if (!target.ok) { console.error(target.message); process.exitCode = 1; return; }
+      if (!target.ok) {
+        // The same --json shape rig grow, remove, shrink and expand give for a shared name.
+        if (opts.json) console.log(JSON.stringify({ ok: false, code: "rig_ambiguous", message: target.message, candidates: target.candidates }, null, 2));
+        else console.error(target.message);
+        process.exitCode = 1;
+        return;
+      }
       const res = await client.get<{
         ok?: boolean;
         error?: string;
