@@ -98,6 +98,18 @@ describe("Send CLI", () => {
           lastBroadcastBody = parsed;
           const sessions: string[] = (parsed.sessions as string[] | undefined)
             ?? ["seat-a@my-rig", "seat-b@my-rig"]; // pod/rig/global resolve to a fixed pair
+          if (parsed.text === "compaction-notice") {
+            const notice = (who: string) => ({ stage: "restoring", observed: "before_send", notice: `${who} was mid-restore (as recorded). This doesn't mean the restore has finished.` });
+            const results = [
+              { ok: true, sessionName: "a@r", managedCompaction: notice("a@r") },
+              { ok: true, sessionName: "b@r" },
+              { ok: false, sessionName: "c@r", error: "paste failed", managedCompaction: notice("c@r") },
+              { ok: true, sessionName: "d@r", outcome: "retained", sent: false, managedCompaction: notice("d@r") },
+            ];
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ total: 4, sent: 2, failed: 1, retained: 1, results }));
+            return;
+          }
           if (parsed.text === "partial") {
             const results = [
               { ok: true, sessionName: sessions[0] },
@@ -190,6 +202,12 @@ describe("Send CLI", () => {
           } else if (parsed.session === "busy-session") {
             res.writeHead(409, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ ok: false, sessionName: "busy-session", reason: "mid_work", error: "Target pane appears mid-task. Use force: true to send anyway." }));
+          } else if (parsed.session === "restoring-seat" || parsed.session === "restoring-failed") {
+            const managedCompaction = { stage: "restoring", observed: "before_send", notice: "restoring-seat was mid-restore (as recorded). This doesn't mean the restore has finished." };
+            const failed = parsed.session === "restoring-failed";
+            res.writeHead(failed ? 502 : 200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(failed ? { ok: false, sessionName: parsed.session, error: "paste failed", managedCompaction }
+              : { ok: true, sessionName: parsed.session, managedCompaction }));
           } else if (parsed.session === "unknown-advisory") {
             // OPR.0.4.3.28 — unknown telemetry now PROCEEDS with a non-blocking advisory (warning).
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -384,6 +402,16 @@ describe("Send CLI", () => {
 
   // OPR.0.4.3.28 correction — an unknown-telemetry send PROCEEDS and PRINTS the advisory on
   // human output (not only in --json).
+  it("prints the managed compaction notice beside the send's own result, sent or failed", async () => {
+    const sent = await captureLogs(async () => { await makeCmd().parseAsync(["node", "rig", "send", "restoring-seat", "hello"]); });
+    expect(sent.logs.join("\n")).toContain("Sent to restoring-seat\nNotice: restoring-seat was mid-restore (as recorded). This doesn't mean the restore has finished.");
+    const failed = await captureLogs(async () => { await makeCmd().parseAsync(["node", "rig", "send", "restoring-failed", "hello"]); });
+    expect(failed.logs.join("\n")).toContain("paste failed");
+    expect(failed.logs.join("\n")).toContain("Notice: restoring-seat was mid-restore");
+    expect(failed.logs.join("\n")).not.toContain("Sent to");
+    expect(failed.exitCode).toBe(2);
+  });
+
   it("prints the Advisory on an unknown-proceed send (human output)", async () => {
     const { logs, exitCode } = await captureLogs(async () => {
       await makeCmd().parseAsync(["node", "rig", "send", "unknown-advisory", "hello"]);
@@ -679,6 +707,30 @@ describe("Send CLI", () => {
     expect(argv[ri + 1]).toBe("why now");
   });
 
+
+  it.each(["\r", "\x1b", "\t", " "])("preserves an explicit interaction byte in SSH argv (%#)", async answer => {
+    let captured: readonly string[] = [];
+    const deps: SendDeps = { ...runningDeps(port),
+      hostRegistryLoader: () => ({ ok: true, registry: { hosts: [{ id: "vm-test", transport: "ssh", target: "vm.local" }] } }),
+      crossHostRun: async (_host, argv) => { captured = argv; return { ok: true, stdout: "remote ok", stderr: "" }; } };
+    const result = await captureLogs(async () => {
+      await makeCmd(deps).parseAsync(["node", "rig", "send", "dev-impl@my-rig", answer,
+        "--host", "vm-test", "--dangerously-interact", "--reason", "explicit key"]);
+    });
+    expect(result.exitCode).toBeFalsy();
+    expect(captured.slice(0, 4)).toEqual(["rig", "send", "dev-impl@my-rig", answer]);
+    expect(captured).toContain("--dangerously-interact");
+    expect(captured[captured.indexOf("--reason") + 1]).toBe("explicit key");
+  });
+
+  it.each(["\r", "\t", " "])("--raw alone retains whitespace refusal (%#)", async answer => {
+    const result = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", answer, "--raw"]);
+    });
+    expect(result.exitCode).toBe(1);
+    expect(lastSendBody).toBeNull();
+  });
+
   // Slice-03 Atom 6b QA fix — the agent@rig@host SUGAR host folds in AFTER the
   // early --context guard, so --context must be re-rejected after the fold: it
   // must NEVER reach the cross-host argv (which would ship literal null with no
@@ -919,6 +971,18 @@ describe("Send CLI", () => {
       expect(output).toMatch(/unverifiable|not .{0,20}this send|does not match this send/i);
       expect(output).toContain("Verified: yes"); // the transport verdict stands, honestly qualified
     });
+  });
+
+  it("fan-out prints each recipient's compaction notice under that recipient's line; exit code unchanged", async () => {
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "--to", "a@r,b@r,c@r,d@r", "compaction-notice"]);
+    });
+    const output = logs.join("\n");
+    expect(output).toContain("a@r: sent\nNotice: a@r was mid-restore (as recorded). This doesn't mean the restore has finished.\nb@r: sent\n");
+    expect(output).toContain("c@r: FAILED — paste failed\nNotice: c@r was mid-restore");
+    expect(output).toContain("d@r: retained, not delivered; inspect with rig seat held-messages\nNotice: d@r was mid-restore");
+    expect(output.match(/^Notice: /gm)).toHaveLength(3); // none for b@r
+    expect(exitCode).toBe(1); // a failed recipient, as before
   });
 
   // S2 (OPR.0.5.4.3): the fan-out renderer must SURFACE an additive warning —

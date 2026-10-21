@@ -40,6 +40,8 @@ export interface SubsystemSlackDeliveryOpts {
    *  (no map) nothing is recorded and the channel is resolved as before. */
   pinChannel?: boolean;
   sourceLabel: string; // host/box/rig — from config, never hardcoded (item 7)
+  /** This daemon's machine name, read per post, shown after a seat sender (message.ts `machine`). */
+  machine?: () => string | null;
   bodyExcerpt?: number;
   fetchImpl?: FetchImpl;
   /** The owning gateway run's stop signal. When the wire stops (restart, disable,
@@ -341,6 +343,7 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
     const payload = buildOutboundMessage(
       {
         qitemId: q.qitemId ?? decision.decisionId,
+        ownerNotificationKind: q.ownerNotificationKind,
         summary: q.summary,
         body: q.body,
         humanQuestions: q.humanQuestions,
@@ -358,6 +361,7 @@ function deliverSinglePart(opts: SubsystemSlackDeliveryOpts, markEpisode = true)
         // A1.2 — attribution rides every post; identity stays the app's own (postChatMessage
         // structurally cannot carry username/icon overrides — the customize-absence rail).
         attribution: attributionFromSession(q.sourceSession),
+        machine: opts.machine?.() ?? undefined,
         mentionUserId: opts.resolveMentionUserId?.(q),
         // fix-r3 — the reconcile identity, reserved outside the clamp budget (same function
         // the scan above matches: one identity, same bytes, both sides).
@@ -535,6 +539,7 @@ function renderPart(opts: SubsystemSlackDeliveryOpts, q: DeliveryPart, part: Del
   return buildOutboundMessage(part, {
     sourceLabel: opts.sourceLabel,
     attribution: attributionFromSession(part.sourceSession),
+    machine: opts.machine?.() ?? undefined,
     mentionUserId: index === 0 ? opts.resolveMentionUserId?.(q) : undefined,
     reconcileMarker: reconcileToken(partId),
     mediaRefs: partEvidence.mediaRefs,
@@ -580,8 +585,41 @@ function splitIntoParts(opts: SubsystemSlackDeliveryOpts, q: DeliveryPart, decis
  * existing attempted/delivered stores and marker reconciler own each stable part.
  * Preflight ALL parts before posting; the episode receipt is written only after
  * every required part. A restart retries missing parts and the final receipt. */
-export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): SubsystemDeliverFn {
-  return async (decision) => {
+/** Whether an earlier attempt of this exact decision may already be in Slack, answered without posting anything:
+ *  `unattempted` (never tried, or nothing of it recorded), or the reconciler's own verdict on its first message. A gate
+ *  that would hold, trim or ack a decision asks this first, so a post that landed but lost its response is reconciled
+ *  rather than sent again in another form. `found` means the whole post: for a post split into parts, a found first
+ *  part with the post not yet recorded complete is `partial` (later parts may still be missing). */
+export async function deliveryLanding(opts: SubsystemSlackDeliveryOpts, decision: OutboundDecision):
+  Promise<"unattempted" | "found" | "partial" | "maybe" | "absent" | { unreadable: string }> {
+  if (opts.delivered.load().has(decision.decisionId)) return "found";
+  const attempted = opts.attempted.load();
+  const multipart = `${decision.decisionId}:part:1`;
+  const firstId = attempted.has(decision.decisionId) ? decision.decisionId : attempted.has(multipart) ? multipart : null;
+  if (!firstId) return "unattempted";
+  const first = await firstMessageMayHaveLanded(opts, (decision.payload ?? {}) as DeliveryPart, decision.decisionId, firstId);
+  return first === "found" && firstId === multipart ? "partial" : first;
+}
+
+/** Whether a post split into parts was started (its first part attempted) but isn't recorded complete. No Slack read. */
+export function multipartUnfinished(opts: SubsystemSlackDeliveryOpts, decision: OutboundDecision): boolean {
+  return !opts.delivered.load().has(decision.decisionId) && opts.attempted.load().has(`${decision.decisionId}:part:1`);
+}
+
+/** Whether any attempt of this decision was made (its single message or its first part). No Slack read. */
+export function wasAttempted(opts: SubsystemSlackDeliveryOpts, decision: OutboundDecision): boolean {
+  const attempted = opts.attempted.load();
+  return attempted.has(decision.decisionId) || attempted.has(`${decision.decisionId}:part:1`);
+}
+
+export type SubsystemSlackDeliverFn = SubsystemDeliverFn & {
+  landing: (decision: OutboundDecision) => ReturnType<typeof deliveryLanding>;
+  unfinished: (decision: OutboundDecision) => boolean;
+  attempted: (decision: OutboundDecision) => boolean;
+};
+
+export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): SubsystemSlackDeliverFn {
+  const fn: SubsystemDeliverFn = async (decision) => {
     if (opts.delivered.load().has(decision.decisionId)) return { ok: true };
     const q = (decision.payload ?? {}) as DeliveryPart;
     let parts: DeliveryPart[] = q.humanDetail
@@ -710,4 +748,9 @@ export function subsystemSlackDeliver(opts: SubsystemSlackDeliveryOpts): Subsyst
       return { ok: false, class: "receipt-failed", detail: (error as Error).message };
     }
   };
+  return Object.assign(fn, {
+    landing: (decision: OutboundDecision) => deliveryLanding(opts, decision),
+    unfinished: (decision: OutboundDecision) => multipartUnfinished(opts, decision),
+    attempted: (decision: OutboundDecision) => wasAttempted(opts, decision),
+  });
 }

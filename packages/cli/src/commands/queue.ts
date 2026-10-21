@@ -10,6 +10,8 @@ import { enumArg, positiveIntArg } from "../cli-error.js";
 import type { StatusDeps } from "./status.js";
 import { resolveContextRef } from "../context-resolve.js";
 import { shellQuote } from "../cross-host-executor.js";
+import { loadHostRegistry, resolveHost } from "../host-registry.js";
+import { loadHostBindings } from "../host-bindings.js";
 import { omittedReadField, readView } from "../read-view.js";
 import { buildWriteReceipt, compactOutputEnabled, type ReceiptContext } from "../queue-receipt.js";
 import { TRANSITIONS_SHOWN, compactShow, compactTransitions, showEmptyNotice, transitionsNotice } from "../queue-read-compact.js";
@@ -340,6 +342,79 @@ function printResult(json: boolean, body: unknown, status: number): void {
     console.log(JSON.stringify(body, null, 2));
   }
   if (status >= 400) process.exitCode = status >= 500 ? 2 : 1;
+}
+
+/** #1642: why a create provably wrote nothing, for the refusals that come before any write: the
+ *  selected daemon refused the forward before contacting another host (its registry was unreadable,
+ *  the host unknown or SSH-declared), or refused a local create to a rig it doesn't have. Any other
+ *  failure, including a timeout or a remote's error, may follow a commit, so it returns null. */
+function provenCreateRefusal(status: number, body: unknown): string | null {
+  if (!body || typeof body !== "object") return null;
+  const { error, failureClass, hostId } = body as { error?: unknown; failureClass?: unknown; hostId?: unknown };
+  if (status === 502 && error === "remote_queue_write_failed"
+    && (failureClass === "unknown-host" || failureClass === "unsupported-transport" || failureClass === "registry")) {
+    return `the daemon refused to forward it to host '${String(hostId)}' (${failureClass}) before contacting that host.`;
+  }
+  if (status === 400 && error === "unknown_destination_rig") {
+    return "the daemon refused it because the destination's rig doesn't exist on that daemon.";
+  }
+  return null;
+}
+
+/** #1642: after the daemon refuses a host token it doesn't know, the substitution this CLI's own
+ *  registry suggests, when it resolves the token (through an entry's declared hostId or a learned
+ *  binding, as `rig send` does) to another entry id. Only a hint: the registry of the daemon this
+ *  command reached may give that id to another host. Nothing is sent again. */
+function hostSubstitutionHint(
+  status: number,
+  body: unknown,
+  rawDestination: string,
+  explicitHost: string | undefined,
+  resolved: { destination: string; hostId?: string },
+  keep = "",
+): string | null {
+  const token = resolved.hostId;
+  const data = body as { error?: unknown; failureClass?: unknown; hostId?: unknown } | null;
+  if (token === undefined || token === "local" || status !== 502 || data?.error !== "remote_queue_write_failed"
+    || data.failureClass !== "unknown-host" || data.hostId !== token) return null;
+  const registry = loadHostRegistry();
+  const match = registry.ok ? resolveHost(registry.registry, token, loadHostBindings().bindings) : undefined;
+  const entryId = match?.ok ? match.host.id : undefined;
+  if (entryId === undefined || entryId === token) return null;
+  const forms = [
+    ...(rawDestination !== resolved.destination ? [`the destination ${shellQuote(`${resolved.destination}@${entryId}`)}`] : []),
+    ...(explicitHost !== undefined ? [`--host ${shellQuote(entryId)}`] : []),
+  ];
+  return `Host '${token}' resolves to '${entryId}' in this CLI's host registry. That doesn't prove '${entryId}' names the same host in the registry of the daemon this command reached, which OPENRIG_URL can select. If it does, send the write again to the same daemon with ${forms.join(" and ")}${keep}.`;
+}
+
+interface WorkChoiceCandidate {
+  qitemId?: string | null;
+  projects?: string[];
+  mission?: string;
+  slice?: string | null;
+  workNodePath?: string | null;
+  unresolved?: string | null;
+}
+
+/** After the plain answer, the candidates the agent must choose between, one line each, so a
+ *  refused current work is never just a count. Prints nothing when the daemon sent no choice
+ *  (current work is settled, nothing is in progress, or the daemon predates the field). */
+export function printCurrentWorkChoice(data: unknown): void {
+  const choice = (data as { currentWorkChoice?: { instruction?: string; candidates?: WorkChoiceCandidate[];
+    unknown?: Array<{ qitemId?: string | null; reason?: string }> } } | null)?.currentWorkChoice;
+  if (!choice) return;
+  console.log("");
+  console.log(choice.instruction ?? "OpenRig did not choose your current work.");
+  for (const [index, c] of (choice.candidates ?? []).entries()) {
+    const project = c.projects?.length ? `project ${c.projects.join(", ")}` : "no project tag";
+    const where = c.workNodePath ?? "no folder found";
+    const why = c.unresolved ? ` (${c.unresolved})` : "";
+    console.log(`  ${index + 1}. ${project} · mission ${c.mission ?? "?"} · slice ${c.slice ?? "none"} · ${where}${why} · from row ${c.qitemId ?? "unknown"}`);
+  }
+  for (const u of choice.unknown ?? []) {
+    console.log(`  - row ${u.qitemId ?? "unknown"}: work not named (${u.reason ?? "no reason given"})`);
+  }
 }
 
 /** Slice 15: the receipt context when a write should print its receipt — the
@@ -680,7 +755,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .option("--expires-at <iso>", "ISO timestamp at which the qitem expires")
     .option("--id <qitemId>", "Retry identity: reuse for the same create after an unknown outcome; otherwise generated and printed before sending")
     .option("--target-repo <name>", "PL-007: typed repo scope (must match a repo in the source rig's RigSpec.workspace.repos[])")
-    .option("--summary <text>", "Short human-readable subject, shown in the needs-you view. For a human destination, --body-file is the complete decision brief or update; keep technical continuation in the owning agent row and evidence.")
+    .option("--summary <text>", "Short human-readable subject of the row, shown on every surface that lists it (RECENT, the story, the needs-you view). Say what the work is and why it needs this seat. For a human destination, --body-file is the complete decision brief or update; keep technical continuation in the owning agent row and evidence.")
     .option("--human-intent <intent>", "decision (default) or update: a quiet informational delivery, never an approval request")
     .option("--human-detail-file <path>", "One explicitly authored supplemental thread reply; keep the complete action/options in --body-file")
     .option("--reply-to <qitemId>", "Post this update into an earlier qitem's Slack thread (requires --human-intent update; posts as a new top-level message instead if that thread can't be used, e.g. it is missing or still has an open human decision; --verify reports why)")
@@ -780,7 +855,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       // callers that omit it; hard-require is a future hardening.
       if (!opts.summary) {
         process.stderr.write(
-          "warning: rig queue create called without --summary. Pass --summary <text> to set the new qitem's short human-readable summary; without it, the Story node falls back to a bounded body preview. A good summary is 1-2 plain sentences a human skims in the needs-you view — what the work is and why it needs this seat, not the agent-speak --body. Proceeding (pre-18 callers exempt).\n"
+          "warning: rig queue create called without --summary. Pass --summary <text> to set the new qitem's short human-readable summary; without it, the Story node falls back to a bounded body preview. The summary is the row's subject in RECENT, the story and the needs-you view. A good summary is 1-2 plain sentences a human skims — what the work is and why it needs this seat, not the agent-speak --body. Proceeding (pre-18 callers exempt).\n"
         );
       }
       // A managed seat keeps transport-derived identity; an external caller can
@@ -877,6 +952,10 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           printResult(opts.json ?? false, { ...res.data, qitemId, recovery }, res.status);
           return;
         }
+        const refusal = res.status >= 400 ? provenCreateRefusal(res.status, res.data) : null;
+        if (refusal) console.error(`No row was created: ${refusal}`);
+        const hint = hostSubstitutionHint(res.status, res.data, opts.destination, opts.host, hostResolved, `, keeping --id ${shellQuote(qitemId)}`);
+        if (hint) console.error(hint);
         const createWarning = res.data?.createWarning as { code?: unknown; message?: unknown } | undefined;
         if (res.status < 400 && createWarning?.code === "qitem_body_not_saved" && typeof createWarning.message === "string") {
           console.error(`Warning: ${createWarning.message}`);
@@ -1118,7 +1197,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--tags <tags>", "Comma-separated tags for the new qitem")
     .option("--gate <role>", "OPR.0.4.3.16: mark the new qitem as gate work; translated to a gate:<role> tag (e.g. guard | spec-review). The idle-gate watchdog reads this predicate. Composes with --tags.")
     .option("--target-repo <name>", "PL-007: typed repo scope for the new qitem")
-    .option("--summary <text>", "OPR.0.4.1.18: short human-readable 1-2 sentence summary for the new qitem — what it is and why this seat, skimmable in the needs-you view (--body stays source of truth). Warned-if-missing.")
+    .option("--summary <text>", "OPR.0.4.1.18: short human-readable 1-2 sentence subject of the new qitem — what it is and why this seat — shown on every surface that lists it (RECENT, the story, the needs-you view); --body stays source of truth. Not inherited from the source row. Warned-if-missing.")
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: durable-artifact pointer for the new qitem. Required by the daemon when the new qitem is human-routed; optional otherwise.")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--no-nudge", "Suppress the default nudge to the new destination")
@@ -1169,7 +1248,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       // it should carry its own summary. Warn to stderr; do not hard-break.
       if (!opts.summary) {
         process.stderr.write(
-          "warning: rig queue handoff called without --summary. Pass --summary <text> to set the new qitem's short human-readable summary; without it, the Story node falls back to a bounded body preview. A good summary is 1-2 plain sentences a human skims in the needs-you view — what the work is and why it needs this seat, not the agent-speak --body. Proceeding.\n"
+          "warning: rig queue handoff called without --summary. Pass --summary <text> to set the new qitem's short human-readable summary; without it, the Story node falls back to a bounded body preview. The summary is the row's subject in RECENT, the story and the needs-you view. A good summary is 1-2 plain sentences a human skims — what the work is and why it needs this seat, not the agent-speak --body. Proceeding.\n"
         );
       }
       const deps = getDeps();
@@ -1196,6 +1275,8 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           nudge: opts.nudge,
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
         });
+        const hint = hostSubstitutionHint(res.status, res.data, opts.to, opts.host, hostResolved);
+        if (hint) console.error(hint);
         await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, {
           verb: "handoff", nudgeSuppressed: opts.nudge === false, remoteHost: remoteHostOf(hostResolved.hostId),
         }));
@@ -1217,7 +1298,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--tags <tags>", "Comma-separated tags for the new qitem")
     .option("--gate <role>", "OPR.0.4.3.16: mark the new qitem as gate work; translated to a gate:<role> tag (e.g. guard | spec-review). The idle-gate watchdog reads this predicate. Composes with --tags.")
     .option("--target-repo <name>", "PL-007: typed repo scope for the new qitem")
-    .option("--summary <text>", "OPR.0.4.1.18: short human-readable 1-2 sentence summary for the new qitem — what it is and why this seat, skimmable in the needs-you view (--body stays source of truth). Warned-if-missing.")
+    .option("--summary <text>", "OPR.0.4.1.18: short human-readable 1-2 sentence subject of the new qitem — what it is and why this seat — shown on every surface that lists it (RECENT, the story, the needs-you view); --body stays source of truth. Not inherited from the source row. Warned-if-missing.")
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: durable-artifact pointer for the new qitem. Required by the daemon when the new qitem is human-routed; optional otherwise.")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--no-nudge", "Suppress the default nudge to the new destination")
@@ -1266,7 +1347,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       // it should carry its own summary. Warn to stderr; do not hard-break.
       if (!opts.summary) {
         process.stderr.write(
-          "warning: rig queue handoff called without --summary. Pass --summary <text> to set the new qitem's short human-readable summary; without it, the Story node falls back to a bounded body preview. A good summary is 1-2 plain sentences a human skims in the needs-you view — what the work is and why it needs this seat, not the agent-speak --body. Proceeding.\n"
+          "warning: rig queue handoff called without --summary. Pass --summary <text> to set the new qitem's short human-readable summary; without it, the Story node falls back to a bounded body preview. The summary is the row's subject in RECENT, the story and the needs-you view. A good summary is 1-2 plain sentences a human skims — what the work is and why it needs this seat, not the agent-speak --body. Proceeding.\n"
         );
       }
       const deps = getDeps();
@@ -1293,6 +1374,8 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           nudge: opts.nudge,
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
         });
+        const hint = hostSubstitutionHint(res.status, res.data, opts.to, opts.host, hostResolved);
+        if (hint) console.error(hint);
         await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, {
           verb: "handoff-and-complete", nudgeSuppressed: opts.nudge === false, remoteHost: remoteHostOf(hostResolved.hostId),
         }));
@@ -1318,6 +1401,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       await withClient(deps, async (client) => {
         const res = await client.get<unknown>(`/api/queue/whoami?${params.toString()}`);
         printResult(opts.json ?? false, res.data, res.status);
+        if (!opts.json && res.status < 400) printCurrentWorkChoice(res.data);
       });
     });
 

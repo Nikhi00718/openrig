@@ -13,7 +13,7 @@ import {
   codexCommandResumeToken, listNativeProcesses, processArgv, verifyCodexPaneProcess,
   type NativeProcessLister, type NativeProcessRow,
 } from "./native-process-lineage.js";
-import { CodexThreadIdResolver, resolveCodexDbPaths } from "./codex-thread-id.js";
+import { CodexThreadIdResolver, resolveCodexDbPaths, type CodexThreadEvidence } from "./codex-thread-id.js";
 import { isShellForeground } from "./shell-classifier.js";
 import { terminatePaneInPlace, type PaneCutoverTiming } from "./pane-cutover.js";
 import { rebindAndVerifyPaneIdentity } from "./seat-attention-reconciler.js";
@@ -37,7 +37,7 @@ import { CODEX_NETWORK_DEFAULT_OVERRIDE } from "./codex-network-default.js";
 export type InPlaceRestartTmux = Pick<TmuxAdapter,
   | "getPanePid" | "getPaneCommand" | "listPanes" | "getSessionEnv" | "signalPid" | "setRemainOnExit"
   | "signalPaneProcess" | "isPaneDead" | "respawnPane" | "getPaneLocalOption" | "restorePaneOption"
-  | "capturePaneHistory">;
+  | "capturePaneHistory" | "capturePaneHistoryParts">;
 
 /** The Codex runtime adapter's resume surface this operation reuses. */
 export interface InPlaceCodexLauncher {
@@ -61,6 +61,8 @@ export interface ProcessFacts {
 export interface InPlaceRestartIo {
   readProcess(pid: number): Promise<ProcessFacts | null>;
   readThreadId(pid: number, startedAt: string, codexHome: string): Promise<string | undefined>;
+  /** The same read as readThreadId, with whether it met no detected incompleteness (discovery, open, query). */
+  readThreadEvidence(pid: number, startedAt: string, codexHome: string): Promise<CodexThreadEvidence>;
   /** `cli_auth_credentials_store` from the home's config.toml: the value, null when unset, undefined when unreadable. */
   readCredentialStore(codexHome: string): string | null | undefined;
   /** stat (never read) of the home's auth.json. */
@@ -123,6 +125,9 @@ export interface InPlaceRestartReport {
   paneShape: PaneShape;
   conversationId: string;
   conversationProof: "argv" | "native_logs";
+  /** When argv proves the stored conversation: what the process's own retained logs show, as a note. "no other
+   *  conversation logged" isn't proof the conversation is current; "not established: …" says why nothing was concluded. */
+  currentConversation?: string;
   activity: { state: "working" | "needs_input" | "idle" | "unknown"; needsInput: number | null; detail: string };
   childProcesses: Array<{ pid: number; name: string }>;
   settings: {
@@ -131,6 +136,12 @@ export interface InPlaceRestartReport {
     effort: { running: string | null; relaunch: string | null; changes: boolean; source: "seat_choice" | "authored" | "runtime_default" };
   };
   codexHome: string;
+  /** Launch evidence only: whether the running Codex's command line carries `--no-daemon`. It doesn't show whether an
+   *  app-server process, its login or any lock is involved. */
+  codexNoDaemonFlag: { present: boolean; detail: string };
+  /** Whether the running Codex is attached to an app-server, as observed. Nothing OpenRig reads observes that today, so
+   *  it is always `unknown`, with the reason. Never inferred from the launch flag. */
+  processMode: { state: "observed" | "unknown"; detail: string };
   billingRoute: { state: "unknown"; detail: string; apiKeyEnvNames: string[] };
   account: AccountEvidence;
   peers: PeerReport[];
@@ -154,6 +165,8 @@ export interface AccountEvidence {
   credentialStore: { value: string | null; state: "read" | "unset" | "unreadable"; detail: string };
   authFile: { changedBeforeRestart: boolean | null; detail: string };
   startupGate: string | null;
+  /** The native resume probe's code for that gate (for example `hook_trust_gate`), when the launch named one. */
+  startupGateKind: string | null;
   notVerified: string[];
 }
 
@@ -248,15 +261,16 @@ export class CodexInPlaceRestart {
         message: `The restart stopped with an error during ${progress.stage}; the seat's state was not observed afterwards.`,
       };
     }
-    // The Account lines already in the pane when the restart finished. --verify counts only lines beyond
-    // these, so text that was there before (anywhere in history or on screen) is never evidence.
-    const accountLinesAtRestart = result.outcome === "restarted_account_unverified"
-      ? accountLineCounts(await this.deps.tmux.capturePaneHistory(result.pane).catch(() => null))
+    // Where the pane's text stood when the restart finished: an anchor at the end of its history, and the
+    // Account lines after it. --verify counts only lines beyond these, so text that was there before is never
+    // evidence, however much older history tmux has trimmed since.
+    const accountTextAtRestart = result.outcome === "restarted_account_unverified"
+      ? accountTextMark(await this.deps.tmux.capturePaneHistoryParts(result.pane).catch(() => null))
       : null;
     this.persist({
       type: RESTART_FINISHED, rigId: seat.rigId, nodeId: seat.nodeId, logicalId: seat.logicalId, sessionName,
       outcome: result.outcome!, newPid: result.newProcess?.pid ?? null, newStartedAt: result.newProcess?.startedAt ?? null,
-      codexHome: result.codexHome, paneHeld: result.paneHeld ? true : false, accountLinesAtRestart, finishedAt: this.now().toISOString(),
+      codexHome: result.codexHome, paneHeld: result.paneHeld ? true : false, accountTextAtRestart, finishedAt: this.now().toISOString(),
     });
     return result;
   }
@@ -340,7 +354,7 @@ export class CodexInPlaceRestart {
     const latest = rows[0];
     if (!latest) return { ok: false, code: "no_restart_recorded", message: "This seat has no recorded in-place restart to verify." };
     if (latest.type === RESTART_STARTED) return { ok: false, code: "restart_not_completed", message: "The latest in-place restart of this seat has not finished." };
-    const finished = JSON.parse(latest.payload) as { outcome: string; newPid: number | null; newStartedAt: string | null; codexHome: string; finishedAt: string; accountLinesAtRestart?: Record<string, number> | null };
+    const finished = JSON.parse(latest.payload) as { outcome: string; newPid: number | null; newStartedAt: string | null; codexHome: string; finishedAt: string; accountLinesAtRestart?: Record<string, number> | null; accountTextAtRestart?: AccountTextMark | null };
     if (finished.outcome !== "restarted_account_unverified") {
       return { ok: false, code: "restart_not_completed", message: `The latest in-place restart ended ${finished.outcome}; there is nothing to verify.` };
     }
@@ -350,7 +364,10 @@ export class CodexInPlaceRestart {
     }
     const conversationId = readResumeToken(this.deps.db, target.sessionId);
     const toolTurn = this.readToolTurn(finished.codexHome, conversationId, finished.finishedAt);
-    const accountEvidence = await this.readAccountLine(target.binding.tmuxPane!, finished.accountLinesAtRestart ?? null, input.expectAccount ?? null);
+    // A restart recorded before the anchor existed carries only whole-pane counts; those are still compared as before.
+    const atRestart = finished.accountTextAtRestart !== undefined ? finished.accountTextAtRestart
+      : finished.accountLinesAtRestart != null ? { anchor: null, counts: finished.accountLinesAtRestart } : null;
+    const accountEvidence = await this.readAccountLine(target.binding.tmuxPane!, atRestart, input.expectAccount ?? null);
     const moved = toolTurn.state === "observed" && toolTurn.completed > 0 && toolTurn.errors === 0 && accountEvidence.state === "matched";
     return {
       ok: true, seat: target.seat, outcome: moved ? "moved" : "restarted_account_unverified", toolTurn, accountEvidence,
@@ -399,6 +416,29 @@ export class CodexInPlaceRestart {
     else if (argvToken === undefined && startedAt && (await this.io.readThreadId(process.pid, startedAt, codexHome)) === token) conversationProof = "native_logs";
     else return { ok: false, code: "resume_binding_unverified", message: "The running Codex could not be proven to be on the seat's stored conversation (checked: its argv, then its native logs). Nothing was stopped." };
 
+    // Its argv resumes the stored conversation, but its own logs may say it has moved on. Refuse only when a read with no
+    // detected incompleteness (every database found, opened and queried) names only another conversation; anything less
+    // keeps the restart, with a note. Not an atomic snapshot: a switch not yet logged, or rows inside the process's start
+    // second (excluded by the reuse gate), stay invisible.
+    let currentConversation: string | undefined;
+    if (conversationProof === "argv") {
+      let evidence: CodexThreadEvidence;
+      if (!startedAt) evidence = { reason: "no_log_row", fullyReadable: false };
+      else {
+        try { evidence = await this.io.readThreadEvidence(process.pid, startedAt, codexHome); }
+        catch { evidence = { reason: "sqlite_unreadable", fullyReadable: false, incomplete: "unreadable" }; }
+      }
+      if (evidence.fullyReadable && evidence.thread && evidence.thread !== token) {
+        return { ok: false, code: "resume_binding_unverified", detail: { reason: "conflicting retained native-thread evidence", loggedConversation: evidence.thread },
+          message: `Conflicting retained native-thread evidence: the running Codex's command line resumes the seat's stored conversation ${token}, but its own logs, read with no detected incompleteness, name only ${evidence.thread}. Nothing was stopped and nothing was typed.`,
+          guidance: "This doesn't show which conversation is current or that the stored one is gone. Check the seat's conversation (rig seat set-resume-token records one) before restarting it in place." };
+      }
+      currentConversation = evidence.thread === token && evidence.fullyReadable ? "no other conversation logged"
+        : evidence.thread ? (evidence.incomplete === "unreadable" ? "not established: a native database was unreadable"
+          : "not established: the native databases couldn't all be found")
+        : `not established: ${evidence.reason ?? "no_log_row"}`;
+    }
+
     // Pane shape: the pane's root is Codex itself, or a shell whose child chain is Codex.
     const chain = codexChain(rows, process, panePid);
     const top = chain.at(-1)!;
@@ -427,7 +467,8 @@ export class CodexInPlaceRestart {
     // The probed and prepared launch choices come from the running Codex, so the relaunch keeps them and no
     // Codex process is started to decide them again.
     const runningArgv = processArgv(process.command);
-    const relaunch = await this.deps.codex.buildResumeCommand(relaunchBinding, { name: sessionName, resumeToken: token, running: runningLaunch(runningArgv) });
+    const running = runningLaunch(runningArgv);
+    const relaunch = await this.deps.codex.buildResumeCommand(relaunchBinding, { name: sessionName, resumeToken: token, running });
     if (!relaunch.ok) return { ok: false, code: "relaunch_unavailable", message: `The resume command could not be built: ${relaunch.error}. Nothing was stopped.` };
     const relaunchHome = envAssignment(relaunch.command, "CODEX_HOME")
       ?? (paneShape === "shell_backed"
@@ -478,9 +519,14 @@ export class CodexInPlaceRestart {
           ? `The restart keeps the settings the running Codex uses (effective), except effort: it sends the seat's saved effort choice ${effort.relaunch} in place of ${effort.running ?? "no flag"}. Other saved choices are shown, not applied.`
           : "The restart keeps the settings the running Codex uses (effective), effort included. Saved choices for the next managed launch are shown, not applied." },
       codexHome,
+      codexNoDaemonFlag: running.daemonOptOut
+        ? { present: true, detail: "Launch evidence: the running Codex was started with --no-daemon. This doesn't show whether an app-server process, its login or any lock is involved." }
+        : { present: false, detail: "Launch evidence: the running Codex's command line has no --no-daemon. This doesn't show whether an app-server process, its login or any lock is involved." },
+      processMode: { state: "unknown", detail: "Process mode: unknown. Nothing OpenRig reads shows whether the running Codex is attached to an app-server; the --no-daemon flag above is launch evidence only." },
       billingRoute: { state: "unknown", apiKeyEnvNames: facts.apiKeyEnvNames,
         detail: "Which billing route Codex uses is not observable without reading credentials; API-key variable names alone don't establish it." },
       account: this.accountEvidence(codexHome, startedAt, null),
+      ...(currentConversation ? { currentConversation } : {}),
       peers: await this.peers(seat.nodeId, codexHome),
       oldProcess: { pid: process.pid, startedAt },
       ...history,
@@ -562,6 +608,8 @@ export class CodexInPlaceRestart {
         db: this.deps.db, sessionRegistry: this.deps.sessionRegistry, tmux: this.deps.tmux,
         nodeId: target.seat.nodeId, sessionName: target.sessionName, runtime: "codex",
         expectedResumeToken: report.conversationId, requireExactResumeLineage: true, listProcesses: this.listProcesses,
+        // The check repeats up to 31 times; only the final attempt, whose text the report shows, pays the extra read.
+        explainFailure: attempt >= polls,
       });
       const now = await this.observeCodex(report.pane, report.conversationId);
       if (!identity.ok || !now) {
@@ -627,14 +675,28 @@ export class CodexInPlaceRestart {
     paneHeld?: InPlaceRestartReport["paneHeld"]): InPlaceRestartReport {
     const signIn = /sign in/i.test(launch.error);
     const missing = launch.recovery === "retry_fresh";
+    const attention = launch.recovery === "attention_required";
+    // The native decision a named startup gate is waiting for. Nothing answers it: the step names it.
+    const named = attention && launch.gate ? startupGateStep(launch, report.sessionName, report.pane, recoveryCommand) : null;
     return {
       ...report, outcome: "incomplete", recoveryCommand, ...(paneHeld ? { paneHeld } : {}),
-      account: { ...report.account, startupGate: launch.recovery === "attention_required" ? launch.error : null },
+      account: { ...report.account, startupGate: attention ? launch.error : null, startupGateKind: attention ? launch.gate ?? null : null },
       remainingStep: signIn
         ? `Whoever owns the sign-in signs in to Codex in ${report.codexHome}, then the conversation resumes with the recovery command.`
         : missing
           ? `Codex in ${report.codexHome} has no saved session for this conversation; no fresh session was started. Find where it was saved before resuming.`
-          : "Resolve what Codex shows in the pane, then resume with the recovery command. Nothing was retried.",
+          : named
+            // #1524 (b): disproved: the resumed process's records name another conversation.
+            ?? (launch.resumeMismatch
+              ? `The resumed Codex opened ${launch.resumeMismatch.opened}, not the seat's conversation ${report.conversationId}; find the seat's conversation before resuming again. Nothing was retried.`
+            // #1524 (b): not disproved, only unproven; the resumed Codex may still be running it.
+            : launch.resumeUnproven
+              ? `The resumed Codex may still be running in the pane: its records didn't prove the conversation in time. Check the pane first; if the conversation is there, adopt it with rig reconcile-session ${report.sessionName} --no-launch. Use the recovery command only if the original is gone. ${attention && keyTyped(launch) ? typedSentence(launch) : "Nothing was retried."}`
+              : null)
+            ?? (attention && keyTyped(launch)
+              // OpenRig's own key is part of what the person needs to know, even with no screen named.
+              ? `Resolve what Codex shows in the pane, then resume with the recovery command. ${typedSentence(launch)}`
+              : "Resolve what Codex shows in the pane, then resume with the recovery command. Nothing was retried."),
       message: `The original Codex exited, but the resume was not proven: ${launch.error}`,
     };
   }
@@ -668,6 +730,7 @@ export class CodexInPlaceRestart {
               detail: "Whether auth.json changed after the running Codex started (stat only; never read). A change is not proof of which account." }
           : { changedBeforeRestart: auth.mtimeMs < newStart, detail: "auth.json was last modified before the replacement started (stat only; never read)." },
       startupGate: null,
+      startupGateKind: null,
       notVerified: NOT_VERIFIED,
     };
   }
@@ -718,23 +781,27 @@ export class CodexInPlaceRestart {
 
   /**
    * Account evidence counts only when the line was produced after the restart. A cursor position can't show
-   * that (a TUI rewrites rows above and below the cursor), so this compares occurrences: every Account line
-   * in the pane's whole text when the restart finished was counted, and a line is new only when the same
-   * text now occurs more often than it did then. Text that moved, stayed or was redrawn never counts more
-   * than once; anything that can't be compared is not observed.
+   * that (a TUI rewrites rows above and below the cursor), so this compares occurrences after an anchor: the
+   * last history lines when the restart finished, which no redraw changes once they've scrolled up. Only text
+   * after the anchor's last occurrence is compared, and a line is new only when the same text occurs there more
+   * often than it did after the anchor's own position then. tmux trims the oldest history first, so trimming
+   * can't remove the restart-time lines after the anchor while keeping the anchor, and older copies of a line no
+   * longer hide a new one. Text that moved, stayed or was redrawn never counts more than once; anything that
+   * can't be compared is not observed.
    */
-  private async readAccountLine(pane: string, atRestart: Record<string, number> | null, expectAccount: string | null): Promise<{ state: "matched" | "not_matched" | "not_requested" | "not_observed"; detail: string }> {
+  private async readAccountLine(pane: string, atRestart: { anchor: string[] | null; counts: Record<string, number> } | null, expectAccount: string | null): Promise<{ state: "matched" | "not_matched" | "not_requested" | "not_observed"; detail: string }> {
     if (!expectAccount?.trim()) return { state: "not_requested", detail: "No --expect-account given, so no account-specific evidence was checked." };
     if (atRestart === null) return { state: "not_observed", detail: "The pane's text at the restart was not recorded, so a line produced since can't be told apart from earlier text." };
     const text = await this.deps.tmux.capturePaneHistory(pane).catch(() => null);
     if (text === null) return { state: "not_observed", detail: "The pane's text could not be read." };
+    const compared = atRestart.anchor === null ? text : linesAfterAnchor(paneLines(text), atRestart.anchor).join("\n");
     const seen = new Map<string, number>();
     let newest: string | undefined;
-    for (const line of accountLines(text)) {
-      const key = accountLineKey(line);
+    for (const line of accountLines(compared)) {
+      const key = lineDigest(line);
       const count = (seen.get(key) ?? 0) + 1;
       seen.set(key, count);
-      if (count > (atRestart[key] ?? 0)) newest = line;
+      if (count > (atRestart.counts[key] ?? 0)) newest = line;
     }
     if (!newest) return { state: "not_observed", detail: "No Codex status Account line was produced since the restart (lines already in the pane then don't count); show /status in the seat first." };
     return accountLineNames(newest, expectAccount)
@@ -791,6 +858,53 @@ function codexChain(rows: NativeProcessRow[], deepest: NativeProcessRow, panePid
     current = parent;
   }
   return chain;
+}
+
+/** The native decision each named Codex startup gate is waiting for, in plain words. OpenRig never makes it: the
+ *  step names it and leaves it to the person or an authorised operator. Gates not listed keep the generic step. An
+ *  update screen is a decision only when it offered a choice; otherwise it's an update screen to check (see below). */
+const STARTUP_GATE_STEPS: Record<string, string> = {
+  hook_trust_gate: "Codex is waiting for a hook review decision",
+  trust_gate: "Codex is waiting for a folder trust decision",
+  model_selection_gate: "Codex is waiting for a model choice",
+  update_gate: "Codex is waiting for an update decision OpenRig could not skip",
+};
+
+/** The remaining step for a named startup gate, or null for the generic step. It states only what the launch result
+ *  carries: the gate, whether an update screen offered a choice, and what the resume verification typed. */
+/** Whether the resume check itself typed the update prompt's skip key (sent, or tried and failed). */
+function keyTyped(launch: Extract<HarnessLaunchResult, { ok: false }>): boolean {
+  return launch.verifierInput === "update_skip_key_sent" || launch.verifierInput === "update_skip_key_failed";
+}
+
+/** What the resume check typed, exactly as the launch result says, and that nothing was retried. */
+function typedSentence(launch: Extract<HarnessLaunchResult, { ok: false }>): string {
+  return launch.verifierInput === "update_skip_key_sent"
+    ? "OpenRig sent the update prompt's skip key (3) once while checking the resume; nothing was retried or relaunched."
+    : launch.verifierInput === "update_skip_key_failed"
+      ? "OpenRig tried to send the update prompt's skip key (3) once and the send failed, so its effect is unknown; nothing was retried or relaunched."
+      : launch.verifierInput === "none"
+        ? "OpenRig typed nothing into this screen; nothing was retried or relaunched."
+        : "Nothing was retried or relaunched.";
+}
+
+function startupGateStep(launch: Extract<HarnessLaunchResult, { ok: false }>, session: string, pane: string,
+  recoveryCommand: string | undefined): string | null {
+  const gate = launch.gate;
+  if (!gate || STARTUP_GATE_STEPS[gate] === undefined) return null;
+  const where = `in the pane (${session}, pane ${pane}); see it with \`rig capture ${session}\``;
+  const run = `run the recovery command${recoveryCommand ? `: ${recoveryCommand}` : ""}`;
+  const typed = typedSentence(launch);
+  if (gate === "update_gate" && launch.screenBeforeInput && launch.verifierInput !== undefined && launch.verifierInput !== "none") {
+    const before = launch.verifierInput === "update_skip_key_sent"
+      ? "before it sent the update prompt's skip key (3), offered an update choice. What Codex showed after the key wasn't observed."
+      : "before it tried to send the update prompt's skip key (3), offered an update choice. The send failed, so the key's effect is unknown.";
+    return `The last screen OpenRig saw, ${before} See it with \`rig capture ${session}\` (pane ${pane}), then ${run}. Nothing was retried or relaunched.`;
+  }
+  if (gate === "update_gate" && launch.gateChoice !== true) {
+    return `Codex is showing an update screen ${where}. Check it before you ${run}. ${typed}`;
+  }
+  return `${STARTUP_GATE_STEPS[gate]} ${where}. That decision is for the person or an authorised operator; once it's made, ${run}. ${typed}`;
 }
 
 /** Processes under the Codex process, other than Codex itself. Reported, never refused. */
@@ -918,17 +1032,58 @@ function accountLines(text: string): string[] {
   return text.split("\n").map((line) => line.replace(/^[\s│|]+|[\s│|]+$/g, "")).filter((line) => /^Account:\s*\S/i.test(line));
 }
 
-/** A line's key in the recorded counts: a digest, so the event log holds no account names. */
-function accountLineKey(line: string): string {
+/** A line's key in the recorded anchor and counts: a digest, so the event log holds no pane text or account names. */
+function lineDigest(line: string): string {
   return createHash("sha256").update(line).digest("hex").slice(0, 16);
 }
 
-/** How often each Account line occurs in the pane's text; null when the text couldn't be read. */
-function accountLineCounts(text: string | null): Record<string, number> | null {
-  if (text === null) return null;
+/** How many history lines the anchor holds. */
+const ANCHOR_LINES = 8;
+
+/** Where the pane's text stood at the restart: digests of the last history lines (the anchor) and how often each
+ *  Account line occurs after them. */
+export interface AccountTextMark {
+  anchor: string[];
+  counts: Record<string, number>;
+}
+
+/** The pane's non-empty lines, trailing blanks removed. */
+function paneLines(text: string): string[] {
+  return text.split("\n").map((line) => line.trimEnd()).filter((line) => line.length > 0);
+}
+
+/** The lines after the anchor's last occurrence. When trimming has cut into the anchor, its longest surviving end
+ *  is used; when none of it survives, every line left came after it. The last occurrence is taken, so a repeat of
+ *  the anchor can only shorten what is compared, never reach back before the restart. */
+export function linesAfterAnchor(lines: string[], anchor: string[]): string[] {
+  const keys = lines.map(lineDigest);
+  for (let size = anchor.length; size >= 1; size--) {
+    const tail = anchor.slice(anchor.length - size);
+    for (let at = keys.length - size; at >= 0; at--) {
+      if (tail.every((key, offset) => keys[at + offset] === key)) return lines.slice(at + size);
+    }
+  }
+  return lines;
+}
+
+/** The anchor and the Account counts after it from one capture; null when the pane couldn't be read. The last history
+ *  line isn't part of the anchor: it can be the start of a line that wraps onto the screen, and joins its continuation
+ *  once it scrolls up. The counts start where the anchor actually ends, not after its last match: a copy of the anchor
+ *  on the screen can be redrawn away, and verify would then compare lines that were never counted. */
+export function accountTextMark(capture: { history: string; all: string } | null): AccountTextMark | null {
+  if (capture === null) return null;
+  const history = paneLines(capture.history);
+  const all = paneLines(capture.all);
+  const end = Math.max(0, history.length - 1);
+  const anchor = history.slice(Math.max(0, end - ANCHOR_LINES), end).map(lineDigest);
+  // The two captures can be separate tmux commands. If the pane moved between them, the anchor isn't where history
+  // ended, so the baseline is the whole pane with no anchor, and verify compares the whole pane.
+  const aligned = anchor.every((key, i) => lineDigest(all[end - anchor.length + i] ?? "") === key);
   const counts: Record<string, number> = {};
-  for (const line of accountLines(text)) counts[accountLineKey(line)] = (counts[accountLineKey(line)] ?? 0) + 1;
-  return counts;
+  for (const line of accountLines((aligned ? all.slice(end) : all).join("\n"))) {
+    counts[lineDigest(line)] = (counts[lineDigest(line)] ?? 0) + 1;
+  }
+  return { anchor: aligned ? anchor : [], counts };
 }
 
 /** Whether a status `Account:` line names `expected` as a whole value: `bob@corp.com` doesn't match
@@ -961,7 +1116,10 @@ export function defaultInPlaceRestartIo(): InPlaceRestartIo {
       }
     },
     async readThreadId(pid, startedAt, codexHome) {
-      return new CodexThreadIdResolver({ codexHome }).resolve(pid, startedAt);
+      return (await new CodexThreadIdResolver({ codexHome }).resolveWithReadability(pid, startedAt)).thread;
+    },
+    async readThreadEvidence(pid, startedAt, codexHome) {
+      return new CodexThreadIdResolver({ codexHome }).resolveWithReadability(pid, startedAt);
     },
     readCredentialStore(codexHome) {
       let text: string;

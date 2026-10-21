@@ -16,9 +16,11 @@ import { WORKSPACE_KINDS } from "./types.js";
 import { validateSafePath } from "./path-safety.js";
 import { CLAUDE_MANAGED_BLOCK_FILES } from "./managed-blocks.js";
 import { canonicalCompactionStrategy, canonicalContinuityMechanic } from "./agent-manifest.js";
+import { unknownLevelWarning } from "./seat-effort.js";
 import { aliasModelPinAdvisory } from "./spec-validation-advisory.js";
 import { normalizeSeatEnv, validateSeatEnv } from "./seat-env.js";
 import { validatePermissionPolicyRef } from "./permission-policy/policy-ref.js";
+import { deriveCanonicalSessionName } from "./session-name.js";
 import { validateStartupBlock, normalizeStartupBlock } from "./startup-validation.js";
 import { COMPOSE_PROJECT_NAME_PATTERN, deriveComposeProjectName } from "./compose-project-name.js";
 import * as path from "node:path";
@@ -202,6 +204,7 @@ export class RigSpecSchema {
         const pod = pods[pi]!;
         errors.push(...validatePod(pod, pi, podIds, advisories));
       }
+      advisories.push(...sessionNameCollisions(obj));
 
       // Cross-pod edge validation
       const allQualifiedIds = new Set<string>(opts?.externalQualifiedIds ?? []);
@@ -383,6 +386,31 @@ function normalizeWorkspaceBlock(raw: unknown): WorkspaceSpec | undefined {
 
 // -- Pod validation --
 
+/**
+ * Members in different pods can derive one session name (pod "a-b" + member "c" and pod "a" + member "b-c").
+ * A warning, not an error: `rig spec validate` and `rig up --plan` report it.
+ */
+export function sessionNameCollisions(spec: unknown): string[] {
+  const warnings: string[] = [];
+  if (!isMapping(spec) || !Array.isArray(spec["pods"])) return warnings;
+  const owners = new Map<string, string>();
+  const rig = typeof spec["name"] === "string" ? spec["name"] : "";
+  (spec["pods"] as unknown[]).forEach((pod, pi) => {
+    if (!isMapping(pod) || typeof pod["id"] !== "string" || !Array.isArray(pod["members"])) return;
+    (pod["members"] as unknown[]).forEach((member, mi) => {
+      if (!isMapping(member) || typeof member["id"] !== "string") return;
+      const sessionName = deriveCanonicalSessionName(pod["id"] as string, member["id"] as string, rig);
+      const owner = owners.get(sessionName);
+      const qualifiedId = `${pod["id"]}.${member["id"]}`;
+      if (owner === undefined) owners.set(sessionName, qualifiedId);
+      else if (owner !== qualifiedId) {
+        warnings.push(`pods[${pi}].members[${mi}].id: session name "${sessionName}" is already used by member "${owner}"`);
+      }
+    });
+  });
+  return warnings;
+}
+
 function validatePod(pod: Record<string, unknown>, index: number, podIds: Set<string>, advisories: string[]): string[] {
   const errors: string[] = [];
   const prefix = `pods[${index}]`;
@@ -496,6 +524,9 @@ function validateMember(member: Record<string, unknown>, index: number, podPrefi
   if (member["effort"] !== undefined) {
     if (typeof member["effort"] !== "string" || !member["effort"].trim()) {
       advisories.push(`${prefix}.effort: non-string value "${member["effort"]}" ignored; effort must be a text value`);
+    } else if (member["runtime"] === "pi") {
+      const warning = unknownLevelWarning("pi", member["effort"].trim());
+      if (warning) advisories.push(`${prefix}.effort: ${warning}`);
     }
   }
   if (!member["cwd"] || typeof member["cwd"] !== "string") {
@@ -1284,6 +1315,9 @@ export class LegacyRigSpecSchema {
         if (node["effort"] !== undefined) {
           if (typeof node["effort"] !== "string" || !node["effort"].trim()) {
             advisories.push(`nodes.${nodeWhere}.effort: non-string value "${node["effort"]}" ignored; effort must be a text value`);
+          } else if (node["runtime"] === "pi") {
+            const warning = unknownLevelWarning("pi", node["effort"].trim());
+            if (warning) advisories.push(`nodes.${nodeWhere}.effort: ${warning}`);
           }
         }
 

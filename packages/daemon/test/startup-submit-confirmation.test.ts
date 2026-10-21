@@ -11,7 +11,7 @@ import { SeatDeliveryGuard } from "../src/domain/seat-delivery-guard.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { SessionTransport } from "../src/domain/session-transport.js";
 import { startupSubmissionEvidence } from "../src/domain/startup-submission-evidence.js";
-import { StartupOrchestrator, type StartupInput } from "../src/domain/startup-orchestrator.js";
+import { StartupOrchestrator, startupProofHeldBackWarning, type StartupInput } from "../src/domain/startup-orchestrator.js";
 import { STARTUP_PROOF_INSTRUCTION_LINE } from "../src/domain/startup-proof.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
@@ -449,7 +449,7 @@ describe("startup prompt submission", () => {
     const result = await f.start({ startupActions: proofActions(false) });
     expect(result).toMatchObject({ ok: true, startupStatus: "ready", submission: { status: "unverified", reasons: [
       "Startup submission is unverified: the current composer does not positively match the complete prompt.",
-      "Startup proof instruction was not sent: the startup prompt was not confirmed submitted.",
+      startupProofHeldBackWarning("the input box did not clearly show the prompt as submitted"),
     ] } });
     expect(f.submitted.includes(STARTUP_PROOF_INSTRUCTION_LINE)).toBe(false);
     expect(f.tmux.sendKeys).toHaveBeenCalledTimes(1);
@@ -511,7 +511,9 @@ describe("startup prompt submission", () => {
         expect(f.tmux.sendText).toHaveBeenCalledTimes(1);
         expect(f.submitted).toHaveLength(0);
         expect(f.composer()).toBe(f.tmux.sendText.mock.calls[0]![1]);
-        expect(result.ok && result.submission?.reasons).toContain("Startup proof instruction was not sent: the startup prompt was not confirmed submitted.");
+        expect(result.ok && result.submission?.reasons).toContain(startupProofHeldBackWarning(observation === "unavailable"
+          ? "the input box could not be observed"
+          : "the input box did not clearly show the prompt as submitted"));
       });
     }
     it(`sends the proof line as its own submission after a confirmed ${path} prompt`, async () => {
@@ -523,9 +525,11 @@ describe("startup prompt submission", () => {
     });
     it(`keeps a staged ${path} prompt pending and sends no proof line`, async () => {
       const f = fixture(Infinity, "claude-code", !identity);
-      expect(await f.start({ startupActions: proofActions(identity) })).toMatchObject({ ok: true, startupStatus: "ready", submission: { status: "staged" } });
+      const result = await f.start({ startupActions: proofActions(identity) });
+      expect(result).toMatchObject({ ok: true, startupStatus: "ready", submission: { status: "staged" } });
       expect(f.tmux.sendText).toHaveBeenCalledTimes(1);
       expect(f.submitted).toHaveLength(0);
+      expect(result.ok && result.submission?.reasons).toContain(startupProofHeldBackWarning("the prompt still looked staged in the input box"));
     });
   }
   it("a Codex challenge stays one submission with no proof line", async () => {
@@ -709,4 +713,17 @@ describe("startup prompt submission", () => {
     expect(f.tmux.capturePaneContent).toHaveBeenCalledTimes(1);
   });
 
+});
+
+describe("startupProofHeldBackWarning (#1623)", () => {
+  it("says only the extra line was held back, why, and that the startup prompt itself was sent", () => {
+    const warning = startupProofHeldBackWarning("the prompt still looked staged in the input box");
+    expect(warning).toMatch(/^Startup proof instruction held back: only the extra line/);
+    expect(warning).toContain("nothing is typed over input that may still be in the box");
+    expect(warning).toContain("The startup prompt itself was sent");
+    expect(warning).toMatch(/could not be confirmed: the prompt still looked staged in the input box\.$/);
+  });
+  it("still reads as a held-back line when no specific reason was recorded", () => {
+    expect(startupProofHeldBackWarning(undefined)).toMatch(/could not be confirmed: it was not observed submitted\.$/);
+  });
 });

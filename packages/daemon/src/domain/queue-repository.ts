@@ -6,10 +6,11 @@ import { loadHumanRegistry, resolveRegisteredHumanAddress, type LoadResult } fro
 import { resolveExternal } from "./gateway/external-admission.js";
 import type { PersistedEvent } from "./types.js";
 import { QueueTransitionLog, type OwnerNotificationLevel, type QueueTransition, type RecentQueueTransitionScope } from "./queue-transition-log.js";
-import { WAKE_INTENT_PREFIX, type OutboxHandler } from "./outbox-handler.js";
+import { WAKE_INTENT_PREFIX, type OutboxHandler, type OutboxEntry } from "./outbox-handler.js";
 import { derivePickup, type PickupReceipt } from "./queue-pickup.js";
 import { lastMeaningfulTransition, readWaitingView, type WaitingView, type WaitingActivityReader } from "./queue-waiting.js";
 import { wrapPaneEnvelope } from "../lib/pane-envelope.js";
+import type { InputBoxEvidence } from "./session-transport.js";
 import { renderQueueHandoffNudge } from "./queue-nudge-text.js";
 import { getSelfHostId } from "./hosts/fanout-contract.js";
 import { parseSessionName, isHumanSeatSessionRef } from "./session-name.js";
@@ -216,6 +217,10 @@ export interface QueueItem {
   lastNudgeResult: string | null;
   /** #165: the wake send's result exactly as recorded, never rewritten by a claim. */
   lastNudgeWireResult: string | null;
+  /** #1278: the input-box reading the transport returned for the latest wake attempt
+   *  (transport.verify_input_box). Diagnostic only, never a delivery verdict; null when
+   *  that attempt had no reading. */
+  lastNudgeInputBox: InputBoxEvidence | null;
   lastHeartbeat: string | null;
   resolution: string | null;
   /** PL-007 Workspace Primitive — typed repo scope for the qitem. Validated
@@ -254,6 +259,7 @@ interface QueueItemRow {
   claimed_at: string | null;
   last_nudge_attempt: string | null;
   last_nudge_result: string | null;
+  last_nudge_input_box?: string | null;
   last_heartbeat: string | null;
   resolution: string | null;
   target_repo: string | null;
@@ -271,13 +277,48 @@ interface QueueItemRow {
 export interface QueueNudgeTransport {
   deliveryTarget?(session: string): import("./seat-delivery-guard.js").GuardTarget | null;
   retentionTarget?(session: string): import("./seat-delivery-guard.js").GuardTarget | null;
+  draftAwareTarget?(session: string): import("./seat-delivery-guard.js").GuardTarget | null;
+  configureGuardedWakes?(applicable: (entries: readonly OutboxEntry[]) => boolean): void;
   send(
     sessionName: string,
     // (h): stampISO threads the nudge's compose time so the transport's delivered-latency calc can
     // measure the wait for a handoff nudge too (the real impl is SessionTransport, which accepts it).
     text: string,
-    opts?: { verify?: boolean; stampISO?: string; actorSession?: string; committedOutboxIds?: string[]; deliveryId?: string; auditPointer?: string }
-  ): Promise<{ ok: boolean; verified?: boolean; error?: string; reason?: string; outcome?: string }>;
+    opts?: { verify?: boolean; stampISO?: string; actorSession?: string; committedOutboxIds?: string[]; deliveryId?: string; auditPointer?: string; queueWake?: boolean }
+  ): Promise<{ ok: boolean; verified?: boolean; error?: string; reason?: string; outcome?: string; delivery?: { state: string }; inputBox?: InputBoxEvidence }>;
+}
+
+/** #1278: the result of one wake attempt — its classification, its recorded result, and the
+ *  input-box reading the transport returned for it, when there was one. */
+type WakeAttemptOutcome = {
+  classified: "verified" | "indeterminate" | "failed" | "retained";
+  nudgeResult: string;
+  inputBox?: InputBoxEvidence;
+};
+
+/** #1278: reject incomplete or invalid readings and keep only the four diagnostic fields. */
+function inputBoxReading(inputBox: InputBoxEvidence | undefined): InputBoxEvidence | undefined {
+  if (!inputBox || typeof inputBox !== "object") return undefined;
+  const { seat, before, after, sameProcess } = inputBox;
+  if (!["idle", "not-idle", "unknown", "unchecked"].includes(seat) || typeof sameProcess !== "boolean") return undefined;
+  const readings = ["exact", "ambiguous", "empty", "queued", "hidden", "other", "unrecognized", "unavailable", "unchecked"];
+  if (!readings.includes(before) || !readings.includes(after)) return undefined;
+  return { seat, before, after, sameProcess };
+}
+
+/** #1278: read a stored reading back; an absent or unreadable value reads unknown (null). The
+ *  reading carries its attempt's timestamp (`at`), and reads unknown unless that is still the row's
+ *  latest attempt: an older daemon records an attempt without touching this column, so a reading
+ *  left behind by an earlier attempt must not read as the latest one's. */
+function parseNudgeInputBox(stored: string | null | undefined, lastAttempt: string | null | undefined): InputBoxEvidence | null {
+  if (!stored || !lastAttempt) return null;
+  try {
+    const parsed = JSON.parse(stored) as InputBoxEvidence & { at?: unknown };
+    if (parsed?.at !== lastAttempt) return null;
+    return inputBoxReading(parsed) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export interface QueueCreateInput {
@@ -451,6 +492,11 @@ export interface QueueListOptions {
   activeOnly?: boolean;
 }
 
+/** The message a `--wake-after` park timer carries when its owner gives none. */
+export function defaultParkWakeMessage(qitemId: string): string {
+  return `Wake timer fired for parked qitem ${qitemId}. Resume the recorded continuation and update the row.`;
+}
+
 export class QueueRepositoryError extends Error {
   readonly code: string;
   readonly meta: Record<string, unknown> | undefined;
@@ -534,6 +580,35 @@ export function matchesRecordedHandoffTarget(
   return foreign !== null && foreign[1] === deriveCrossHostSuccessorId(qitemId, handedOffTo, foreign[2]!);
 }
 
+/**
+ * Shared read-only lineage helper for handoff advisory and stuck sweep.
+ * Checks whether a local successor item exists matching target (by qitem_id or destination_session)
+ * linked to sourceQitemId (via handed_off_from or chain_of_record membership).
+ *
+ * Excludes source row itself (s.qitem_id != sourceQitemId). Guards chain_of_record with json_valid.
+ * Throws on database/query errors so callers can handle lookup failures with their own policies.
+ */
+export function hasLinkedSuccessor(
+  db: Database.Database,
+  sourceQitemId: string,
+  target: string,
+): boolean {
+  const successor = db
+    .prepare(
+      `SELECT 1 FROM queue_items s
+        WHERE (s.qitem_id = ? OR s.destination_session = ?) AND s.qitem_id != ?
+          AND (s.handed_off_from = ? OR (
+            s.chain_of_record IS NOT NULL
+            AND json_valid(s.chain_of_record)
+            AND EXISTS (
+              SELECT 1 FROM json_each(s.chain_of_record) WHERE value = ?
+            )
+          )) LIMIT 1`,
+    )
+    .get(target, target, sourceQitemId, sourceQitemId, sourceQitemId);
+  return Boolean(successor);
+}
+
 /** PL-007 — defensive column probe. Older test fixtures bypass the
  *  canonical migration list, so target_repo may be absent. Mirrors
  *  the `hasNodeColumn` pattern in rig-repository.ts. */
@@ -569,6 +644,7 @@ function detectTable(db: Database.Database, tableName: string): boolean {
 // and named in fieldsElided, never backfilled as empty.
 const COMPACT_ELIDED_FIELDS = [
   "body", "evidenceRef", "humanDetail", "waiting", "chainOfRecord", "replyTo", "humanQuestions", "humanAnswers",
+  "lastNudgeInputBox",
 ] as const;
 
 /** A compact listing row: the elided fields are absent, not empty, and `fieldsElided` names them. */
@@ -585,8 +661,17 @@ function compactRow(item: QueueItem): CompactQueueItem {
   return row as unknown as CompactQueueItem;
 }
 
-const COMPACT_QUEUE_COLUMNS =
-  "qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tier, tags, blocked_on, handed_off_to, handed_off_from, expires_at, closure_reason, closure_target, closure_required_at, claimed_at, last_nudge_attempt, last_nudge_result, last_heartbeat, resolution, target_repo";
+const COMPACT_QUEUE_COLUMN_NAMES = [
+  "qitem_id", "ts_created", "ts_updated", "source_session", "destination_session", "state", "priority", "tier", "tags",
+  "blocked_on", "handed_off_to", "handed_off_from", "expires_at", "closure_reason", "closure_target", "closure_required_at",
+  "claimed_at", "last_nudge_attempt", "last_nudge_result", "last_heartbeat", "resolution", "target_repo",
+] as const;
+const COMPACT_QUEUE_COLUMNS = COMPACT_QUEUE_COLUMN_NAMES.join(", ");
+
+/** The row fields a delivery ledger reads. A compact listing selects only COMPACT_QUEUE_COLUMN_NAMES, so each must be
+ *  one of them: dropping one from that list leaves its field off this type, and its read fails to compile. */
+type LedgerRow = Pick<QueueItemRow, Extract<(typeof COMPACT_QUEUE_COLUMN_NAMES)[number],
+  "qitem_id" | "state" | "blocked_on" | "destination_session" | "ts_created" | "last_nudge_result" | "claimed_at">>;
 
 /**
  * Stamp-at-FORWARD only (founder root invariant 2026-08-27, superseding 51-09 incr 4
@@ -759,6 +844,7 @@ export class QueueRepository {
    *     fallback real code rather than a promise in a comment). */
   private outbox: OutboxHandler | undefined;
   private resolveOccupantGeneration?: (sessionName: string) => string | null;
+  private readonly resolveSessionAddresses: (name: string) => string[];
   private readonly wakeRepo: QueueWakeRepository;
   private watchdogJobsRepo: WatchdogJobsRepository | undefined;
   /** PL-007 Workspace Primitive — true when migration 038 has applied the
@@ -772,6 +858,8 @@ export class QueueRepository {
   private readonly hasReplyToColumn: boolean;
   private readonly hasHumanQuestionsColumn: boolean;
   private readonly hasEvidenceRefColumn: boolean;
+  /** #1278 — migration 116; older fixtures without it record no reading. */
+  private readonly hasNudgeInputBoxColumn: boolean;
   private readonly hasMintingGenColumn: boolean;
   private readonly hasClaimedGenColumn: boolean;
   private readonly hasQueueTransitionsTable: boolean;
@@ -816,6 +904,7 @@ export class QueueRepository {
        * is omitted (never forged).
        */
       resolveOccupantGeneration?: (sessionName: string) => string | null;
+      resolveSessionAddresses?: (name: string) => string[];
       loadHumanRegistry?: () => LoadResult;
     }
   ) {
@@ -825,9 +914,10 @@ export class QueueRepository {
     this.wakeRepo = new QueueWakeRepository(db);
     this.validateRig = opts?.validateRig ?? (() => true);
     this.destinationAdvisory = opts?.destinationAdvisory ?? (() => null);
-    this.transport = opts?.transport;
+    if (opts?.transport) this.attachTransport(opts.transport);
     this.workflowFrontierPredicate = opts?.workflowFrontierPredicate;
     this.resolveOccupantGeneration = opts?.resolveOccupantGeneration;
+    this.resolveSessionAddresses = opts?.resolveSessionAddresses ?? ((name) => [name]);
     this.loadHumanRegistryFn = opts?.loadHumanRegistry ?? (() => loadHumanRegistry());
     this.hasTargetRepoColumn = detectQueueColumn(db, "target_repo");
     this.hasSummaryColumn = detectQueueColumn(db, "summary");
@@ -835,6 +925,7 @@ export class QueueRepository {
     this.hasReplyToColumn = detectQueueColumn(db, "reply_to");
     this.hasHumanQuestionsColumn = detectQueueColumn(db, "human_questions");
     this.hasEvidenceRefColumn = detectQueueColumn(db, "evidence_ref");
+    this.hasNudgeInputBoxColumn = detectQueueColumn(db, "last_nudge_input_box");
     this.hasQueueTransitionsTable = detectTable(db, "queue_transitions");
     const transitionColumns = this.hasQueueTransitionsTable
       ? new Set((db.prepare("PRAGMA table_info(queue_transitions)").all() as Array<{ name: string }>).map((column) => column.name))
@@ -895,6 +986,39 @@ export class QueueRepository {
    */
   attachTransport(transport: QueueNudgeTransport): void {
     this.transport = transport;
+    transport.configureGuardedWakes?.(entries => entries.every(entry => {
+      const row = entry.auditPointer ? this.getById(entry.auditPointer) : null;
+      if (!row || row.destinationSession !== entry.destinationSession) return false;
+      return entry.outboxId.startsWith(WAKE_INTENT_PREFIX) ? this.currentWakeIntent(entry) : isBlockerLive(row.state);
+    }));
+  }
+
+  private currentWakeIntent(entry: OutboxEntry): boolean {
+    const row = entry.auditPointer ? this.db.prepare("SELECT state FROM queue_items WHERE qitem_id=?").get(entry.auditPointer) as { state: string } | undefined : undefined;
+    if (row?.state !== "pending") return false;
+    const prefix = `${WAKE_INTENT_PREFIX}blocker-`;
+    if (!entry.outboxId.startsWith(prefix)) return true;
+    const expected = Number(entry.outboxId.slice(prefix.length));
+    const latest = this.db.prepare(`SELECT transition_id FROM (
+      SELECT transition_id, state, LAG(state) OVER (ORDER BY transition_id) AS previous_state
+      FROM queue_transitions WHERE qitem_id=?)
+      WHERE state='pending' AND previous_state IS NOT 'pending' ORDER BY transition_id DESC LIMIT 1`)
+      .get(entry.auditPointer) as { transition_id: number } | undefined;
+    return expected === latest?.transition_id;
+  }
+
+  private classifyWakeResult(res: Awaited<ReturnType<QueueNudgeTransport["send"]>>): WakeAttemptOutcome {
+    // #1278: the reading rides along unchanged; it never alters the classification.
+    const inputBox = inputBoxReading(res.inputBox);
+    const reading = inputBox ? { inputBox } : {};
+    if (res.outcome === "retained") return { classified: "retained", nudgeResult: res.reason?.startsWith("draft_")
+      ? "retained:draft_aware" : "retained:typing_guard", ...reading };
+    if (res.ok) return res.verified ? { classified: "verified", nudgeResult: "verified", ...reading } : { classified: "indeterminate", nudgeResult: "delivered-ack-pending", ...reading };
+    const detail = res.error ?? res.reason ?? "unknown";
+    if (res.delivery?.state === "indeterminate" || res.delivery?.state === "sending" || isWakeTimeoutSignal(res.reason) || isWakeTimeoutSignal(res.error)) {
+      return { classified: "indeterminate", nudgeResult: `indeterminate:${detail}`, ...reading };
+    }
+    return { classified: "failed", nudgeResult: `failed:${detail}`, ...reading };
   }
 
   /**
@@ -1018,6 +1142,10 @@ export class QueueRepository {
     const target = this.transport?.retentionTarget?.(input.toSession);
     if (target) this.outbox.retain(record, target);
     else {
+      // Draft-aware wakes remain pending until the transport owns their bounded
+      // retry. Manual retention is deliberately never drained.
+      const draftTarget = this.transport?.draftAwareTarget?.(input.toSession);
+      if (draftTarget) this.outbox.assertRetentionCapacity(draftTarget.nodeId, frozenEnvelope);
       this.outbox.record(record);
       const binding = this.transport?.deliveryTarget?.(input.toSession);
       if (binding) this.db.prepare("UPDATE outbox_entries SET guard_binding=? WHERE outbox_id=? AND guard_binding IS NULL")
@@ -1125,18 +1253,7 @@ export class QueueRepository {
     // original frozen intent and audit pointer survives; only transport coalesces.
     let superseded = false;
     const actionable = (entry: import("./outbox-handler.js").OutboxEntry): boolean => {
-      const row = entry.auditPointer ? this.db.prepare("SELECT state FROM queue_items WHERE qitem_id = ?").get(entry.auditPointer) as { state: string } | undefined : undefined;
-      let current = row?.state === "pending";
-      const resumePrefix = `${WAKE_INTENT_PREFIX}blocker-`;
-      if (current && entry.outboxId.startsWith(resumePrefix)) {
-        const expected = Number(entry.outboxId.slice(resumePrefix.length));
-        const latest = this.db.prepare(`SELECT transition_id FROM (
-          SELECT transition_id, state, LAG(state) OVER (ORDER BY transition_id) AS previous_state
-          FROM queue_transitions WHERE qitem_id = ?)
-          WHERE state = 'pending' AND previous_state IS NOT 'pending' ORDER BY transition_id DESC LIMIT 1`)
-          .get(entry.auditPointer) as { transition_id: number } | undefined;
-        current = expected === latest?.transition_id;
-      }
+      const current = this.currentWakeIntent(entry);
       if (!current) {
         // Existing failed state means the requested old delivery was refused;
         // the explicit tag distinguishes supersession from a transport attempt.
@@ -1188,7 +1305,8 @@ export class QueueRepository {
             ?.slice(AUTO_UNPARK_BLOCKER_TAG_PREFIX.length)
         : undefined;
       const wakeEvent = this.db.transaction(() => {
-        this.recordNudgeAttempt(qitemId, outcome.nudgeResult);
+        // #1278: a coalesced wake is one send, so every row it woke gets that send's reading.
+        this.recordNudgeAttempt(qitemId, outcome.nudgeResult, outcome.inputBox);
         this.outbox!.finalizeDelivery(intent.outboxId, finalState);
         if (!blockerRef) return null;
 
@@ -1349,7 +1467,18 @@ export class QueueRepository {
     if (nudgeOpt === false) return;
     if (!this.transport) return;
     const outcome = await this.performWakeSend(qitemId, destinationSession, sourceSession, bodyOverride);
-    this.recordNudgeAttempt(qitemId, outcome.nudgeResult);
+    this.recordNudgeAttempt(qitemId, outcome.nudgeResult, outcome.inputBox);
+  }
+
+  /** Boot recovery must respect an existing intent's claim and terminal outcome.
+   * Older entry packets have no intent and still need the legacy nudge path. */
+  async recoverLostNudge(qitemId: string, destinationSession: string, sourceSession?: string): Promise<void> {
+    const outboxId = `${WAKE_INTENT_PREFIX}${qitemId}`;
+    if (this.outbox?.getById(outboxId)) {
+      await this.deliverWakeIntent(outboxId);
+      return;
+    }
+    await this.maybeNudge(qitemId, destinationSession, undefined, sourceSession);
   }
 
   /**
@@ -1372,7 +1501,7 @@ export class QueueRepository {
     bodyOverride?: string,
     prebuiltText?: string,
     committedOutboxIds?: string[],
-  ): Promise<{ classified: "verified" | "indeterminate" | "failed" | "retained"; nudgeResult: string }> {
+  ): Promise<WakeAttemptOutcome> {
     // DEFECT FIX qitem-20260827065907-b9ae334c (S1-class, 3 live specimens): a virtual
     // @external destination has NO pane — the queue row ITSELF is the gateway
     // subsystem's input (the Slack connector polls human-destined rows and its own
@@ -1426,12 +1555,12 @@ export class QueueRepository {
     }
     const deliveryId = `guard-nudge-${qitemId}-${createHash("sha256").update(JSON.stringify([sourceSession, destinationSession, bodyOverride ?? null])).digest("hex")}`;
     const held = !committedOutboxIds ? this.outbox?.getById(deliveryId) : null;
-    if (held?.deliveryState === "retained" || held?.deliveryState === "retired") {
+    if (held?.guardBinding) {
       // Same logical nudge reuses its original frozen envelope, not a new timestamp.
       text = held.body;
     }
     try {
-      const res = await this.transport!.send(destinationSession, text, { verify: true, stampISO, actorSession: sourceSession, committedOutboxIds, deliveryId: committedOutboxIds ? undefined : deliveryId, auditPointer: qitemId });
+      const res = await this.transport!.send(destinationSession, text, { verify: true, stampISO, actorSession: sourceSession, committedOutboxIds, deliveryId: committedOutboxIds ? undefined : deliveryId, auditPointer: qitemId, queueWake: true });
       // OPR.0.3.2.21.FR-4(c) — wording rename: the prior literal
       // "sent-unverified" read as a failure even in the common case
       // (delivery confirmed but the synchronous ack window expired,
@@ -1439,21 +1568,11 @@ export class QueueRepository {
       // "delivered-ack-pending" reads as healthy. The old "verified"
       // case is unchanged for backward-compat with any tooling that
       // already consumed the positive literal.
-      if (res.outcome === "retained") return { classified: "retained", nudgeResult: "retained:typing_guard" };
-      if (res.ok) {
-        return res.verified
-          ? { classified: "verified", nudgeResult: "verified" }
-          : { classified: "indeterminate", nudgeResult: "delivered-ack-pending" };
-      }
       // MF6: a TIMEOUT is ambiguous — the send may have landed but the ack window
       // expired — so it records `indeterminate` (never silently delivered, never a
       // hard `failed`). A definite non-timeout failure (unreachable, unknown
       // session) stays `failed`.
-      const detail = res.error ?? res.reason ?? "unknown";
-      if (isWakeTimeoutSignal(res.reason) || isWakeTimeoutSignal(res.error)) {
-        return { classified: "indeterminate", nudgeResult: `indeterminate:${detail}` };
-      }
-      return { classified: "failed", nudgeResult: `failed:${detail}` };
+      return this.classifyWakeResult(res);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // A thrown timeout is equally ambiguous (see above).
@@ -2210,27 +2329,29 @@ export class QueueRepository {
     asDestination: { pending: number; inProgress: number; blocked: number; recent: QueueItem[] };
     asSource: { total: number };
   } {
+    const addresses = this.resolveSessionAddresses(session);
+    const slots = addresses.map(() => "?").join(",");
     const limit = Math.max(1, Math.min(opts?.recentLimit ?? 25, 200));
     const countByState = (state: string): number => {
       const row = this.db
         .prepare(
-          `SELECT COUNT(*) AS n FROM queue_items WHERE destination_session = ? AND state = ?`
+          `SELECT COUNT(*) AS n FROM queue_items WHERE destination_session IN (${slots}) AND state = ?`
         )
-        .get(session, state) as { n: number };
+        .get(...addresses, state) as { n: number };
       return row.n;
     };
     const recent = this.db
       .prepare(
         `SELECT * FROM queue_items
-          WHERE destination_session = ?
+          WHERE destination_session IN (${slots})
             AND state IN ('pending','in-progress','blocked')
           ORDER BY ts_updated DESC
           LIMIT ?`
       )
-      .all(session, limit) as QueueItemRow[];
+      .all(...addresses, limit) as QueueItemRow[];
     const sourceTotalRow = this.db
-      .prepare(`SELECT COUNT(*) AS n FROM queue_items WHERE source_session = ?`)
-      .get(session) as { n: number };
+      .prepare(`SELECT COUNT(*) AS n FROM queue_items WHERE source_session IN (${slots})`)
+      .get(...addresses) as { n: number };
     return {
       session,
       asDestination: {
@@ -2253,11 +2374,13 @@ export class QueueRepository {
    * silently degrades into a confident answer. This is that authoritative input.
    */
   listInProgressForDestination(session: string): QueueItem[] {
+    const addresses = this.resolveSessionAddresses(session);
+    const slots = addresses.map(() => "?").join(",");
     const rows = this.db
       .prepare(
-        `SELECT * FROM queue_items WHERE destination_session = ? AND state = 'in-progress'`
+        `SELECT * FROM queue_items WHERE destination_session IN (${slots}) AND state = 'in-progress'`
       )
-      .all(session) as QueueItemRow[];
+      .all(...addresses) as QueueItemRow[];
     return rows.map((r) => this.rowToItem(r));
   }
 
@@ -2272,7 +2395,7 @@ export class QueueRepository {
         `qitem ${input.qitemId} not found`
       );
     }
-    if (qitem.destinationSession !== input.destinationSession) {
+    if (!this.resolveSessionAddresses(input.destinationSession).includes(qitem.destinationSession)) {
       throw new QueueRepositoryError(
         "claim_destination_mismatch",
         `qitem ${input.qitemId} destination is ${qitem.destinationSession}, not ${input.destinationSession}`
@@ -2446,6 +2569,11 @@ export class QueueRepository {
   } {
     const result = this.updateInTransactionalContext(input);
     return { qitemId: input.qitemId, ...result };
+  }
+
+  /** Notify subscribers of events persisted inside a caller's own transaction (updateWithinTransaction), after it commits. */
+  notifyCommitted(events: readonly PersistedEvent[]): void {
+    for (const event of events) this.eventBus.notifySubscribers(event);
   }
 
   /** Internal read-only audit pointer for non-state receipts. Never search past a state write. */
@@ -2820,7 +2948,7 @@ export class QueueRepository {
           "policy: periodic-reminder",
           "target:",
           `  session: ${JSON.stringify(qitem.destinationSession)}`,
-          `message: ${JSON.stringify(input.wakeMessage ?? `Wake timer fired for parked qitem ${qitem.qitemId}. Resume the recorded continuation and update the row.`)}`,
+          `message: ${JSON.stringify(input.wakeMessage ?? defaultParkWakeMessage(qitem.qitemId))}`,
           "",
         ].join("\n"),
         targetSession: qitem.destinationSession,
@@ -3104,6 +3232,11 @@ export class QueueRepository {
     return this.wakeRepo.getStatus(qitemId);
   }
 
+  /** For parked diagnosis only (see QueueWakeRepository.servedByOwnRepeatingReminder). */
+  parkWakeServedByOwnReminder(qitemId: string): boolean {
+    return this.wakeRepo.servedByOwnRepeatingReminder(qitemId);
+  }
+
   /** Park timers a seat swap keeps: each is still its blocked row's current wake and still targets the
    *  row's owner (see QueueWakeRepository.currentParkTimerIds). */
   currentParkTimerIds(): string[] {
@@ -3147,6 +3280,23 @@ export class QueueRepository {
    * queue-domain door. */
   listRecentTransitions(scope: RecentQueueTransitionScope | string, limit = 20): ReturnType<QueueTransitionLog["listRecent"]> {
     return this.transitionLog.listRecent(typeof scope === "string" ? { kind: "rig", rig: scope } : scope, limit);
+  }
+
+  /** The parked row an ordinary due park timer reminds about, when its reminder may share one message with other
+   *  reminders due for the same seat in the same scheduler pass: a one-shot `--wake-after` timer serving exactly one
+   *  live parked row, carrying its default message. Null keeps the reminder's own send: a custom message, a shared
+   *  or attached watchdog, a repeating wait and a provider-limit timer each deliver as before. The entry carries the
+   *  current park's recorded continuation, or null, for the wake's preview. */
+  parkReminderDigestEntry(jobId: string, message: string): { qitemId: string; summary: string | null; continuation: string | null } | null {
+    const generated = this.wakeRepo.findCurrentQitemsByGeneratedTimer(jobId);
+    const bound = this.wakeRepo.findBlockedQitemsByWatchdog(jobId, true);
+    if (generated.length !== 1 || bound.length !== 1 || bound[0]!.qitemId !== generated[0]!.qitemId) return null;
+    const row = this.getById(generated[0]!.qitemId);
+    if (!row || row.state !== "blocked" || row.tags?.includes(USAGE_LIMIT_BLOCKER_TAG)) return null;
+    const job = (this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db)).getById(jobId);
+    if (!job || job.policy !== "periodic-reminder" || isQueueWait(job.specYaml)) return null;
+    if (message !== defaultParkWakeMessage(row.qitemId)) return null;
+    return { qitemId: row.qitemId, summary: row.summary ?? null, continuation: this.currentParkContinuation(row.qitemId) };
   }
 
   /** Called by the watchdog engine after the delivery attempt is durably
@@ -3343,19 +3493,38 @@ export class QueueRepository {
 
   /** #96 — whether some update recorded this Slack root as the thread it posts into. Such a
    *  root is shared: its owner's next decision must not reuse it (see slack-subsystem). */
-  isReplyToThread(threadTs: string): boolean {
+  isReplyToThread(threadTs: string, where?: { channel: string }): boolean {
     if (!this.hasQueueTransitionsTable) return false;
     // Same trust rule as replyToChoiceFor: a pre-provenance schema reads every row as null.
     const provenance = this.hasTransitionProvenanceColumn ? " AND identity_provenance IS NULL" : "";
+    const note = formatReplyToChoice({ kind: "thread", threadTs });
+    // A root is its channel's: with `where`, only a choice naming that channel counts. One naming no
+    // channel is judged by the caller from the rows that made it (unnamedReplyToChoiceRows).
+    if (where) {
+      return this.db.prepare(
+        `SELECT 1 FROM queue_transitions WHERE transition_note = ? AND actor_session = ?${provenance} LIMIT 1`,
+      ).get(`${note} channel=${where.channel}`, REPLY_TO_CHOICE_ACTOR) !== undefined;
+    }
     // #192: with a channel map the note carries a ` channel=<id>` suffix. Match the exact note, or
     // the exact note followed by that suffix; a prefix compare, not LIKE (the note itself contains
     // `_`), and the trailing space keeps thread 1.1 from matching 1.10.
-    const note = formatReplyToChoice({ kind: "thread", threadTs });
     const withChannel = `${note} channel=`;
     return this.db.prepare(
       `SELECT 1 FROM queue_transitions
         WHERE (transition_note = ? OR substr(transition_note, 1, ?) = ?) AND actor_session = ?${provenance} LIMIT 1`,
     ).get(note, withChannel.length, withChannel, REPLY_TO_CHOICE_ACTOR) !== undefined;
+  }
+
+  /** #96 — the rows whose recorded choice threads into this ts without naming a channel. Such a choice
+   *  was made for the default channel of its day, which may have changed since, so the note alone
+   *  can't say which root it took; the caller checks where each row's post landed (its recorded parts). */
+  unnamedReplyToChoiceRows(threadTs: string): string[] {
+    if (!this.hasQueueTransitionsTable) return [];
+    const provenance = this.hasTransitionProvenanceColumn ? " AND identity_provenance IS NULL" : "";
+    const rows = this.db.prepare(
+      `SELECT DISTINCT qitem_id FROM queue_transitions WHERE transition_note = ? AND actor_session = ?${provenance}`,
+    ).all(formatReplyToChoice({ kind: "thread", threadTs }), REPLY_TO_CHOICE_ACTOR) as Array<{ qitem_id: string }>;
+    return rows.map((r) => r.qitem_id);
   }
 
   private replyToFallbackFor(qitemId: string): string | null {
@@ -3366,11 +3535,13 @@ export class QueueRepository {
   /** The parked query's obligation face: open rows to one destination, newest first, without the per-row
    *  projections list() derives (pickup, waiting view, delivery ledger), which this read never uses. */
   listOpenObligations(destinationSession: string, limit: number): Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked"; summary: string | null }> {
+    const addresses = this.resolveSessionAddresses(destinationSession);
+    const slots = addresses.map(() => "?").join(",");
     const rows = this.db.prepare(
       `SELECT qitem_id, state${this.hasSummaryColumn ? ", summary" : ""} FROM queue_items
-        WHERE destination_session = ? AND state IN ('pending', 'in-progress', 'blocked')
+        WHERE destination_session IN (${slots}) AND state IN ('pending', 'in-progress', 'blocked')
         ORDER BY ts_created DESC LIMIT ?`,
-    ).all(destinationSession, limit) as Array<{ qitem_id: string; state: "pending" | "in-progress" | "blocked"; summary?: string | null }>;
+    ).all(...addresses, limit) as Array<{ qitem_id: string; state: "pending" | "in-progress" | "blocked"; summary?: string | null }>;
     return rows.map((r) => ({ qitemId: r.qitem_id, state: r.state, summary: r.summary ?? null }));
   }
 
@@ -3392,19 +3563,23 @@ export class QueueRepository {
       params.push(`%@${escaped}`, `%@${escaped}`);
     }
     if (opts?.asSession) {
-      conditions.push("(destination_session = ? OR source_session = ?)");
-      params.push(opts.asSession, opts.asSession);
+      const addresses = this.resolveSessionAddresses(opts.asSession);
+      const slots = addresses.map(() => "?").join(",");
+      conditions.push(`(destination_session IN (${slots}) OR source_session IN (${slots}))`);
+      params.push(...addresses, ...addresses);
     }
     if (opts?.activeOnly && !opts?.state) {
       conditions.push("state IN ('pending', 'in-progress', 'blocked')");
     }
     if (opts?.destinationSession) {
-      conditions.push("destination_session = ?");
-      params.push(opts.destinationSession);
+      const addresses = this.resolveSessionAddresses(opts.destinationSession);
+      conditions.push(`destination_session IN (${addresses.map(() => "?").join(",")})`);
+      params.push(...addresses);
     }
     if (opts?.sourceSession) {
-      conditions.push("source_session = ?");
-      params.push(opts.sourceSession);
+      const addresses = this.resolveSessionAddresses(opts.sourceSession);
+      conditions.push(`source_session IN (${addresses.map(() => "?").join(",")})`);
+      params.push(...addresses);
     }
     if (opts?.state) {
       const states = Array.isArray(opts.state) ? opts.state : [opts.state];
@@ -3430,9 +3605,11 @@ export class QueueRepository {
         `SELECT ${columns} FROM queue_items ${where} ORDER BY ${orderBy} LIMIT ?`
       )
       .all(...params) as QueueItemRow[];
+    const owners = this.transitionLog.ownerNotificationsForQitems(rows.map((row) => row.qitem_id));
+    const ledgers = this.deliveryOutcomesFor(rows, owners);
     const items = rows.map((r) => {
-      const item = this.rowToItem(r, !opts?.compact);
-      const ledger = this.deliveryOutcomeFor(item.qitemId);
+      const ledger = ledgers.get(r.qitem_id);
+      const item = this.rowToItem(r, !opts?.compact, { owners: owners.get(r.qitem_id) ?? [], ledger: ledger ?? null });
       return {
         ...item,
         deliveryOutcome: ledger?.outcome ?? null,
@@ -3488,6 +3665,21 @@ export class QueueRepository {
     return rows.map((row) => ({ ...this.rowToItem(row), deliveredAt: row.delivered_at, deliveryReceipt: row.delivery_receipt }));
   }
 
+  /** Current explicit human FYIs; delivery receipts are not required for local visibility.
+   * Filter before the bounded window so agent and malformed destinations cannot hide updates. */
+  listOpenHumanUpdates(opts: { limit?: number } = {}): QueueItem[] {
+    if (!this.hasHumanIntentColumn) return [];
+    const limit = Number.isFinite(opts.limit) ? Math.max(1, Math.min(1001, Math.floor(opts.limit!))) : 100;
+    const rows = this.db.prepare(`
+      SELECT * FROM queue_items
+      WHERE state IN ('pending', 'in-progress', 'blocked')
+        AND human_intent = 'update'
+        AND is_human_seat_session(destination_session) = 1
+      ORDER BY CASE priority WHEN 'critical' THEN 2 WHEN 'urgent' THEN 1 ELSE 0 END DESC, ts_created DESC, qitem_id DESC LIMIT ?
+    `).all(limit) as QueueItemRow[];
+    return rows.map(row => this.rowToItem(row));
+  }
+
   listAttention(opts?: {
     limit?: number;
     state?: QueueState | QueueState[];
@@ -3527,12 +3719,14 @@ export class QueueRepository {
     if (this.hasHumanIntentColumn) conditions.push("COALESCE(human_intent, 'decision') <> 'update'");
     const params: unknown[] = [...states];
     if (opts?.destinationSession) {
-      conditions.push("destination_session = ?");
-      params.push(opts.destinationSession);
+      const addresses = this.resolveSessionAddresses(opts.destinationSession);
+      conditions.push(`destination_session IN (${addresses.map(() => "?").join(",")})`);
+      params.push(...addresses);
     }
     if (opts?.sourceSession) {
-      conditions.push("source_session = ?");
-      params.push(opts.sourceSession);
+      const addresses = this.resolveSessionAddresses(opts.sourceSession);
+      conditions.push(`source_session IN (${addresses.map(() => "?").join(",")})`);
+      params.push(...addresses);
     }
     if (opts?.targetRepo && this.hasTargetRepoColumn) {
       conditions.push("target_repo = ?");
@@ -3714,6 +3908,27 @@ export class QueueRepository {
     return opts?.compact ? out.map(compactRow) : out;
   }
 
+  /** Read the same address-admission predicate used by queue writes before choosing
+   *  a recovery owner. Admission does not require a live seat or terminal binding. */
+  acceptsDestination(destinationSession: string): boolean {
+    return this.validateRig(destinationSession);
+  }
+
+  /** Human ownership includes reserved references and registered aliases, even when
+   *  an alias has a terminal binding. Transport capability does not determine identity.
+   *  A canonical identity is unknown when the registry cannot be read: throw instead
+   *  of returning an agent classification that a caller could persist as a route. */
+  isHumanDestination(destinationSession: string): boolean {
+    if (isHumanSeatSessionRef(destinationSession)) return true;
+    if (parseSessionName(destinationSession).kind !== "canonical") return false;
+    const registry = this.loadHumanRegistryFn();
+    if (!registry.ok) {
+      throw new QueueRepositoryError("human_registry_unavailable",
+        `Cannot classify '${destinationSession}' as human or agent: human registry unavailable (${registry.error}).`);
+    }
+    return resolveRegisteredHumanAddress(destinationSession, registry.entities) !== null;
+  }
+
   /** OPR.0.5.6.14 — the one destination-classification seam, as the wake path consults it.
    *  Public for the single-row read route; getById itself stays free of topology reads. */
   classifyDestinationOf(destinationSession: string): DestinationClass {
@@ -3761,9 +3976,14 @@ export class QueueRepository {
   }
 
   /** Null means legacy/no OWNER history; inactive means OWNER history exists
-   *  but the row no longer projects a current human-notification episode. */
-  private currentDeliveryEpisode(item: QueueItem, knownOwner?: QueueTransition): { notificationKey: string; startedAt: string } | "inactive" | null {
-    let transition = knownOwner ?? this.transitionLog.latestOwnerNotificationForQitem(item.qitemId);
+   *  but the row no longer projects a current human-notification episode.
+   *  owners: the row's owner notifications, newest first. */
+  private currentDeliveryEpisode(
+    item: LedgerItem,
+    owners: QueueTransition[],
+    loadRegistry: () => LoadResult,
+  ): { notificationKey: string; startedAt: string } | "inactive" | null {
+    let transition = owners[0];
     if (!transition) return null;
     // A human-decision-resolved notice written BY the transition that closed the row (a human's direct reply closing
     // it) is never posted: the Slack outbound lists active rows only (listHumanAlerts), and that human just answered.
@@ -3772,14 +3992,12 @@ export class QueueRepository {
     // stayed active is a real delivery and keeps its outcome after an agent later closes the row.
     let resolvedBy: string | null = null;
     if (transition.ownerNotificationKind === "human-decision-resolved" && !["pending", "in-progress", "blocked"].includes(transition.state)) {
-      const outbound = this.transitionLog.listForQitem(item.qitemId)
-        .filter((t) => t.ownerNotificationLevel != null && t.ownerNotificationKind != null && t.ownerNotificationKind !== "human-decision-resolved")
-        .sort((a, b) => b.transitionId - a.transitionId)[0];
+      const outbound = owners.find(isOutboundOwnerNotice);
       if (!outbound) return "inactive";
       resolvedBy = transition.actorSession;
       transition = outbound;
     }
-    const registry = this.loadHumanRegistryFn();
+    const registry = loadRegistry();
     if (!registry.ok) return "inactive";
     // After that fallback the recipient is the human who answered: the row may be an agent's that was parked on them
     // (its destination is the agent, and closing cleared blocked_on).
@@ -3808,12 +4026,13 @@ export class QueueRepository {
    *  to a registered human, aliases included) has a POSTED receipt. Legacy rows with no OWNER
    *  history, inactive episodes, never-posted and transport-failed all read false. Same derivation
    *  as deliveryOutcomeFor; it reads row fields, never the waiting view. */
-  humanNotificationPostedThisEpisode(qitemId: string): boolean {
+  humanNotificationPostedThisEpisode(qitemId: string, listed?: ListedLedger): boolean {
     if (!this.hasQueueTransitionsTable) return false;
     // Only the ask's own notification binds a recipient: create writes it in state pending, to the destination of
     // that moment. A park notice (its recipient is not retained), a resolution notice, or a later destination change
     // (routeToFallback opens no new episode) cannot establish that the current destination received this ask.
-    const owner = this.transitionLog.latestOwnerNotificationForQitem(qitemId);
+    const owners = listed?.owners ?? this.transitionLog.ownerNotificationsForQitems([qitemId]).get(qitemId) ?? [];
+    const owner = owners[0];
     if (!owner || owner.state !== "pending") return false;
     if (owner.ownerNotificationKind !== "human-required" && owner.ownerNotificationKind !== "human-update") return false;
     const rerouted = this.db.prepare(
@@ -3821,11 +4040,12 @@ export class QueueRepository {
     ).get(qitemId, owner.transitionId);
     if (rerouted) return false;
     // The ledger's episode exists only when the destination resolves to a registered human (aliases included).
-    const ledger = this.deliveryLedger(qitemId, owner);
+    const ledger = listed ? listed.ledger : this.deliveryLedger(qitemId, owners);
     return ledger !== null && ledger.outcome === "posted" && ledger.episode?.notificationKey === `${qitemId}:${owner.transitionId}`;
   }
 
-  private deliveryLedger(qitemId: string, knownOwner?: QueueTransition): { outcome: "posted" | "transport-failed" | "never-posted"; detail: string; episode: { notificationKey: string; startedAt: string } | null } | null {
+  /** owners: the row's owner notifications as ownerNotificationsForQitems gives them, when the caller read them. */
+  private deliveryLedger(qitemId: string, owners?: QueueTransition[]): DeliveryLedger | null {
     // Some repository-only fixtures intentionally model the pre-transition
     // schema. Delivery projection is additive there: absence means no verdict,
     // never a list failure.
@@ -3833,25 +4053,64 @@ export class QueueRepository {
     const row = this.db.prepare("SELECT * FROM queue_items WHERE qitem_id = ?")
       .get(qitemId) as QueueItemRow | undefined;
     if (!row) return null;
-    // The delivery episode uses row fields, not the waiting/backstop view.
-    // Keep this read fresh without repeating the caller's recovery-tag scan.
-    const item = this.rowToItem(row, false);
-    const episodeState = this.currentDeliveryEpisode(item, knownOwner);
-    if (episodeState === "inactive") return null;
-    const episode = episodeState;
-    const notes = this.db.prepare(
-      `SELECT transition_note FROM queue_transitions
-        WHERE qitem_id = ? AND (transition_note LIKE 'slack-owner-notification-posted %'
+    // The delivery episode uses row fields, not the waiting/backstop view. Its receipts are read after it, as they
+    // always were for a single row: a receipt committed while the human registry loads is then seen.
+    return this.deliveryOutcomesFor([row], owners && new Map([[qitemId, owners]]), true).get(qitemId) ?? null;
+  }
+
+  private receiptNotesStatement?: Database.Statement;
+
+  /** The delivery ledger of each row, its reads batched: one read of the rows' owner notifications (unless the caller
+   *  read them already), one of their receipts, the human registry loaded once at most. A single row's
+   *  (deliveryOutcomeFor, show, the sweeps) is a batch of one. receiptsAfterEpisodes: read the receipts once the
+   *  episodes (and so the registry) are worked out, as a single row's ledger does; a listing reads them before. */
+  private deliveryOutcomesFor(rows: LedgerRow[], knownOwners?: Map<string, QueueTransition[]>, receiptsAfterEpisodes = false): Map<string, DeliveryLedger> {
+    const ledgers = new Map<string, DeliveryLedger>();
+    if (!this.hasQueueTransitionsTable || rows.length === 0) return ledgers;
+    const qitemIds = rows.map((row) => row.qitem_id);
+    const owners = knownOwners ?? this.transitionLog.ownerNotificationsForQitems(qitemIds);
+    let notes = receiptsAfterEpisodes ? undefined : this.receiptNotesFor(qitemIds);
+    let registry: LoadResult | undefined;
+    const loadRegistry = () => (registry ??= this.loadHumanRegistryFn());
+    const episodes = rows.map((row) => {
+      const item = ledgerItem(row);
+      return { item, episode: this.currentDeliveryEpisode(item, owners.get(row.qitem_id) ?? [], loadRegistry) };
+    });
+    notes ??= this.receiptNotesFor(qitemIds);
+    for (const { item, episode } of episodes) {
+      if (episode === "inactive") continue;
+      const ledger = this.ledgerOf(item, episode, notes.get(item.qitemId) ?? []);
+      if (ledger) ledgers.set(item.qitemId, ledger);
+    }
+    return ledgers;
+  }
+
+  /** The delivery receipt notes of these qitems, newest first, by qitem. */
+  private receiptNotesFor(qitemIds: string[]): Map<string, string[]> {
+    this.receiptNotesStatement ??= this.db.prepare(
+      `SELECT qitem_id, transition_note FROM queue_transitions
+        WHERE qitem_id IN (SELECT value FROM json_each(?)) AND (transition_note LIKE 'slack-owner-notification-posted %'
                              OR transition_note LIKE 'slack-owner-notification-transport-failed %')
         ORDER BY transition_id DESC`,
-    ).all(qitemId) as Array<{ transition_note: string }>;
+    );
+    const notes = new Map<string, string[]>();
+    for (const row of this.receiptNotesStatement.all(JSON.stringify(qitemIds)) as Array<{ qitem_id: string; transition_note: string }>) {
+      const own = notes.get(row.qitem_id);
+      if (own) own.push(row.transition_note);
+      else notes.set(row.qitem_id, [row.transition_note]);
+    }
+    return notes;
+  }
+
+  /** The ledger of one row's current episode, from its receipt notes (newest first). */
+  private ledgerOf(item: LedgerItem, episode: { notificationKey: string; startedAt: string } | null, notes: string[]): DeliveryLedger | null {
     const currentNotes = episode
-      ? notes.filter((note) => note.transition_note.split(/\s+/).includes(`notification_key=${episode.notificationKey}`))
+      ? notes.filter((note) => note.split(/\s+/).includes(`notification_key=${episode.notificationKey}`))
       : notes;
-    const posted = currentNotes.find((note) => note.transition_note.startsWith("slack-owner-notification-posted "));
-    if (posted) return { outcome: "posted", detail: posted.transition_note, episode };
-    const failed = currentNotes.find((note) => note.transition_note.startsWith("slack-owner-notification-transport-failed "));
-    if (failed) return { outcome: "transport-failed", detail: failed.transition_note, episode };
+    const posted = currentNotes.find((note) => note.startsWith("slack-owner-notification-posted "));
+    if (posted) return { outcome: "posted", detail: posted, episode };
+    const failed = currentNotes.find((note) => note.startsWith("slack-owner-notification-transport-failed "));
+    if (failed) return { outcome: "transport-failed", detail: failed, episode };
     const startedAt = episode?.startedAt ?? item.tsCreated;
     const gatewayRouted = episode !== null || item.lastNudgeResult?.startsWith("gateway-owned") === true;
     if (gatewayRouted) {
@@ -3868,8 +4127,24 @@ export class QueueRepository {
    *  never-posted (the connector sweep cadence bounds normal posting latency). */
   static readonly NEVER_POSTED_WINDOW_MS = 120_000;
 
-  recordNudgeAttempt(qitemId: string, result: string): void {
+  /**
+   * Record one wake attempt. #1278: `inputBox` is that attempt's input-box reading, when the
+   * transport returned one. It is written with the attempt every time, so an attempt without a
+   * reading clears an earlier attempt's reading rather than leaving it to read as current.
+   */
+  recordNudgeAttempt(qitemId: string, result: string, inputBox?: InputBoxEvidence): void {
     const ts = new Date().toISOString();
+    if (this.hasNudgeInputBoxColumn) {
+      const reading = inputBoxReading(inputBox);
+      this.db
+        .prepare(
+          `UPDATE queue_items
+             SET last_nudge_attempt = ?, last_nudge_result = ?, last_nudge_input_box = ?
+           WHERE qitem_id = ?`
+        )
+        .run(ts, result, reading ? JSON.stringify({ ...reading, at: ts }) : null, qitemId);
+      return;
+    }
     this.db
       .prepare(
         `UPDATE queue_items
@@ -4089,12 +4364,13 @@ export class QueueRepository {
     try { return this.activityReader?.(session) ?? null; } catch { return null; }
   }
 
-  waitingView(qitemId: string): WaitingView | null {
+  /** listed: the row's owner notifications and ledger, when a listing read them for all its rows. */
+  waitingView(qitemId: string, listed?: ListedLedger): WaitingView | null {
     const view = readWaitingView(this.db, qitemId, this.activityReader);
     if (view && ["pending", "in-progress"].includes(view.state)) {
       // #514 — the unclaimed sweep skips a pending ask already posted to its human in the current
       // episode (same predicate as runStuckSweep), so the view must not promise that sweep.
-      const awaitingHuman = view.state === "pending" && this.humanNotificationPostedThisEpisode(qitemId);
+      const awaitingHuman = view.state === "pending" && this.humanNotificationPostedThisEpisode(qitemId, listed);
       if (awaitingHuman) {
         view.nextBackstop = { owner: view.owner, mechanism: "none (posted to the human; awaiting their decision)", dueAt: null, intervalSeconds: null };
       }
@@ -4114,16 +4390,7 @@ export class QueueRepository {
       || row.closure_reason !== "handed_off_to" || !row.closure_target) return undefined;
     const target = row.closure_target;
     try {
-      const successor = this.db.prepare(
-        `SELECT 1 FROM queue_items s
-          WHERE (s.qitem_id = ? OR s.destination_session = ?) AND s.qitem_id != ?
-            AND (s.handed_off_from = ? OR EXISTS (
-              SELECT 1 FROM json_each(s.chain_of_record) WHERE value = ?
-            )) LIMIT 1`,
-      ).get(target, target, row.qitem_id, row.qitem_id, row.qitem_id);
-      // A linked row may have handed on to another owner. Its current state
-      // does not establish whether later hops still hold the work.
-      if (successor) return undefined;
+      if (hasLinkedSuccessor(this.db, row.qitem_id, target)) return undefined;
     } catch {
       // Optional reporting must not fail a close that has already committed,
       // or describe an unavailable lookup as proof of a missing local row.
@@ -4135,16 +4402,16 @@ export class QueueRepository {
       target,
       reason: "no-live-local-successor",
       message: foreignTarget
-        ? `Successor custody for '${target}' is unverified on this daemon: the successor is named on that host, and this daemon cannot read its custody. This closure records a handoff claim, not proof of transfer or pickup.`
-        : `Successor custody for '${target}' is unverified on this daemon: no local row with this source's lineage was found. A successor may exist on another host. This closure records a handoff claim, not proof of transfer or pickup; reconcile the successor by ID.`,
+        ? `Successor custody for '${target}' is unverified on this daemon: the successor is named on that host, and this daemon cannot read its custody. This closure records a handoff claim, not proof of transfer or pickup. Use 'rig queue handoff' or 'handoff-and-complete': a local handoff is atomic, across hosts the successor is created first and the source closed after, and an uncertain result is reconciled by its exact id, since re-running the same handoff is idempotent.`
+        : `Successor custody for '${target}' is unverified on this daemon: no local row with this source's lineage was found. A successor may exist on another host. This closure records a handoff claim, not proof of transfer or pickup; reconcile the successor by ID. Use 'rig queue handoff' or 'handoff-and-complete': a local handoff is atomic, across hosts the successor is created first and the source closed after, and an uncertain result is reconciled by its exact id, since re-running the same handoff is idempotent.`,
     };
   }
 
-  private rowToItem(row: QueueItemRow, includeWaiting = true): QueueItem {
+  private rowToItem(row: QueueItemRow, includeWaiting = true, listed?: ListedLedger): QueueItem {
     // S04 — derive the pickup receipt at the ONE shared projection point (list/show/overdue
     // all flow through here), so the park-vs-strand question is answered by the row face.
     const meaningful = lastMeaningfulTransition(this.db, row.qitem_id);
-    const waiting = includeWaiting ? this.waitingView(row.qitem_id) : null;
+    const waiting = includeWaiting ? this.waitingView(row.qitem_id, listed) : null;
     const activity = this.ownerActivity(row.destination_session);
     const pickup = derivePickup({
       state: row.state,
@@ -4193,6 +4460,8 @@ export class QueueRepository {
       lastNudgeAttempt: row.last_nudge_attempt,
       lastNudgeResult: presentedNudgeResult(row.last_nudge_result, row.claimed_at),
       lastNudgeWireResult: row.last_nudge_result,
+      // #1278: absent before migration 116 and on compact rows (elided there), so null.
+      lastNudgeInputBox: parseNudgeInputBox(row.last_nudge_input_box, row.last_nudge_attempt),
       lastHeartbeat: row.last_heartbeat,
       resolution: row.resolution,
       // PL-007: target_repo present only when migration 038 has applied;
@@ -4200,6 +4469,30 @@ export class QueueRepository {
       targetRepo: row.target_repo ?? null,
     };
   }
+}
+
+/** The row fields a delivery ledger reads, as rowToItem presents them. */
+type LedgerItem = Pick<QueueItem, "qitemId" | "state" | "blockedOn" | "destinationSession" | "tsCreated" | "lastNudgeResult">;
+
+type DeliveryLedger = { outcome: "posted" | "transport-failed" | "never-posted"; detail: string; episode: { notificationKey: string; startedAt: string } | null };
+
+/** A listed row's owner notifications (newest first) and its delivery ledger, read once for the whole listing. */
+type ListedLedger = { owners: QueueTransition[]; ledger: DeliveryLedger | null };
+
+function ledgerItem(row: LedgerRow): LedgerItem {
+  return {
+    qitemId: row.qitem_id,
+    state: row.state as QueueState,
+    blockedOn: row.blocked_on,
+    destinationSession: row.destination_session,
+    tsCreated: row.ts_created,
+    lastNudgeResult: presentedNudgeResult(row.last_nudge_result, row.claimed_at),
+  };
+}
+
+/** A notice sent to the owner, as opposed to the resolution notice a human's own answer writes. */
+function isOutboundOwnerNotice(t: QueueTransition): boolean {
+  return t.ownerNotificationLevel != null && t.ownerNotificationKind != null && t.ownerNotificationKind !== "human-decision-resolved";
 }
 
 function isQueueState(value: unknown): value is QueueState {

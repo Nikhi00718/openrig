@@ -4,11 +4,13 @@ import type { ContextUsageStore } from "./context-usage-store.js";
 import {
   isAttentionRequiredReadinessCode,
   type NodeBinding,
+  type ReadinessOptions,
   type ReadinessResult,
 } from "./runtime-adapter.js";
 import type { UsageSamplesStore, ProviderWindowSampleInput } from "./usage-samples-store.js";
 import type { ContextUsage } from "./types.js";
-import { hasPendingFreshStartup } from "./startup-orchestrator.js";
+import { getLatestStartupFailedEvent, hasClaudeResumeIdentityWork, readPendingStartupContext } from "./startup-orchestrator.js";
+import { claudeResumeRotation, SessionRegistry } from "./session-registry.js";
 
 /** Default polling interval: 30 seconds. */
 export const DEFAULT_POLL_INTERVAL_MS = 30_000;
@@ -19,6 +21,10 @@ interface EligibleSession {
   session_name: string;
   runtime: string | null;
   resume_token: string | null;
+  resume_provenance: string | null;
+  resume_rotated_from: string | null;
+  resume_rotated_process: string | null;
+  resume_launch_process: string | null;
   cwd: string | null;
   startup_status: "pending" | "ready" | "attention_required" | "failed" | null;
   status: string;
@@ -34,11 +40,11 @@ interface EligibleSession {
 
 interface ClaudeContextProvisioner {
   ensureContextCollector(binding: { cwd?: string | null; tmuxSession?: string | null }): void;
-  checkReady?(binding: NodeBinding): Promise<ReadinessResult>;
+  checkReady?(binding: NodeBinding, options?: ReadinessOptions): Promise<ReadinessResult>;
 }
 
 interface RuntimeReadinessChecker {
-  checkReady?(binding: NodeBinding): Promise<ReadinessResult>;
+  checkReady?(binding: NodeBinding, options?: ReadinessOptions): Promise<ReadinessResult>;
 }
 
 /**
@@ -235,6 +241,10 @@ export class ContextMonitor {
         s.session_name,
         n.runtime,
         s.resume_token,
+        s.resume_provenance,
+        s.resume_rotated_from,
+        s.resume_rotated_process,
+        s.resume_launch_process,
         n.cwd,
         s.startup_status,
         s.status,
@@ -302,18 +312,23 @@ export class ContextMonitor {
     const isCurrent = () => this.isCurrentSession(session);
     try {
       if (!isCurrent()) return;
+      // A Claude seat is checked with its real binding (pane, session, current occupant) and recorded conversation, so a
+      // banner-less auto-mode screen can be proved when no launch record exists (#1477). Other runtimes keep the stand-in.
+      const claude = session.runtime === "claude-code";
+      const rotation = claude ? claudeResumeRotation(session) : null;
       const readiness = await checker.checkReady({
-        id: `context-monitor:${session.session_id}`,
+        id: claude && session.binding_id ? session.binding_id : `context-monitor:${session.session_id}`,
         nodeId: session.node_id,
         attachmentType: "tmux",
         tmuxSession: session.session_name,
         tmuxWindow: null,
-        tmuxPane: null,
+        tmuxPane: claude ? session.binding_pane : null,
         cmuxWorkspace: null,
         cmuxSurface: null,
         updatedAt: "",
         cwd: session.cwd ?? "",
-      });
+        ...(claude && session.generation_uuid ? { launchGeneration: session.generation_uuid } : {}),
+      }, ...(claude && session.resume_token ? [{ resumeToken: session.resume_token, ...(rotation ? { resumeRotation: rotation } : {}) }] : []));
       // Hold no database lock while observing the runtime. Revalidation and
       // the write share an immediate transaction, reserving the writer before the
       // snapshot read so WAL contention cannot fail a later read-to-write upgrade.
@@ -322,7 +337,8 @@ export class ContextMonitor {
         if (readiness.ready) {
           // A live prompt does not deliver saved context. Check after the await:
           // startup may have reached an attention gate while we were observing.
-          if (hasPendingFreshStartup(this.db, session.node_id, session.session_id)) return;
+          if (readPendingStartupContext(this.db, session.node_id, session.session_id)) return;
+          if (readiness.provedWithoutLaunch && this.requestedConversationDiffers(session)) return;
           const completedAt = new Date().toISOString();
           const updated = this.db.prepare(`
             UPDATE sessions
@@ -350,5 +366,18 @@ export class ContextMonitor {
     } catch {
       // Best-effort normalization only; telemetry polling still succeeds.
     }
+  }
+
+  /** For a promotion the no-launch process proof made (#1477), the conversation the failed start asked for, in addition
+   *  to the recorded one. `node.startup_failed`'s `requestedResumeToken` is written by the daemon and survives a restart; the SessionStart hook rewrites only
+   *  `sessions.resume_token`, so a record the hook moved to another conversation no longer matches the request. The
+   *  same comparison the post-send reconcile makes (stored token, or a rotation that started from it). With no such
+   *  event, or a null request (a fresh launch), or an event from before the fields existed, this holds nothing back,
+   *  unlike the post-send reconcile's default: a seat the monitor promotes today stays promoted. */
+  private requestedConversationDiffers(session: EligibleSession): boolean {
+    const event = getLatestStartupFailedEvent(this.db, session.node_id, session.session_id);
+    if (!event?.requestedResumeToken) return false;
+    return hasClaudeResumeIdentityWork(new SessionRegistry(this.db), session.session_id, "claude-code",
+      event.requestedResumeToken, event.requestedResumeType);
   }
 }

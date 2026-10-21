@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { resolveActiveOccupantRow } from "./active-occupant.js";
+import { decodeStoredSnapshotData } from "./snapshot-repository.js";
 import { resolve } from "node:path";
 import { ulid } from "ulid";
 import { deriveComposeProjectName } from "./compose-project-name.js";
@@ -17,7 +18,15 @@ import type {
   Snapshot,
   SnapshotData,
   SessionSourceSpec,
+  StartupBlock,
 } from "./types.js";
+
+/** A rig's own startup layers: its `culture_file` and rig `startup` block as declared, and the absolute root they resolve against. */
+export interface RigStartupLayers {
+  root: string;
+  cultureFile?: string;
+  startup?: StartupBlock;
+}
 
 /**
  * Free helper: returns the latest snapshot for a rig whose data carries non-null
@@ -34,7 +43,7 @@ interface SnapshotRow { id: string; rig_id: string; kind: string; status: string
 function snapshotFromRowIfUsable(row: SnapshotRow): Snapshot | null {
   let data: SnapshotData;
   try {
-    data = JSON.parse(row.data) as SnapshotData;
+    data = decodeStoredSnapshotData(row.data);
   } catch {
     return null;
   }
@@ -80,10 +89,11 @@ export function findLatestUsableSnapshot(db: Database.Database, rigId: string): 
  * arch-D1.1 sibling-audit `snapshots(rig_id, created_at)` index candidate.
  */
 export function findLatestUsableSnapshotsForAllRigs(db: Database.Database): Map<string, Snapshot> {
+  // One latest-snapshot lookup per rig with snapshots (from the index), not one per snapshot row.
   const rows = db.prepare(`
-    SELECT s.* FROM snapshots s
-    WHERE s.id = (
-      SELECT s2.id FROM snapshots s2 WHERE s2.rig_id = s.rig_id
+    SELECT s.* FROM (SELECT DISTINCT rig_id FROM snapshots) r
+    JOIN snapshots s ON s.id = (
+      SELECT s2.id FROM snapshots s2 WHERE s2.rig_id = r.rig_id
       ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1
     )
   `).all() as SnapshotRow[];
@@ -263,6 +273,27 @@ export class RigRepository {
     if (!this.hasRigColumn("claude_managed_block_file")) return;
     this.db.prepare("UPDATE rigs SET claude_managed_block_file = ?, updated_at = ? WHERE id = ?")
       .run(file ?? null, new Date().toISOString(), rigId);
+  }
+
+  /** The rig's `culture_file` and rig `startup` block as its spec declared them, and the absolute root their paths
+   *  resolve against (migration 121). A seat added to the rig later reads them back. Null when neither was declared. */
+  setRigStartupLayers(rigId: string, layers: RigStartupLayers | null): void {
+    if (!this.hasRigColumn("startup_layers_json")) return;
+    this.db.prepare("UPDATE rigs SET startup_layers_json = ?, updated_at = ? WHERE id = ?")
+      .run(layers ? JSON.stringify(layers) : null, new Date().toISOString(), rigId);
+  }
+
+  getRigStartupLayers(rigId: string): RigStartupLayers | null {
+    if (!this.hasRigColumn("startup_layers_json")) return null;
+    const row = this.db.prepare("SELECT startup_layers_json FROM rigs WHERE id = ?")
+      .get(rigId) as { startup_layers_json: string | null } | undefined;
+    if (!row?.startup_layers_json) return null;
+    try {
+      const parsed = JSON.parse(row.startup_layers_json) as Partial<RigStartupLayers>;
+      return typeof parsed.root === "string" ? parsed as RigStartupLayers : null;
+    } catch {
+      return null;
+    }
   }
 
   /** #25 — the rig's selected Claude managed-block file, or null when it uses the default. */
@@ -515,6 +546,13 @@ export class RigRepository {
       .prepare("UPDATE nodes SET model = ? WHERE id = ?")
       .run(model, nodeId);
     return result.changes > 0;
+  }
+
+  /** Saves a seat's launch directory only if it's still `expectedCwd`. The lifecycle service checks the new
+   *  directory, read-only, before calling this; it writes no startup files. */
+  setNodeCwd(nodeId: string, cwd: string, expectedCwd: string | null): boolean {
+    return this.db.prepare("UPDATE nodes SET cwd = ? WHERE id = ? AND cwd IS ?")
+      .run(cwd, nodeId, expectedCwd).changes > 0;
   }
 
   setNodeEffort(nodeId: string, effort: string): boolean {

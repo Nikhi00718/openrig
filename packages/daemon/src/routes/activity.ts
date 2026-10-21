@@ -1,3 +1,4 @@
+import { physicalSessionName } from "../domain/session-registry.js";
 import { existsSync } from "node:fs";
 import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
@@ -5,7 +6,7 @@ import type { AgentActivityStore } from "../domain/agent-activity-store.js";
 import type { SessionRegistry } from "../domain/session-registry.js";
 import type { EventBus } from "../domain/event-bus.js";
 import { verifyStartupProof } from "../domain/startup-proof.js";
-import type { ActivityEvidence } from "../domain/activity-taxonomy.js";
+import type { ActivityEvidence, EvidenceRoute } from "../domain/activity-taxonomy.js";
 import type { AgentActivity } from "../domain/types.js";
 import * as parkedQuery from "../domain/parked-query.js";
 import { runtimeRungInventory } from "../domain/activity-taxonomy.js";
@@ -31,6 +32,7 @@ export function evidenceFromHookActivity(input: {
   runtime: string | null;
   activity: AgentActivity;
   seq: number;
+  route?: EvidenceRoute;
 }): ActivityEvidence | null {
   const base = {
     seatNodeId: input.seatNodeId,
@@ -39,13 +41,19 @@ export function evidenceFromHookActivity(input: {
     sourceId: `${input.runtime ?? "unknown-runtime"}:hooks`,
     seq: input.seq,
     observedAt: input.activity.eventAt ?? input.activity.sampledAt,
+    ...(input.route ? { route: input.route } : {}),
   };
   if (input.activity.reason === "permission_request_pending") {
     return { ...base, permissionRequest: { id: input.activity.turnId ?? "uncorrelated" } };
   }
+  if (input.runtime === "claude-code" && input.activity.rawEvent === "Notification"
+      && input.activity.reason === "permission_prompt") {
+    return { ...base, permissionRequest: { id: "claude-permission-prompt" }, needsInput: { count: 1, reason: "permission_prompt" } };
+  }
   switch (input.activity.state) {
     case "running":
-      return { ...base, activity: "working", needsInput: { count: 0, reason: null } };
+      return { ...base, activity: "working", needsInput: { count: 0, reason: null },
+        ...(input.runtime === "claude-code" && input.activity.rawEvent === "UserPromptSubmit" ? { permissionResolved: true } : {}) };
     case "idle":
       return { ...base, activity: "idle-at-prompt", needsInput: { count: 0, reason: null } };
     case "needs_input":
@@ -53,6 +61,13 @@ export function evidenceFromHookActivity(input: {
     default:
       return null; // unknown = noise, never evidence
   }
+}
+
+/** The relay route a hook post names: "plugin" or "managed". An untagged post (an older relay) stays untagged; any
+ *  other value is "unrecognised", so a poster can't add promotion keys of its own. */
+export function hookRelayRoute(value: unknown): EvidenceRoute | undefined {
+  if (value === undefined || value === null) return undefined;
+  return value === "plugin" || value === "managed" ? value : "unrecognised";
 }
 
 // Per-source monotonic seq for ingested hook evidence (the relay does not mint one).
@@ -168,6 +183,8 @@ activityRoutes.post("/hooks", async (c) => {
   } catch {
     return c.json({ ok: false, code: "invalid_json", error: "Request body must be JSON." }, 400);
   }
+
+  if (typeof body.sessionName === "string") body = { ...body, sessionName: physicalSessionName(store.db, body.sessionName) };
 
   if (body.eventFamily === "session_identity") {
     const sessionId = typeof body.sessionId === "string" ? body.sessionId : null;
@@ -321,6 +338,33 @@ activityRoutes.post("/hooks", async (c) => {
           listProcesses: c.get("listProcesses" as never) as NativeProcessLister | undefined });
       }
     }
+    // #1524 (a), Codex only, synchronous with the write below (no await between them):
+    // - a known earlier occupant's hook (its generation is registered for this node and isn't the current one)
+    //   neither writes nor publishes. An absent or unregistered generation, no current tenure, or an unreadable
+    //   ledger keep today's write.
+    // - Codex sends an explicit transcript_path null for a thread it never persists (an internal thread), and also
+    //   when it can't read a persisted conversation's rollout. Either way the saved pointer is kept, so an internal
+    //   thread can't replace it. An absent key, an empty string or a malformed value keep today's write.
+    if (runtime === "codex") {
+      let generationMismatch = false;
+      try {
+        const current = sessionRegistry.currentOccupantTenure(resolved.nodeId);
+        generationMismatch = !!generation && !!current && current.generationUuid !== generation
+          && sessionRegistry.isOccupantGenerationRegistered(resolved.nodeId, generation);
+      } catch { /* an unreadable ledger is no evidence of a mismatch */ }
+      if (generationMismatch) {
+        return c.json({
+          ok: false, code: "generation_mismatch", tokenPersisted: false,
+          error: "Codex session identity ignored: emitter is an earlier occupant of this seat.",
+        }, 409);
+      }
+      if (body.transcriptPathPresent === true && body.transcriptPath === null) {
+        return c.json({
+          ok: true, sessionId, provenance: "hook", tokenPersisted: false, code: "transcript_absent",
+          detail: "Codex reported no transcript for this thread, so the saved conversation pointer was kept.",
+        });
+      }
+    }
     const persistHook = (type: string, token: string): boolean => {
       if (runtime !== "claude-code") return sessionRegistry.updateResumeToken(resolved.sessionId, type, token, "hook");
       return sessionRegistry.recordHookSessionIdentity(resolved.sessionId, type, token,
@@ -430,6 +474,7 @@ activityRoutes.post("/hooks", async (c) => {
       runtime,
       activity: result.activity,
       seq: nextHookSeq(`${emitted.nodeId}:${runtime ?? "unknown-runtime"}:hooks`),
+      route: hookRelayRoute(body.relayRoute),
     });
     if (evidence) oracle.reportEvidence(evidence);
   }
@@ -482,6 +527,7 @@ activityRoutes.get("/parked", (c) => {
     | {
         list: (opts: { destinationSession?: string; state?: string[]; limit?: number }) => Array<{ qitemId: string; state: string; summary?: string | null }>;
         getParkWakeStatus: (qitemId: string) => import("../domain/queue-wake-repository.js").ParkWakeStatus | null;
+        parkWakeServedByOwnReminder?: (qitemId: string) => boolean;
       }
     | undefined;
   const rigRepo = c.get("rigRepo" as never) as { db: import("better-sqlite3").Database } | undefined;
@@ -503,6 +549,7 @@ activityRoutes.get("/parked", (c) => {
       limit,
     }),
     getParkWake: (qitemId: string) => queueRepo.getParkWakeStatus(qitemId),
+    servedByOwnReminder: (qitemId: string) => queueRepo.parkWakeServedByOwnReminder?.(qitemId) === true,
   };
 
   // WAVE-O B2 (R2 508e383d): the diagnosis is RIG-SCOPED, never fleet-wide. Resolve ONE
@@ -549,7 +596,8 @@ activityRoutes.get("/parked", (c) => {
   `).all(scope.rig) as Array<{ node_id: string; session_name: string }>;
 
   if (seatParam) {
-    const match = seats.find((s) => s.node_id === seatParam || s.session_name === seatParam);
+    const physical = physicalSessionName(rigRepo.db, seatParam);
+    const match = seats.find((s) => s.node_id === seatParam || s.session_name === physical);
     if (!match) {
       return c.json({
         ok: false,
