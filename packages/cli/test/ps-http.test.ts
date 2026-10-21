@@ -343,6 +343,57 @@ describe("rig ps --host HTTP", () => {
     expect(parsed.totalRigs).toBe(1);
     expect(parsed.entries.map((e: { rigId: string }) => e.rigId)).toEqual(["r3"]);
   });
+
+  it("--rig naming no rig on the host says so and exits 1, like the local view; --json keeps []", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "tok");
+    const client = mockClient({
+      "/api/ps": { status: 200, data: [{ rigId: "r1", name: "a", status: "running" }] },
+      "/api/ps?includeArchived=true": { status: 200, data: [
+        { rigId: "r1", name: "a", status: "running" },
+        { rigId: "r9", name: "old", status: "stopped", isArchived: true },
+      ] },
+    });
+    const deps: PsDeps = {
+      lifecycleDeps: {} as PsDeps["lifecycleDeps"],
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://x", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    };
+    const run = async (...args: string[]) => {
+      process.exitCode = undefined;
+      const logs = await captureLogs(async () => {
+        await makeCmd(deps).parseAsync(["node", "rig", "ps", "--host", "host-b", ...args]);
+      });
+      const exitCode = process.exitCode;
+      process.exitCode = undefined;
+      return { ...logs, exitCode };
+    };
+
+    for (const args of [["--rig", "nope"], ["--rig", "nope", "--summary"]]) {
+      const r = await run(...args);
+      expect(r.stderr.join("")).toContain("Rig 'nope' not found on host host-b. List rigs with: rig ps --host host-b");
+      expect(r.stdout.join("")).toBe("");
+      expect(r.exitCode).toBe(1);
+    }
+
+    const archived = await run("--rig", "old");
+    expect(archived.stderr.join("")).toContain("Rig 'old' is archived on host host-b. Show it with: rig ps --host host-b --rig old --include-archived");
+    expect(archived.exitCode).toBe(1);
+
+    const json = await run("--rig", "nope", "--json");
+    expect(JSON.parse(json.stdout.join(""))).toEqual([]);
+    expect(json.exitCode).toBeUndefined();
+  });
+
+  it("the help's exit codes list --rig naming no rig", async () => {
+    const prog = makeCmd({ lifecycleDeps: {} as PsDeps["lifecycleDeps"], clientFactory: () => mockClient({}) });
+    let out = "";
+    prog.commands[0]!.configureOutput({ writeOut: (text) => { out += text; } });
+    await prog.parseAsync(["node", "rig", "ps", "--help"]).catch(() => {});
+    expect(out).toContain("Exit codes:");
+    expect(out).toContain("--rig names no rig");
+  });
 });
 
 describe("rig ps --all-hosts fan-out", () => {
