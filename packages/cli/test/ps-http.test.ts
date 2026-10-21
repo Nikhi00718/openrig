@@ -304,6 +304,45 @@ describe("rig ps --host HTTP", () => {
     const parsed = JSON.parse(stdout.join(""));
     expect(parsed.totalRigs).toBe(2);
   });
+
+  it("--rig scopes the remote rig list before --summary and --limit", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "tok");
+    const client = mockClient({
+      "/api/ps": { status: 200, data: [
+        { rigId: "r1", name: "a", status: "running" },
+        { rigId: "r2", name: "b", status: "stopped" },
+        { rigId: "r3", rigName: "c", name: "c-display", status: "running" },
+      ] },
+    });
+    const deps: PsDeps = {
+      lifecycleDeps: {} as PsDeps["lifecycleDeps"],
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://x", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    };
+    const list = await captureLogs(async () => {
+      await makeCmd(deps).parseAsync(["node", "rig", "ps", "--host", "host-b", "--rig", "b", "--json"]);
+    });
+    expect(JSON.parse(list.stdout.join("")).map((e: { rigId: string }) => e.rigId)).toEqual(["r2"]);
+
+    const byRigName = await captureLogs(async () => {
+      await makeCmd(deps).parseAsync(["node", "rig", "ps", "--host", "host-b", "--rig", "c", "--json"]);
+    });
+    expect(JSON.parse(byRigName.stdout.join("")).map((e: { rigId: string }) => e.rigId)).toEqual(["r3"]);
+
+    const summary = await captureLogs(async () => {
+      await makeCmd(deps).parseAsync(["node", "rig", "ps", "--host", "host-b", "--rig", "b", "--summary", "--json"]);
+    });
+    expect(JSON.parse(summary.stdout.join("")).totalRigs).toBe(1);
+
+    const envelope = await captureLogs(async () => {
+      await makeCmd(deps).parseAsync(["node", "rig", "ps", "--host", "host-b", "--rig", "a", "--limit", "5", "--json"]);
+    });
+    const parsed = JSON.parse(envelope.stdout.join(""));
+    expect(parsed.totalRigs).toBe(1);
+    expect(parsed.entries.map((e: { rigId: string }) => e.rigId)).toEqual(["r1"]);
+  });
 });
 
 describe("rig ps --all-hosts fan-out", () => {
