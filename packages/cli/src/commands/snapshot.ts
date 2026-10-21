@@ -80,7 +80,8 @@ export function snapshotCommand(depsOverride?: StatusDeps): Command {
       // keeps Status and Created in their columns.
       const header = ["ID", "Kind", "Status", "Created"];
       const rows = snapshots.map((snap) => [snap.id, snap.kind, snap.status, snap.createdAt]);
-      const widths = header.map((title, i) => Math.max(title.length, ...rows.map((row) => row[i]!.length)));
+      // A reduce, not Math.max(...rows): a long snapshot history must not hit the argument-count limit.
+      const widths = header.map((title, i) => rows.reduce((width, row) => Math.max(width, row[i]!.length), title.length));
       const line = (cells: string[]) => cells.map((cell, i) => (i < cells.length - 1 ? cell.padEnd(widths[i]!) : cell)).join("  ");
       console.log(line(header));
       for (const row of rows) console.log(line(row));
