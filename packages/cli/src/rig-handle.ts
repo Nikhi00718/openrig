@@ -45,7 +45,12 @@ export type HandleResolution =
  * the active candidate counts), and an archived-only name does not resolve by
  * name (use the id, or the archive path).
  */
-export async function resolveRigHandle(client: DaemonClient, handle: string): Promise<HandleResolution> {
+export async function resolveRigHandle(
+  client: DaemonClient,
+  handle: string,
+  // `archived: true` matches names among ARCHIVED rigs instead (for `rig unarchive`, whose target is archived).
+  opts: { archived?: boolean } = {},
+): Promise<HandleResolution> {
   let summaries: RigSummaryEntry[];
   try {
     // includeArchived=true so an archived rig's id still id-matches below;
@@ -66,7 +71,7 @@ export async function resolveRigHandle(client: DaemonClient, handle: string): Pr
   }
 
   // 2. name-filter over ACTIVE (non-archived) rigs only, symmetric with `up`.
-  const activeNameMatches = summaries.filter((r) => r.name === handle && r.archivedAt == null);
+  const activeNameMatches = summaries.filter((r) => r.name === handle && (opts.archived ? r.archivedAt != null : r.archivedAt == null));
   if (activeNameMatches.length === 1) {
     return { kind: "resolved", id: activeNameMatches[0]!.id, byName: true };
   }

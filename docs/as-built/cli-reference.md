@@ -301,13 +301,13 @@ the sections that were not read are `null`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig archive <rigId>` | — | `--force`<br>`--json` |
+| `rig archive <rig>` | — | `--force`<br>`--json` |
 
 ### unarchive
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig unarchive <rigId>` | — | `--json` |
+| `rig unarchive <rig>` | — | `--json` |
 
 ### host
 
@@ -800,7 +800,7 @@ Only Claude and Codex tenures can be woken.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig release <rigId>` | — | `--delete`<br>`--json` |
+| `rig release <rig>` | — | `--delete`<br>`--json` |
 
 ### launch
 
