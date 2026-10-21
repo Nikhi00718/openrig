@@ -10,6 +10,7 @@ import { RigRepository } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
 import { ContextUsageStore } from "../src/domain/context-usage-store.js";
 import { ContextMonitor } from "../src/domain/context-monitor.js";
+import { UsageSamplesStore } from "../src/domain/usage-samples-store.js";
 import { ClaudeCompactionEnforcer } from "../src/domain/claude-compaction-enforcer.js";
 import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
 import { SettingsStore } from "../src/domain/user-settings/settings-store.js";
@@ -71,17 +72,17 @@ describe("context observations retain their compaction target", () => {
     usage(name, 90);
     return { rig, node, session, name };
   }
-  function usage(name: string, percentage: number) {
+  function usage(name: string, percentage: number, sampledAt = new Date().toISOString()) {
     const dir = join(home, "state", "context-usage");
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, `${name}.json`), JSON.stringify({
-      session_name: name, session_id: "native-fixture", sampled_at: new Date().toISOString(),
+      session_name: name, session_id: "native-fixture", sampled_at: sampledAt,
       context_window: { used_percentage: percentage, remaining_percentage: 100 - percentage,
         total_input_tokens: 1000, total_output_tokens: 100, context_window_size: 200000 },
     }));
   }
-  function monitor(checkReady: (binding: NodeBinding) => Promise<ReadinessResult>) {
-    return new ContextMonitor(db, store, { ensureContextCollector: vi.fn(), checkReady }, enforcer);
+  function monitor(checkReady: (binding: NodeBinding) => Promise<ReadinessResult>, samples?: UsageSamplesStore) {
+    return new ContextMonitor(db, store, { ensureContextCollector: vi.fn(), checkReady }, enforcer, undefined, samples);
   }
 
   it.each(["generation", "replacement", "stopped", "pane", "retry"] as const)(
@@ -222,6 +223,72 @@ describe("context observations retain their compaction target", () => {
 
     await poller.pollOnce();
     expect(send).toHaveBeenCalledTimes(sendsBefore + 1);
+  });
+
+  it.each([
+    { path: "sampled", field: "startup_status" },
+    { path: "sampled", field: "startup_completed_at" },
+    { path: "pending", field: "startup_status" },
+    { path: "pending", field: "startup_completed_at" },
+  ] as const)("keeps a later seat's usage when its $field changes while an earlier seat is observed ($path)", async ({ path, field }) => {
+    const samples = new UsageSamplesStore(db);
+    const startup = path === "pending" ? "ready" : "failed";
+    const seats = [seed("first@fixture", startup), seed("second@fixture", startup)];
+    let blockNext = false;
+    const entered = deferred<NodeBinding>();
+    const probe = deferred<ReadinessResult>();
+    const poller = monitor(binding => {
+      if (!blockNext) return Promise.resolve({ ready: true });
+      blockNext = false;
+      entered.resolve(binding);
+      return probe.promise;
+    }, samples);
+    const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+    let sampledAt = minutesAgo(0);
+    if (path === "pending") {
+      await poller.pollOnce();
+      for (const { name } of seats) {
+        const prep = enforcer.getPreparationState(name)!;
+        writeFileSync(`${prep.mapPath}.tmp`, `# Fixture restore map\n${prep.marker}\n`);
+      }
+      await poller.pollOnce();
+      for (const { name } of seats) expect(enforcer.hasPendingPostCompactStage(name)).toBe(true);
+      // A known but stale sample is still recorded, and leaves the pending stage to drain.
+      sampledAt = minutesAgo(20);
+      for (const { session } of seats) registry.updateStartupStatus(session.id, "failed");
+    }
+    for (const { name } of seats) usage(name, 90, sampledAt);
+    const sendsTo = (name: string) => send.mock.calls.filter(args => args[0] === name).length;
+    const sentBefore = new Map(seats.map(({ name }) => [name, sendsTo(name)]));
+
+    blockNext = true;
+    const poll = poller.pollOnce();
+    const first = await entered.promise;
+    const later = seats.find(seat => seat.node.id !== first.nodeId)!;
+    if (field === "startup_status") registry.updateStartupStatus(later.session.id, "attention_required");
+    else registry.updateStartupStatus(later.session.id, "failed", "2026-01-01T00:00:00.000Z");
+    const readiness = () => db.prepare("SELECT startup_status, startup_completed_at FROM sessions WHERE id = ?").get(later.session.id);
+    const changed = readiness();
+    probe.resolve({ ready: true });
+    await poll;
+
+    const series = () => (db.prepare(
+      "SELECT sampled_at FROM usage_samples WHERE lane = 'context' AND seat_session = ? ORDER BY id",
+    ).all(later.name) as Array<{ sampled_at: string }>).map(row => row.sampled_at);
+    expect(store.getForNode(later.node.id, later.name)).toMatchObject({ usedPercentage: 90, sampledAt });
+    expect(series()).toContain(sampledAt);
+    // The stale observation neither normalizes nor compacts or drains.
+    expect(readiness()).toEqual(changed);
+    expect(sendsTo(later.name)).toBe(sentBefore.get(later.name));
+    if (path === "sampled") expect(enforcer.getPreparationState(later.name)).toBeNull();
+    else expect(enforcer.hasPendingPostCompactStage(later.name)).toBe(true);
+
+    const nextSampledAt = path === "pending" ? minutesAgo(19) : minutesAgo(0);
+    usage(later.name, 91, nextSampledAt);
+    await poller.pollOnce();
+    expect(series().indexOf(sampledAt)).toBeGreaterThanOrEqual(0);
+    expect(series().indexOf(nextSampledAt)).toBeGreaterThan(series().indexOf(sampledAt));
+    expect(store.getForNode(later.node.id, later.name)).toMatchObject({ usedPercentage: 91, sampledAt: nextSampledAt });
   });
 
   it.each(["startup_status", "startup_completed_at"] as const)(

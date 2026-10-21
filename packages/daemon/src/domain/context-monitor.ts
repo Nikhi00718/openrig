@@ -105,7 +105,7 @@ export class ContextMonitor {
     this.compactionEnforcer?.reconcilePreparations?.();
     const sessions = this.getEligibleSessions();
     for (const session of sessions) {
-      if (!this.isCurrentSession(session)) continue;
+      if (!this.isCurrentSession(session, true)) continue;
       let observed: ContextUsage | null = null;
       const canReadContextUsage = session.runtime !== "codex" || !!session.resume_token;
       if (canReadContextUsage) {
@@ -205,11 +205,14 @@ export class ContextMonitor {
     }
   }
 
-  /** Every field must match the observation, including this poll's own readiness writes. */
-  private isCurrentSession(session: EligibleSession): boolean {
+  /** Every field must match the observation, including this poll's own readiness writes.
+   * Usage telemetry passes `ignoreReadiness`: readiness does not change how usage is
+   * read, so an independent readiness change must not drop that tick's sample. */
+  private isCurrentSession(session: EligibleSession, ignoreReadiness = false): boolean {
     const current = this.getEligibleSessions(session.node_id)[0];
     return current !== undefined && Object.entries(session).every(([key, value]) =>
-      current[key as keyof EligibleSession] === value);
+      (ignoreReadiness && (key === "startup_status" || key === "startup_completed_at"))
+      || current[key as keyof EligibleSession] === value);
   }
 
   /** Start polling at the given interval. Idempotent. */
