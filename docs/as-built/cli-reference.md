@@ -165,16 +165,16 @@ the sections that were not read are `null`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig snapshot <rigId>` | — | `--intended-seats <ids>` |
-| `rig snapshot list <rigId>` | — | — |
+| `rig snapshot <rig>` | — | `--intended-seats <ids>` |
+| `rig snapshot list <rig>` | — | — |
 
 ### restore
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig restore` | — | — |
-| `rig restore apply <snapshotId>` (hidden) | — | `--rig <rigId>` **required** |
-| `rig restore status <attemptId>` | — | `--rig <rigId>` **required**<br>`--json` |
+| `rig restore apply <snapshotId>` (hidden) | — | `--rig <rig>` **required** |
+| `rig restore status <attemptId>` | — | `--rig <rig>` **required**<br>`--json` |
 
 ### crash-cart
 
@@ -204,7 +204,7 @@ the sections that were not read are `null`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig export <rigId>` | — | `-o, --output <path>` |
+| `rig export <rig>` | — | `-o, --output <path>` |
 
 ### import
 
