@@ -337,11 +337,11 @@ describe("rig ps --host HTTP", () => {
     expect(JSON.parse(summary.stdout.join("")).totalRigs).toBe(1);
 
     const envelope = await captureLogs(async () => {
-      await makeCmd(deps).parseAsync(["node", "rig", "ps", "--host", "host-b", "--rig", "a", "--limit", "5", "--json"]);
+      await makeCmd(deps).parseAsync(["node", "rig", "ps", "--host", "host-b", "--rig", "c", "--limit", "1", "--json"]);
     });
     const parsed = JSON.parse(envelope.stdout.join(""));
     expect(parsed.totalRigs).toBe(1);
-    expect(parsed.entries.map((e: { rigId: string }) => e.rigId)).toEqual(["r1"]);
+    expect(parsed.entries.map((e: { rigId: string }) => e.rigId)).toEqual(["r3"]);
   });
 });
 
