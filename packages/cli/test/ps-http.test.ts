@@ -408,8 +408,8 @@ describe("rig ps --host HTTP", () => {
       process.exitCode = undefined;
       expect(stderr.join("")).toContain("503");
       expect(stderr.join("")).not.toContain("not found");
-      expect(exitCode).not.toBe(0);
-      expect(exitCode).toBeDefined();
+      // The remote rig view uses the cross-host error (1); the node view, the rig-list failure (2).
+      expect(exitCode).toBe(args.includes("--nodes") ? 2 : 1);
     }
   });
 
