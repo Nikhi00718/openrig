@@ -1243,8 +1243,13 @@ async function handleNodes(
     let archived = false;
     if (!opts.includeArchived) {
       const withArchived = await client.get<PsEntry[]>("/api/ps?includeArchived=true", requestHeaders ? { headers: requestHeaders } : undefined);
-      archived = withArchived.status < 400 && Array.isArray(withArchived.data)
-        && withArchived.data.some((r) => (r.rigName ?? r.name) === opts.rig);
+      // A failed lookup hasn't shown the rig is missing: report it as the first rig-list read does.
+      if (withArchived.status >= 400) {
+        console.error(`Failed to fetch rig list from daemon (HTTP ${withArchived.status}). Check daemon status with: rig status`);
+        process.exitCode = 2;
+        return;
+      }
+      archived = Array.isArray(withArchived.data) && withArchived.data.some((r) => (r.rigName ?? r.name) === opts.rig);
     }
     console.error(archived
       ? `Rig '${opts.rig}' is archived. Show it with: rig ps --nodes --rig ${opts.rig} --include-archived`
@@ -1635,8 +1640,14 @@ async function runHttpPs(
       let archived = false;
       if (!opts.includeArchived) {
         const withArchived = await client.get<PsEntry[]>("/api/ps?includeArchived=true", { headers });
-        archived = withArchived.status < 400 && Array.isArray(withArchived.data)
-          && withArchived.data.some((r) => (r.rigName ?? r.name) === opts.rig);
+        // A failed lookup hasn't shown the rig is missing: report it as the first remote read does.
+        const lookupStep = classifyHttpFailedStep(withArchived.status);
+        if (lookupStep !== "none") {
+          emitCrossHostError(host.id, lookupStep, `HTTP ${withArchived.status}`, opts.json);
+          process.exitCode = 1;
+          return;
+        }
+        archived = Array.isArray(withArchived.data) && withArchived.data.some((r) => (r.rigName ?? r.name) === opts.rig);
       }
       console.error(archived
         ? `Rig '${opts.rig}' is archived on host ${host.id}. Show it with: rig ps --host ${host.id} --rig ${opts.rig} --include-archived`

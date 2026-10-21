@@ -386,6 +386,33 @@ describe("rig ps --host HTTP", () => {
     expect(json.exitCode).toBeUndefined();
   });
 
+  it("a failed archived lookup is reported as a failure, not as 'not found'", async () => {
+    vi.stubEnv("HOST_B_TOKEN", "tok");
+    const client = mockClient({
+      "/api/ps": { status: 200, data: [{ rigId: "r1", name: "a", status: "running" }] },
+      "/api/ps?includeArchived=true": { status: 503, data: { error: "busy" } },
+    });
+    const deps: PsDeps = {
+      lifecycleDeps: {} as PsDeps["lifecycleDeps"],
+      clientFactory: () => client,
+      hostRegistryLoader: mockRegistry([
+        { id: "host-b", transport: "http", url: "http://x", bearer_env: "HOST_B_TOKEN" },
+      ]),
+    };
+    for (const args of [["--rig", "nope"], ["--nodes", "--rig", "nope"]]) {
+      process.exitCode = undefined;
+      const { stderr } = await captureLogs(async () => {
+        await makeCmd(deps).parseAsync(["node", "rig", "ps", "--host", "host-b", ...args]);
+      });
+      const exitCode = process.exitCode;
+      process.exitCode = undefined;
+      expect(stderr.join("")).toContain("503");
+      expect(stderr.join("")).not.toContain("not found");
+      expect(exitCode).not.toBe(0);
+      expect(exitCode).toBeDefined();
+    }
+  });
+
   it("the help's exit codes list --rig naming no rig", async () => {
     const prog = makeCmd({ lifecycleDeps: {} as PsDeps["lifecycleDeps"], clientFactory: () => mockClient({}) });
     let out = "";
