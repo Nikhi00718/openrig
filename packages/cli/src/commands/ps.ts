@@ -1057,6 +1057,17 @@ Exit codes:
       }
 
       if (limited.length === 0) {
+        // A --rig that names no rig is a lookup that missed, not an empty fleet: say so (as rig chatroom,
+        // env and parked do) instead of "No rigs". --json keeps its empty array.
+        if (opts.rig && !visible.some((e) => (e.rigName ?? e.name) === opts.rig)) {
+          if (all.some((e) => (e.rigName ?? e.name) === opts.rig)) {
+            console.error(`Rig '${opts.rig}' is archived. Show it with: rig ps --rig ${opts.rig} --include-archived`);
+          } else {
+            console.error(`Rig '${opts.rig}' not found. List rigs with: rig ps`);
+          }
+          process.exitCode = 1;
+          return;
+        }
         if (parsedFilter) {
           console.log(`No rigs match --filter ${parsedFilter.key}=${parsedFilter.value}`);
         } else if (archivedCount > 0 && !opts.includeArchived) {
@@ -1247,6 +1258,12 @@ async function handleNodes(
   }
 
   if (limited.length === 0) {
+    // A --rig that names no rig is a lookup that missed, not a rig without seats. --json keeps its empty array.
+    if (opts.rig && effectiveRigs.length === 0) {
+      console.error(`Rig '${opts.rig}' not found. List rigs with: rig ps`);
+      process.exitCode = 1;
+      return;
+    }
     if (parsedFilter) {
       console.log(`No nodes match --filter ${parsedFilter.key}=${parsedFilter.value}`);
     } else {
