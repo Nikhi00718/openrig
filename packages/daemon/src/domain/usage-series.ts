@@ -385,7 +385,11 @@ export function computeCostView(db: Database, q: { nowIso: string; seatSession?:
       ORDER BY seat_session ASC, id ASC`,
   ).all(...(q.seatSession ? [q.seatSession] : [])) as CostRow[];
   const bySeat = new Map<string, CostRow[]>();
-  for (const row of rows) bySeat.set(row.seat_session, [...(bySeat.get(row.seat_session) ?? []), row]);
+  for (const row of rows) {
+    let history = bySeat.get(row.seat_session);
+    if (!history) bySeat.set(row.seat_session, history = []);
+    history.push(row);
+  }
   const now = Date.parse(q.nowIso);
   const staleAfter = q.staleAfterMs ?? COST_STALE_AFTER_MS;
   const seats: SeatCost[] = [];
