@@ -182,10 +182,12 @@ export function streamRoutes(): Hono {
           sentIds.add(item.streamItemId);
         }
 
-        initialDone.value = true;
+        // Arrivals while this drain yields must join its tail, rather than
+        // writing directly ahead of earlier buffered events.
         for (const p of pending) {
           if (!sentIds.has(p.id)) await stream.writeSSE(p);
         }
+        initialDone.value = true;
 
         await aborted;
       } finally {
