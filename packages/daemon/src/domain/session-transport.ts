@@ -199,6 +199,8 @@ const CLAUDE_TIMERLESS_STATUS_PATTERN = /^[✶✢✳✻✽·*]\s+\S.*(?:…|\.{3
 export interface ClassifyPaneOptions {
   /** Treat a timer-less live status row above the composer as work in progress. */
   timerlessStatusIsLive?: boolean;
+  /** On a fresh Claude running hook, ignore numbered choices from pane history. */
+  currentClaudeDialogueOnly?: boolean;
   /** Opted-in typing guards retain styling and cursor evidence for this read. */
   composerSnapshot?: ComposerSnapshot;
   runtime?: string | null;
@@ -531,8 +533,19 @@ export function classifyPaneActivity(paneContent: string, options: ClassifyPaneO
     ? promptScanLines.slice(oldQuestionEnd + 1)
     : options.runtime === "codex" && !permissionPromptEvidence
       ? codexCurrentSelectionLines(paneContent) ?? promptScanLines : promptScanLines;
+  const currentComposer = options.currentClaudeDialogueOnly && options.runtime === "claude-code"
+    ? composerRegion(paneContent, "claude-code")
+    : null;
+  const currentComposerText = currentComposer?.body ?? (currentComposer?.markerLine !== null && currentComposer?.markerLine !== undefined
+    && currentComposer.closingRuleLine !== null && currentComposer.closingRuleLine !== undefined
+    ? paneContent.split(/\r?\n/).slice(currentComposer.markerLine - 1, currentComposer.closingRuleLine - 1).join("\n")
+    : null);
+  const currentComposerSelection = currentComposerText
+    ? findPatternEvidence(currentComposerText.split("\n").map(line => line.trimStart()), [COMPOSER_SELECTION_SCAN_PATTERN])
+    : null;
   const selectionPromptEvidence = currentClaudeMcpMenu(paneContent) ?? findCurrentClaudeQuestion(paneContent) ??
-    findPatternEvidence(selectionLines, [COMPOSER_SELECTION_SCAN_PATTERN]);
+    currentComposerSelection ?? (options.currentClaudeDialogueOnly ? null
+      : findPatternEvidence(selectionLines, [COMPOSER_SELECTION_SCAN_PATTERN]));
   if (selectionPromptEvidence) {
     return {
       state: "attention",
@@ -650,6 +663,8 @@ export async function probeSessionActivity(input: {
   /** See ClassifyPaneOptions.timerlessStatusIsLive. */
   timerlessStatusIsLive?: boolean;
   visibleScreenOnly?: boolean;
+  /** Limit numbered-choice detection to current Claude dialogue and composer evidence. */
+  currentClaudeDialogueOnly?: boolean;
   /** Supplied only by an active draft-aware send; ordinary observations stay unchanged. */
   composerSnapshot?: () => Promise<ComposerSnapshot | null>;
   /** The seat's community harness (`communityHarnessOf`): its idle-looking screen reads unknown. */
@@ -770,7 +785,10 @@ export async function probeSessionActivity(input: {
     const snapshot = input.composerSnapshot ? await input.composerSnapshot().catch(() => null) : null;
     const paneContent = snapshot?.screen ?? await capture();
     const capturedAt = new Date().toISOString();
-    const classifyOptions = { timerlessStatusIsLive: input.timerlessStatusIsLive === true };
+    const classifyOptions = {
+      timerlessStatusIsLive: input.timerlessStatusIsLive === true,
+      currentClaudeDialogueOnly: input.currentClaudeDialogueOnly === true,
+    };
     let classification = communityHarnessPaneActivity(classifyPaneActivity(paneContent ?? "", { ...classifyOptions,
       composerSnapshot: snapshot ?? undefined, runtime }), input.communityHarness);
     // Claude renders its prompt suggestion faint, which the plain capture loses. When a Claude pane reads
@@ -3335,6 +3353,7 @@ export class SessionTransport {
         if (hookActivity.state === "running" && input.runtime === "claude-code") {
           const paneVeto = await probeSessionActivity({
             composerSnapshot,
+            currentClaudeDialogueOnly: true,
             sessionName: input.sessionName,
             runtime: input.runtime,
             attachmentType: input.attachmentType as "tmux" | "external_cli" | null | undefined,
