@@ -3332,6 +3332,19 @@ export class SessionTransport {
     ) {
       // Fresh hook (within the 15s send window): authoritative for any state.
       if (this.hookFreshForSend(hookActivity, now)) {
+        if (hookActivity.state === "running" && input.runtime === "claude-code") {
+          const paneVeto = await probeSessionActivity({
+            composerSnapshot,
+            sessionName: input.sessionName,
+            runtime: input.runtime,
+            attachmentType: input.attachmentType as "tmux" | "external_cli" | null | undefined,
+            tmuxAdapter: this.tmuxAdapter,
+            now,
+            captureObserver: this.captureObserver,
+            binding: input.binding,
+          });
+          if (paneVeto.state === "needs_input") return paneVeto;
+        }
         return hookActivity;
       }
       // OPR.0.4.3.28 Part A — a stale-but-latest `idle` hook (older than the 15s

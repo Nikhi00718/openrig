@@ -1652,6 +1652,61 @@ describe("SessionTransport", () => {
     expect(sendTextSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("a fresh Claude working hook cannot override a visible MCP approval menu", async () => {
+    seedCanonicalRig();
+    const eventBus = new EventBus(db);
+    const agentActivityStore = new AgentActivityStore({ db, eventBus });
+    agentActivityStore.recordHookEvent({
+      runtime: "claude-code",
+      sessionName: "dev-impl@my-rig",
+      hookEvent: "UserPromptSubmit",
+    });
+    const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
+    const capture = vi.fn(async () => [
+      "2 new MCP servers found in this project",
+      "Select any you wish to enable.",
+      "MCP servers may execute code or access system resources. All tool calls",
+      "require approval. Learn more in the MCP documentation.",
+      "❯ [✔] dummy1",
+      "  [✔] dummy2",
+      "     Enable selected",
+      "Space to select · Esc to reject all",
+    ].join("\n"));
+    const transport = createTransport(mockTmux({ capturePaneContent: capture, sendText: sendTextSpy }), {
+      agentActivityStore,
+    });
+
+    const result = await transport.send("dev-impl@my-rig", "hello");
+
+    expect(result).toMatchObject({ ok: false, reason: "target_needs_input" });
+    expect(result.activity).toMatchObject({ state: "needs_input", reason: "selection_prompt" });
+    expect(capture).toHaveBeenCalledTimes(1);
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps busy sends advisory when a fresh Claude working hook has no visible prompt", async () => {
+    seedCanonicalRig();
+    const eventBus = new EventBus(db);
+    const agentActivityStore = new AgentActivityStore({ db, eventBus });
+    agentActivityStore.recordHookEvent({
+      runtime: "claude-code",
+      sessionName: "dev-impl@my-rig",
+      hookEvent: "UserPromptSubmit",
+    });
+    const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
+    const capture = vi.fn(async () => "Working on task...\n⠋ Processing files\nesc to interrupt");
+    const transport = createTransport(mockTmux({ capturePaneContent: capture, sendText: sendTextSpy }), {
+      agentActivityStore,
+    });
+
+    const result = await transport.send("dev-impl@my-rig", "hello");
+
+    expect(result.ok).toBe(true);
+    expect(result.warning).toContain("target pane appears mid-task");
+    expect(capture).toHaveBeenCalledTimes(1);
+    expect(sendTextSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("send with wait-for-idle prefers fresh hook activity and waits for hook idle", async () => {
     seedCanonicalRig();
     const eventBus = new EventBus(db);
