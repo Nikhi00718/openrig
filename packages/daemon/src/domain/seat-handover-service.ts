@@ -29,6 +29,7 @@ import { findOtherSessionOwner } from "./session-owner.js";
 import { seatCodexCorePluginDir, seatCorePluginDir, withPluginDirs } from "./claude-core-plugin-env.js";
 import { seatSkillPluginDirForNode } from "./seat-skill-storage.js";
 import { recordConversationPromptForNode, recordForkConversationPromptForNode, seatLaunchAdditionsForLaunch } from "./seat-launch-additions.js";
+import { inspectStartupStagedText, startupOwnCollapsedPaste } from "./startup-submission-evidence.js";
 
 /** A bounded labeled-from-record recap of the predecessor's last exchanges + the record path,
  *  resolved from the predecessor's provider transcript (claude transcript_path / codex rollout_path).
@@ -574,6 +575,7 @@ export class SeatHandoverService {
       // packet as a NAMED line, never a silent omission.
       const resolved = "recap" in predecessorRecapResolution ? predecessorRecapResolution : null;
       const delivered = await this.deliverRestorePacket(launch.tmuxSession, {
+        runtime: node.runtime,
         seatRef: input.seatRef,
         reason,
         departingSession: latestSession.session_name,
@@ -964,6 +966,7 @@ export class SeatHandoverService {
   private async deliverRestorePacket(
     successorSession: string,
     info: {
+      runtime: string | null;
       seatRef: string;
       reason: string;
       departingSession: string;
@@ -992,7 +995,66 @@ export class SeatHandoverService {
     if (!submit.ok) {
       return { ok: false, message: (submit as { message?: string }).message ?? "submit failed" };
     }
+    if (info.runtime === "claude-code") {
+      const afterSubmit = await this.waitForClaudeRestorePacketComposer(successorSession, packet);
+      if (afterSubmit === "clear") return { ok: true };
+      if (afterSubmit !== "staged") {
+        return { ok: false, message: "could not confirm the restore packet left Claude's input box" };
+      }
+
+      // A first Enter can arrive before a fresh Claude TUI is drawing. Retry only
+      // after two captures show this exact packet still in Claude's composer.
+      await this.sleep(200);
+      const beforeRetry = await this.readClaudeRestorePacketComposer(successorSession, packet);
+      if (beforeRetry === "clear") return { ok: true };
+      if (beforeRetry !== "staged") {
+        return { ok: false, message: "could not confirm the staged restore packet before retrying Enter" };
+      }
+
+      const retry = await this.tmuxAdapter.sendKeys(successorSession, ["Enter"]);
+      if (!retry.ok) {
+        return { ok: false, message: (retry as { message?: string }).message ?? "retry submit failed" };
+      }
+      const afterRetry = await this.waitForClaudeRestorePacketComposer(successorSession, packet);
+      if (afterRetry === "clear") return { ok: true };
+      return { ok: false, message: afterRetry === "staged"
+        ? "restore packet remained in Claude's input box after retrying Enter"
+        : "could not confirm the restore packet left Claude's input box after retrying Enter" };
+    }
     return { ok: true };
+  }
+
+  private async waitForClaudeRestorePacketComposer(
+    session: string,
+    packet: string,
+  ): Promise<"clear" | "staged" | "unverified"> {
+    let consecutiveStaged = 0;
+    for (let attempt = 0; attempt < 26; attempt++) {
+      const state = await this.readClaudeRestorePacketComposer(session, packet);
+      if (state === "clear") return "clear";
+      consecutiveStaged = state === "staged" ? consecutiveStaged + 1 : 0;
+      if (consecutiveStaged >= 2) return "staged";
+      if (attempt < 25) await this.sleep(200);
+    }
+    return "unverified";
+  }
+
+  private async readClaudeRestorePacketComposer(
+    session: string,
+    packet: string,
+  ): Promise<"clear" | "staged" | "unverified"> {
+    let pane: string | null;
+    try {
+      // The predecessor's retained scrollback can still contain a Claude
+      // composer. Only the visible screen is evidence about this successor.
+      pane = await this.tmuxAdapter.capturePaneScreen(session);
+    } catch {
+      return "unverified";
+    }
+    const staged = inspectStartupStagedText(pane, packet, "claude-code");
+    if (staged === "clear") return "clear";
+    if (staged === "staged" || startupOwnCollapsedPaste(pane, packet, "claude-code")) return "staged";
+    return "unverified";
   }
 
   private checkRuntimeMismatch(nodeRuntime: string | null, discoveredRuntime: string): SeatHandoverResult | null {

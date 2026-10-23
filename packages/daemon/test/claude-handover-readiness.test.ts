@@ -134,12 +134,12 @@ describe("Claude fresh in-place handover readiness", () => {
   }
 
 
-  it.each(["classic-predecessor-history", "screen-without-predecessor-history", "new-runtime-already-ready", "stale-wrapper-screen-unavailable", "working-wrapper-screen-unavailable", "working-headerless-auto-proof", "working-headerless-auto-unavailable", "working-headerless-accept-edits-unavailable", "working-headerless-bypass-unavailable",
+  it.each(["classic-predecessor-history", "screen-without-predecessor-history", "new-runtime-already-ready", "stale-wrapper-screen-unavailable", "working-wrapper-screen-unavailable", "staged-packet-screen-unavailable", "unverifiable-packet-screen-unavailable", "working-headerless-auto-proof", "working-headerless-auto-unavailable", "working-headerless-accept-edits-unavailable", "working-headerless-bypass-unavailable",
     ...["shell", "script"].flatMap(process => ["prompt", "command"].flatMap(frame =>
       ["readable", "unreadable"].map(listing => `classic-chevron-${process}-${frame}-${listing}`))),
   ])("1544 %s", async mode => {
     const { node } = seedSeat({ runtime: "claude-code" });
-    let elapsed = 0, requested = false, packetPasted = false;
+    let elapsed = 0, requested = false, packetPasted = false, packetText = "", packetEnterCount = 0;
     const chevron = mode.startsWith("classic-chevron-");
     const script = chevron && mode.includes("-script-");
     const unreadable = chevron && mode.endsWith("-unreadable");
@@ -155,18 +155,48 @@ describe("Claude fresh in-place handover readiness", () => {
     const headerlessFrame = auto ? autoFrame : autoFrame.replace("auto mode on", bypass ? "bypass permissions on" : "accept edits on");
     const oldFrame = "Claude Code v2.1.303\n❯ predecessor finished turn\n  ⏵⏵ accept edits on (shift+tab to cycle)";
     const freshFrame = "Claude Code v2.1.303\n❯ \n  ⏵⏵ accept edits on (shift+tab to cycle)";
+    const emptyComposerFrame = "Claude Code v2.1.303\n❯ \n────────────────────\n  ⏵⏵ accept edits on (shift+tab to cycle)";
     const trace: unknown[] = [];
-    const pane = () => headerless ? identicalFrame + "\n" + headerlessFrame : unavailable ? identicalFrame : requested && elapsed >= nativeAt ? freshFrame
+    const stagedPacketMode = mode === "staged-packet-screen-unavailable";
+    const pane = () => headerless ? identicalFrame + "\n" + headerlessFrame : unavailable ? identicalFrame
+      : stagedPacketMode && requested && elapsed < nativeAt ? oldFrame + "\n" + shellPrompt : requested && elapsed >= nativeAt ? freshFrame
       : mode === "classic-predecessor-history" || chevron ? oldFrame + "\n" + shellPrompt : shellPrompt;
     getPaneCommand.mockImplementation(async () => (unavailable || headerless) && requested ? "sh" : requested && elapsed >= nativeAt ? "claude" : requested && script ? "sh" : "zsh");
     capturePaneScreen.mockImplementation(async (target: string) => {
-      const returnedPane = unavailable ? null : headerless ? headerlessFrame : requested && elapsed < nativeAt ? shellPrompt : pane();
+      let returnedPane: string | null;
+      if (mode === "unverifiable-packet-screen-unavailable" && packetPasted && packetEnterCount > 0) {
+        returnedPane = null;
+      } else if (stagedPacketMode && packetPasted && packetEnterCount > 0) {
+        if (!requested || elapsed < nativeAt) returnedPane = null;
+        else if (packetEnterCount === 1) returnedPane = `Claude Code v2.1.303\n❯ [Pasted text #1 +${packetText.split("\n").length - 1} lines]\n────────────────────\n  paste again to expand`;
+        else returnedPane = emptyComposerFrame;
+      } else if (packetPasted && packetEnterCount > 0) {
+        returnedPane = emptyComposerFrame;
+      } else if (stagedPacketMode && requested && elapsed < nativeAt) {
+        returnedPane = null;
+      } else {
+        returnedPane = unavailable ? null : headerless ? headerlessFrame : requested && elapsed < nativeAt ? shellPrompt : pane();
+      }
       trace.push({ kind: "current-frame", target, elapsed, returnedPane });
       return returnedPane;
     });
     const capturePaneContent = vi.fn(async (_session: string, lines: number) => {
-      trace.push({ kind: "history", elapsed, lines, returnedPane: pane() });
-      return pane();
+      let returnedPane = pane();
+      if (packetPasted && packetEnterCount > 0) {
+        if (mode === "staged-packet-screen-unavailable") {
+          if (requested && elapsed >= nativeAt) {
+            returnedPane = packetEnterCount === 1
+              ? `Claude Code v2.1.303\n❯ [Pasted text #1 +${packetText.split("\n").length - 1} lines]\n────────────────────\n  paste again to expand`
+              : emptyComposerFrame;
+          } else {
+            returnedPane = shellPrompt;
+          }
+        } else {
+          returnedPane = emptyComposerFrame;
+        }
+      }
+      trace.push({ kind: "history", elapsed, lines, returnedPane });
+      return returnedPane;
     });
     const target = { ...tmux(), capturePaneContent, getPanePid: vi.fn(async () => 100),
       sendShellCommand: async (session: string, text: string) => sendText(session, text) } as unknown as TmuxAdapter;
@@ -213,10 +243,12 @@ describe("Claude fresh in-place handover readiness", () => {
         return { ok: true };
       }
       packetPasted = true;
+      packetText = text;
       trace.push({ kind: "packet-paste", session, elapsed, successorRuntimeStarted: requested && elapsed >= nativeAt, text });
       return { ok: true };
     });
     sendKeys.mockImplementation(async (session: string, keys: string[]) => {
+      if (packetPasted && keys.includes("Enter")) packetEnterCount++;
       trace.push({ kind: packetPasted ? "input" : "launch-input", session, elapsed, successorRuntimeStarted: requested && elapsed >= nativeAt, keys });
       return { ok: true };
     });
@@ -232,6 +264,15 @@ describe("Claude fresh in-place handover readiness", () => {
     const sessions = db.prepare("SELECT session_name,status,resume_token,startup_status FROM sessions ORDER BY id").all();
     observations.push({ mode, result, trace, reads, listProcessesCalls: listProcesses.mock.calls.length,
       sessions, respawn: respawnPane.mock.calls });
+    if (mode === "unverifiable-packet-screen-unavailable") {
+      if (result.ok) throw new Error("expected the unverified Claude packet handover to fail");
+      expect(result.code).toBe("context_delivery_failed");
+      expect(result.message).toContain("could not confirm the restore packet left Claude's input box");
+      expect(trace.filter((x: any) => x.kind === "input")).toHaveLength(1);
+      expect(trace.some((x: any) => x.kind === "history" && x.returnedPane === identicalFrame)).toBe(true);
+      expect(trace.some((x: any) => x.kind === "current-frame" && x.returnedPane === null)).toBe(true);
+      return;
+    }
     expect(result.ok).toBe(true);
     expect(reads.length).toBeGreaterThan(0);
     const first = reads[0] as any;
@@ -268,6 +309,12 @@ describe("Claude fresh in-place handover readiness", () => {
       expect((reads.at(-1) as any).result.ready).toBe(true);
     }
     expect(trace.find((x: any) => x.kind === "launch-intent")).toMatchObject({ opts: { freshInPlace: true } });
+    if (mode === "staged-packet-screen-unavailable") {
+      const packetInputs = trace.filter((x: any) => x.kind === "input");
+      expect(packetInputs).toHaveLength(2);
+      expect(packetInputs.map((x: any) => x.successorRuntimeStarted)).toEqual([false, true]);
+      expect(result).toMatchObject({ ok: true, result: { sideEffects: { startupContextDelivered: true } } });
+    }
     expect(respawnPane).toHaveBeenCalled();
     expect(killSession).not.toHaveBeenCalled();
 
