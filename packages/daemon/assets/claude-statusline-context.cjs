@@ -7,6 +7,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { randomUUID } = require("node:crypto");
 
 const outputTarget = process.argv[2];
 const providerUsageTarget = process.argv[3];
@@ -114,7 +115,7 @@ function unixSecondsToIso(value) {
 }
 
 function writeJsonAtomic(outputPath, value) {
-  const tmpPath = outputPath + ".tmp";
+  const tmpPath = outputPath + ".tmp-" + randomUUID();
   const dir = path.dirname(outputPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
