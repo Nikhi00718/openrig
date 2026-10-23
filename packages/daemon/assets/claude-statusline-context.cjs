@@ -120,6 +120,15 @@ function writeJsonAtomic(outputPath, value) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
-  fs.writeFileSync(tmpPath, JSON.stringify(value), "utf-8");
-  fs.renameSync(tmpPath, outputPath);
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(value), "utf-8");
+    fs.renameSync(tmpPath, outputPath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // Keep the original write or rename error.
+    }
+    throw error;
+  }
 }

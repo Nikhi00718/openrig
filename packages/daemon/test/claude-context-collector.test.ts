@@ -134,6 +134,22 @@ describe("Claude Status Line Collector Script", () => {
     expect(existsSync(outputPath + ".tmp")).toBe(false);
   });
 
+  it("cleans up its staged file when rename fails on repeated refreshes", () => {
+    const outputPath = join(tmpDir, "context", "blocked.json");
+    mkdirSync(outputPath, { recursive: true });
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = spawnSync("node", [collectorPath, outputPath], {
+        encoding: "utf-8",
+        input: VALID_STATUS_LINE,
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("failed to collect Claude context status line");
+      expect(readdirSync(join(tmpDir, "context")).filter((name) => name.startsWith("blocked.json.tmp-"))).toEqual([]);
+    }
+  });
+
   // T3: Malformed stdin — graceful exit, no output
   it("handles malformed stdin gracefully — no output file created", () => {
     const outputPath = join(tmpDir, "context", "bad.json");
