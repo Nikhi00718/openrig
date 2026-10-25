@@ -222,6 +222,25 @@ describe("artifactPoolReadyPolicy (POC contract)", () => {
     expect(out.message).not.toContain("malformed.md");
   });
 
+  it.each(["\n", "\r\n"])("waits for an unfinished frontmatter block to close (%j)", async (newline) => {
+    const file = join(tmp, "draft.md");
+    const partial = ["---", "status: ready", ""].join(newline);
+    writeFileSync(file, partial);
+    const job = makeJob({ context: { pools: [{ path: tmp }] } });
+    expect(await artifactPoolReadyPolicy.evaluate(job)).toEqual({ action: "skip", reason: "no_actionable_artifacts" });
+
+    const optedIn = makeJob({ context: { pools: [{ path: tmp, include_malformed_frontmatter: true }] } });
+    expect((await artifactPoolReadyPolicy.evaluate(optedIn)).action).toBe("send");
+
+    writeFileSync(file, `${partial}---`);
+    expect((await artifactPoolReadyPolicy.evaluate(job)).action).toBe("send");
+  });
+
+  it("still accepts artifacts without frontmatter", async () => {
+    writeFileSync(join(tmp, "plain.md"), "# Finished artifact\nBody\n");
+    expect((await artifactPoolReadyPolicy.evaluate(makeJob({ context: { pools: [{ path: tmp }] } }))).action).toBe("send");
+  });
+
   // R2 fix (guard blocker 2): valid YAML scalars containing colons
   // (ISO timestamps, URLs) MUST parse cleanly via the `yaml` package
   // and the artifact MUST be included. The R1 local parser excluded

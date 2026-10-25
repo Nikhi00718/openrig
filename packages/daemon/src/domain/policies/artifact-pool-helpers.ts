@@ -92,7 +92,7 @@ function readFrontmatter(filePath: string): {
   }
   const close = /\n---(?:\n|$)/.exec(text.slice(FRONTMATTER_OPEN.length - 1));
   if (!close) {
-    return { raw, frontmatter: {}, frontmatter_parse_error: null };
+    return { raw, frontmatter: {}, frontmatter_parse_error: "frontmatter closing delimiter is missing" };
   }
   const block = text.slice(FRONTMATTER_OPEN.length, FRONTMATTER_OPEN.length - 1 + close.index);
   let parsed: unknown;
