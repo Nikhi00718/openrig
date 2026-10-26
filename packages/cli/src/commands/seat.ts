@@ -160,6 +160,8 @@ interface SeatHandoverMutationResult {
   sourceOutcome?:
     | { mode: "fork"; forkedFrom: string; forkId?: "captured" | "pending"; limit?: string }
     | { mode: "rebuild"; primedArtifacts: Array<{ address: string; label: string }>; gaps: string[]; emptyChainReason?: string; permissions?: { state: string; detail: string } };
+  /** The restore packet was pasted and Enter pressed, but its submission couldn't be confirmed. */
+  restorePacket?: { status: "unconfirmed"; reason: string };
   sideEffects: {
     departingSessionKilled: false;
     startupContextDelivered: boolean;
@@ -338,6 +340,11 @@ function printHumanHandoverResult(result: SeatHandoverMutationResult): void {
       // live successor agent.
       console.log("The captured startup context (restore packet) was delivered to the successor.");
     }
+    console.log("No conversation continuity, provenance markdown, or session stop was performed.");
+  } else if (result.restorePacket?.status === "unconfirmed") {
+    // The packet was pasted and Enter pressed: the successor may already be working on it, so don't send it again.
+    console.log(`The captured startup context (restore packet) was sent to the successor, but its submission is unconfirmed: ${result.restorePacket.reason}.`);
+    console.log("Check the successor's screen before sending the context again; it may already be working on it.");
     console.log("No conversation continuity, provenance markdown, or session stop was performed.");
   } else if (result.source.mode === "fork") {
     console.log("No packet delivery: fork context rides the native conversation itself.");

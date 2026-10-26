@@ -733,6 +733,27 @@ describe("rig seat status", () => {
     expect(output).not.toContain("No conversation continuity, startup context delivery,");
   });
 
+  it("handover fresh human output says an unconfirmed restore packet was sent, not that nothing was delivered", async () => {
+    const reason = "the input box could not be observed";
+    const deps = makeDeps({ status: 200, data: {
+      ...HANDOVER_RESULT_FRESH,
+      restorePacket: { status: "unconfirmed", reason },
+      sideEffects: { ...HANDOVER_RESULT_FRESH.sideEffects, startupContextDelivered: false },
+    } }, []);
+
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCommand(deps).parseAsync(["node", "rig", "seat", "handover", "dev-impl@seat-rig", "--source", "fresh", "--reason", "context-wall"]);
+    });
+
+    const output = logs.join("\n");
+    expect(exitCode).toBeUndefined(); // the handover still succeeded
+    expect(output).toContain("Seat handover complete: dev-impl@seat-rig");
+    expect(output).toContain(`its submission is unconfirmed: ${reason}.`);
+    expect(output).toContain("Check the successor's screen before sending the context again");
+    expect(output).not.toContain("No conversation continuity, startup context delivery,");
+    expect(output).not.toContain("restore packet) was delivered");
+  });
+
   it("handover surfaces a loud step-named failure (successor_create_failed)", async () => {
     const deps = makeDeps({
       status: 500,
