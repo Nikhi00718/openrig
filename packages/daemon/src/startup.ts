@@ -2004,6 +2004,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       // OPR.0.4.4.22 FR-2: the agent state glyph reads recorded hook
       // activity (honest-unknown when absent) - synchronous, never polls.
       activityStore: agentActivityStore,
+      // NEEDS YOU and the AGENTS roster tell people from shared channels as the queue does.
+      participants: {
+        isPerson: (address) => queueRepoInstance.isPersonAddress(address),
+        isSharedChannel: (address) => queueRepoInstance.isSharedChannel(address),
+      },
     });
   }
 

@@ -24,6 +24,8 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
 import { SliceIndexer } from "../src/domain/slices/slice-indexer.js";
 import { ReviewGatherer } from "../src/domain/review/gather.js";
+import { QueueRepository } from "../src/domain/queue-repository.js";
+import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { reviewRoutes } from "../src/routes/review.js";
 import {
   makeFixtureWorkspace,
@@ -423,20 +425,45 @@ describe("GET /api/review/rig (OPR.0.4.4.22)", () => {
     expect(body.agents.rows.some((r: { sessionName: string }) => r.sessionName === "human-review@kernel")).toBe(false);
   });
 
-  it("keeps an ask to and a park on a person's own <id>@external address in NEEDS YOU, never as an AGENTS row", async () => {
+  it("keeps asks to and parks on a person in NEEDS YOU, and never a shared channel's row", async () => {
+    // The production wiring: the queue's own person and shared-channel facts.
+    const queueDb = createDb();
+    migrate(queueDb, ALL_MIGRATIONS);
+    const sarah = { entityId: "sarah", class: "human" as const, displayName: "Sarah", address: "sarah@external",
+      connectorBindings: [{ kind: "slack" as const, connectorRef: "primary", secretsRef: "env:SLACK_BOT_TOKEN", role: "primary" as const, handle: "USARAH" }],
+      prefs: { deliveryClass: "A" as const } };
+    const queue = new QueueRepository(queueDb, new EventBus(queueDb), { validateRig: () => true,
+      loadHumanRegistry: () => ({ ok: true, entities: [sarah] }), sharedChannels: () => [{ address: "support@external" }] });
+    const gatherer = new ReviewGatherer({ db, indexer: new SliceIndexer({ slicesRoot: ws.root, additionalSliceRoots: [], dogfoodEvidenceRoot: null, db }),
+      gitRepoPath: null, now: () => NOW,
+      participants: { isPerson: (a) => queue.isPersonAddress(a), isSharedChannel: (a) => queue.isSharedChannel(a) } });
+    const people = new Hono();
+    people.use("*", async (c, next) => { c.set("reviewGatherer" as never, gatherer); await next(); });
+    people.route("/api/review", reviewRoutes());
+
     insert({ id: "q-ask", dest: "sarah@external", tags: ["slice:20-x"], summary: "approve the demo", state: "pending" });
     insert({ id: "q-park", dest: "planner@r", state: "blocked", tags: ["slice:20-x"], summary: "waiting on sarah" });
-    db.prepare("UPDATE queue_items SET blocked_on = 'sarah@external' WHERE qitem_id = 'q-park'").run();
+    db.prepare("UPDATE queue_items SET blocked_on = 'sarah@host' WHERE qitem_id = 'q-park'").run(); // a registered alias
+    insert({ id: "q-channel", dest: "support@external", tags: ["slice:20-x"], summary: "release notes posted", state: "pending" });
+    insert({ id: "q-channel-park", dest: "writer@r", state: "blocked", tags: ["slice:20-x"], summary: "waiting on the channel" });
+    db.prepare("UPDATE queue_items SET blocked_on = 'support@external' WHERE qitem_id = 'q-channel-park'").run();
     insert({ id: "q-gate", dest: "qa@r", state: "blocked", tags: ["slice:20-x"], summary: "waiting on the external gate" });
     db.prepare("UPDATE queue_items SET blocked_on = 'external:qa-pass' WHERE qitem_id = 'q-gate'").run();
+    insert({ id: "q-legacy", dest: "human-review@kernel", tags: ["slice:20-x"], summary: "approve the cut", state: "pending" });
 
-    const body = await (await app.request("/api/review/rig")).json();
+    const body = await (await people.request("/api/review/rig")).json();
     const needs = body.needsYou.items.map((i: { qitemId: string | null; leg?: string }) => [i.qitemId, i.leg]);
-    expect(needs).toEqual(expect.arrayContaining([["q-ask", "human-routed"], ["q-park", "park-on-human"]]));
-    expect(needs.some(([id]: [string]) => id === "q-gate")).toBe(false); // a typed external: gate is not a person
+    expect(needs).toEqual(expect.arrayContaining([["q-ask", "human-routed"], ["q-park", "park-on-human"], ["q-legacy", "human-routed"]]));
+    // A shared channel takes correspondence; a typed external: gate is not a person.
+    for (const id of ["q-channel", "q-channel-park", "q-gate"]) expect(needs.some(([needed]: [string]) => needed === id)).toBe(false);
     const sessions = body.agents.rows.map((r: { sessionName: string }) => r.sessionName);
-    expect(sessions).not.toContain("sarah@external");
-    expect(sessions).toEqual(expect.arrayContaining(["planner@r", "qa@r"]));
+    for (const address of ["sarah@external", "support@external", "human-review@kernel"]) expect(sessions).not.toContain(address);
+    expect(sessions).toEqual(expect.arrayContaining(["planner@r", "writer@r", "qa@r"]));
+
+    writeFixtureSlice(ws, "release-t", "20-x", { intent: "i", prd: false });
+    const slice = await (await people.request("/api/review/slice/20-x")).json();
+    expect(slice.needsYou.items.map((i: { qitemId: string | null }) => i.qitemId).sort()).toEqual(["q-ask", "q-legacy", "q-park"]);
+    queueDb.close();
   });
 
   it("recently-holding: an agent whose slice-tagged item closed TODAY appears with 'no tracked work item'", async () => {
