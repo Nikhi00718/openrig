@@ -423,6 +423,22 @@ describe("GET /api/review/rig (OPR.0.4.4.22)", () => {
     expect(body.agents.rows.some((r: { sessionName: string }) => r.sessionName === "human-review@kernel")).toBe(false);
   });
 
+  it("keeps an ask to and a park on a person's own <id>@external address in NEEDS YOU, never as an AGENTS row", async () => {
+    insert({ id: "q-ask", dest: "sarah@external", tags: ["slice:20-x"], summary: "approve the demo", state: "pending" });
+    insert({ id: "q-park", dest: "planner@r", state: "blocked", tags: ["slice:20-x"], summary: "waiting on sarah" });
+    db.prepare("UPDATE queue_items SET blocked_on = 'sarah@external' WHERE qitem_id = 'q-park'").run();
+    insert({ id: "q-gate", dest: "qa@r", state: "blocked", tags: ["slice:20-x"], summary: "waiting on the external gate" });
+    db.prepare("UPDATE queue_items SET blocked_on = 'external:qa-pass' WHERE qitem_id = 'q-gate'").run();
+
+    const body = await (await app.request("/api/review/rig")).json();
+    const needs = body.needsYou.items.map((i: { qitemId: string | null; leg?: string }) => [i.qitemId, i.leg]);
+    expect(needs).toEqual(expect.arrayContaining([["q-ask", "human-routed"], ["q-park", "park-on-human"]]));
+    expect(needs.some(([id]: [string]) => id === "q-gate")).toBe(false); // a typed external: gate is not a person
+    const sessions = body.agents.rows.map((r: { sessionName: string }) => r.sessionName);
+    expect(sessions).not.toContain("sarah@external");
+    expect(sessions).toEqual(expect.arrayContaining(["planner@r", "qa@r"]));
+  });
+
   it("recently-holding: an agent whose slice-tagged item closed TODAY appears with 'no tracked work item'", async () => {
     insert({ id: "q-closed", dest: "qa1@r", state: "done", tags: ["slice:20-x"], summary: "done work", tsUpdated: NOW });
     const res = await app.request("/api/review/rig");

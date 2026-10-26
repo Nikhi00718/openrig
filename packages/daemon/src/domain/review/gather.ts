@@ -14,7 +14,7 @@ import { execFileSync } from "node:child_process";
 import YAML from "yaml";
 import { findFrontmatterBlock } from "../frontmatter.js";
 import type Database from "better-sqlite3";
-import { sessionMemberLabel } from "../session-name.js";
+import { isHumanSeatSessionRef, sessionMemberLabel } from "../session-name.js";
 import type { SliceIndexer, SliceRecord } from "../slices/slice-indexer.js";
 import { parseScopeTags } from "../slices/qitem-membership.js";
 import {
@@ -40,7 +40,6 @@ import { readSliceReadiness, readMissionReadiness } from "../proof/judgments.js"
 import { readProofArtifacts } from "./proof-io.js";
 import { evaluateStepDeadline } from "../workflow-deadline.js";
 import type { AgentActivityStore } from "../agent-activity-store.js";
-import { isHumanSeatSession } from "../human-route-enforcer.js";
 import { resolveNodeFileVia } from "../scope/node-file.js";
 
 export interface ReviewGathererDeps {
@@ -452,8 +451,7 @@ export class ReviewGatherer {
             ? {
                 qitemId: item.qitem_id,
                 destinationSession: item.destination_session,
-                humanRouted:
-                  item.tier === "human-gate" || /^human(?:-[A-Za-z0-9._-]+)?@(kernel|host)$/.test(item.destination_session),
+                humanRouted: item.tier === "human-gate" || isHumanSeatSessionRef(item.destination_session),
                 createdAtIso: item.ts_created,
                 summary: item.summary,
               }
@@ -498,8 +496,8 @@ export class ReviewGatherer {
          WHERE state IN (${ACTIVE_STATES.map(() => "?").join(",")})
            AND (${likeKeys.map(() => "tags LIKE ?").join(" OR ")})
            AND (tier = 'human-gate'
-                OR destination_session LIKE 'human%'
-                OR (state = 'blocked' AND blocked_on LIKE 'human%'))`,
+                OR destination_session LIKE 'human%' OR destination_session LIKE '%@external'
+                OR (state = 'blocked' AND (blocked_on LIKE 'human%' OR blocked_on LIKE '%@external')))`,
       )
       .all(...ACTIVE_STATES, ...likeKeys.map((key) => `%${key}%`)) as Array<QitemRow & { evidence_ref?: string | null }>;
     return rows
@@ -564,7 +562,7 @@ export class ReviewGatherer {
       .all(...ACTIVE_STATES) as QitemRow[];
     const bySession = new Map<string, { rows: QitemRow[]; slices: Set<string> }>();
     for (const r of rows) {
-      if (isHumanSeatSession(r.destination_session)) continue;
+      if (isHumanSeatSessionRef(r.destination_session)) continue;
       const scopes = parseScopeTags(r.tags);
       const rowSlices = [...scopes.slices];
       // Membership (canonical): a row belongs when it carries one of the
@@ -631,7 +629,7 @@ export class ReviewGatherer {
     const known = new Set(holders.map((h) => h.sessionName));
     const recent = new Map<string, { latest: QitemRow; slices: Set<string> }>();
     for (const r of rows) {
-      if (isHumanSeatSession(r.destination_session)) continue;
+      if (isHumanSeatSessionRef(r.destination_session)) continue;
       const owner = physicalSessionName(this.db, r.destination_session);
       if (known.has(owner)) continue;
       let tags: string[] = [];
@@ -726,8 +724,8 @@ export class ReviewGatherer {
          FROM queue_items
          WHERE state IN (${ACTIVE_STATES.map(() => "?").join(",")})
            AND (tier = 'human-gate'
-                OR destination_session LIKE 'human%'
-                OR (state = 'blocked' AND blocked_on LIKE 'human%'))`,
+                OR destination_session LIKE 'human%' OR destination_session LIKE '%@external'
+                OR (state = 'blocked' AND (blocked_on LIKE 'human%' OR blocked_on LIKE '%@external')))`,
       )
       .all(...ACTIVE_STATES) as Array<QitemRow & { evidence_ref?: string | null }>;
     return rows.map((r) => {
