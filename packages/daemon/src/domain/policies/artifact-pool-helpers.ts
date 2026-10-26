@@ -39,7 +39,9 @@ export interface ArtifactPoolSpec {
    * When true, artifacts whose frontmatter cannot be parsed are still
    * included with empty frontmatter. Default false: malformed frontmatter
    * causes the artifact to be excluded (matches POC behavior so that
-   * agents do not get woken about half-written drafts).
+   * agents do not get woken about half-written drafts). An opening `---`
+   * with no closing `---` line counts as malformed, including Markdown
+   * whose first line is a `---` horizontal rule; `true` still includes it.
    */
   include_malformed_frontmatter?: boolean;
 }

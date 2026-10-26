@@ -441,6 +441,39 @@ describe("edgeArtifactRequiredPolicy (POC contract)", () => {
     expect(out).toEqual({ action: "skip", reason: "no_missing_edge_artifacts" });
   });
 
+  it.each([
+    ["an unclosed header", "---\nstatus: draft\nReferences x here.\n"],
+    ["a horizontal rule first line", "---\n# Lifecycle\n\nReferences x here.\n"],
+    ["invalid YAML", "---\nstatus: [unclosed\n---\nReferences x here.\n"],
+  ])("a matching target with %s still satisfies the edge", async (_label, body) => {
+    writeFileSync(join(src, "x.md"), "---\nentry: x\nstatus: ready\n---\n");
+    writeFileSync(join(tgt, "x-down.md"), body);
+    const out = await edgeArtifactRequiredPolicy.evaluate(
+      makeJob({ target: { session: "a@rig" }, context: { source: { path: src, include_statuses: ["ready"] }, target: { path: tgt } } }),
+    );
+    expect(out).toEqual({ action: "skip", reason: "no_missing_edge_artifacts" });
+  });
+
+  it.each([
+    ["absent", null],
+    ["non-matching with an unclosed header", "---\nstatus: draft\nReferences y only.\n"],
+  ])("a target that's %s still requests the repair", async (_label, body) => {
+    writeFileSync(join(src, "x.md"), "---\nentry: x\nstatus: ready\n---\n");
+    if (body) writeFileSync(join(tgt, "y-down.md"), body);
+    const out = await edgeArtifactRequiredPolicy.evaluate(
+      makeJob({ target: { session: "a@rig" }, context: { source: { path: src, include_statuses: ["ready"] }, target: { path: tgt } } }),
+    );
+    expect(out.action).toBe("send");
+  });
+
+  it("a source with an unclosed header is still excluded", async () => {
+    writeFileSync(join(src, "x.md"), "---\nentry: x\nstatus: ready\n");
+    const out = await edgeArtifactRequiredPolicy.evaluate(
+      makeJob({ target: { session: "a@rig" }, context: { source: { path: src }, target: { path: tgt } } }),
+    );
+    expect(out).toEqual({ action: "skip", reason: "no_missing_edge_artifacts" });
+  });
+
   it("throws policy_spec_invalid when context.source is missing", async () => {
     try {
       await edgeArtifactRequiredPolicy.evaluate(
