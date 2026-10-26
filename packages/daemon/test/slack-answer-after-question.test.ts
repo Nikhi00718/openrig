@@ -181,6 +181,64 @@ describe("#822: replies answer only the current posted question", () => {
     expect(resolveNote(row.qitemId)).toBe("Yes, tag it.");
   });
 
+  // The person's own address, as their inbound row carries it: the row a seat parks back on its writer.
+  const parkOnRegisteredAddress = (qitemId: string) =>
+    repo.update({ qitemId, actorSession: "operator-agent@kernel", state: "blocked", blockedOn: human, transitionNote: "asked the person" });
+
+  it("a park on the person's registered address keeps early follow-ups as context", async () => {
+    await say(undefined, "1.1", "Can you check the build?");
+    const row = inboundRow("1.1")!;
+    parkOnRegisteredAddress(row.qitemId);
+    await say("1.1", "1.2", "Also, it's the release branch."); // before the question posts at all
+    expect(repo.getById(row.qitemId)?.state).toBe("blocked");
+    expect(resolveNote(row.qitemId)).toBeNull();
+    expect(inboundRow("1.2")).toMatchObject({ destinationSession: "operator-agent@kernel", replyTo: row.qitemId });
+
+    const park = latestPark(row.qitemId);
+    await sweep(row.qitemId);
+    const askedTs = field(receipts(row.qitemId).find((n) => n.includes(`notification_key=${episodeKey(row.qitemId, park.transitionId)}`))!, "message_ts")!;
+    await say("1.1", "1.3", "Written before the question appeared."); // Slack ts before the question's, delivered after its receipt
+    expect(Number("1.3")).toBeLessThan(Number(askedTs));
+    expect(repo.getById(row.qitemId)?.state).toBe("blocked");
+    expect(resolveNote(row.qitemId)).toBeNull();
+
+    await say("1.1", "30.1", "The release branch.");
+    await vi.waitFor(() => expect(repo.getById(row.qitemId)?.state).toBe("in-progress"));
+    expect(resolveNote(row.qitemId)).toBe("The release branch.");
+  });
+
+  it("a re-park on the person's registered address waits for its own question", async () => {
+    await say(undefined, "4.1", "Can you check the build?");
+    const row = inboundRow("4.1")!;
+    parkOnRegisteredAddress(row.qitemId);
+    await sweep(row.qitemId);
+    await say("4.1", "40.1", "The release branch.");
+    await vi.waitFor(() => expect(repo.getById(row.qitemId)?.state).toBe("in-progress"));
+    await sweep(row.qitemId);
+
+    parkOnRegisteredAddress(row.qitemId);
+    await say("4.1", "41.1", "One more thing about the build."); // before question 2 posts
+    expect(repo.getById(row.qitemId)?.state).toBe("blocked");
+    expect(resolveNote(row.qitemId)).toBe("The release branch.");
+    await sweep(row.qitemId);
+    await say("4.1", "42.1", "Yes, tag it.");
+    await vi.waitFor(() => expect(repo.getById(row.qitemId)?.state).toBe("in-progress"));
+    expect(resolveNote(row.qitemId)).toBe("Yes, tag it.");
+  });
+
+  it("keeps receipt/time uncertainty honest for a park on the person's registered address", async () => {
+    await say(undefined, "16.1", "Check this build.");
+    const row = inboundRow("16.1")!;
+    parkOnRegisteredAddress(row.qitemId);
+    const park = latestPark(row.qitemId);
+    repo.update({ qitemId: row.qitemId, actorSession: "daemon@kernel", transitionNote:
+      `slack-owner-notification-posted notification_key=${episodeKey(row.qitemId, park.transitionId)} kind=human-required message_ts=reconciled thread_ts=16.1` });
+    const contract = new MissionControlWriteContract({ db, eventBus: bus, queueRepo: repo, actionLog: new MissionControlActionLog(db) });
+    expect(await makeHumanReplyResolver(repo, contract, home)({ qitemId: row.qitemId, actorSession: human, decision: "Release.", messageTs: "30.1" }))
+      .toBe("resolved-uncertain");
+    expect(resolveNote(row.qitemId)).toContain("OpenRig timing context");
+  });
+
   it.each([
     { label: "missing reply time", posted: "11.1", messageTs: undefined, expected: "resolved-uncertain" },
     { label: "malformed reply time", posted: "11.1", messageTs: "later", expected: "resolved-uncertain" },
@@ -296,7 +354,7 @@ describe("#822: replies answer only the current posted question", () => {
     const key = episodeKey(row.qitemId, latestPark(row.qitemId).transitionId);
     repo.update({ qitemId: row.qitemId, actorSession: "daemon@kernel", transitionNote:
       `slack-owner-notification-posted notification_key=${key} kind=human-required message_ts=20.1 thread_ts=10.1 digest=legacy` });
-    await say("10.1", "15.1", "More context.");
+    await say("10.1", "4.1", "More context.");
     expect(repo.getById(row.qitemId)?.state).toBe("blocked");
     expect(posts).toHaveLength(0);
   });

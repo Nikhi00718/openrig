@@ -44,7 +44,6 @@ import { hasLiveHumanGate, isBlockerLive, type QueueRepository } from "../../que
 import { formatReplyToChoice, REPLY_TO_CHOICE_ACTOR, REPLY_TO_CHAIN_LIMIT, type ReplyToChoice } from "../../reply-to-choice.js";
 import { parseSessionName } from "../../session-name.js";
 import type { FetchImpl } from "./slack-api.js";
-import { isHumanSeatSession } from "../../human-route-enforcer.js";
 import { ownerNotificationLevelAtLeast } from "../../queue-transition-log.js";
 // OPR.0.5.6.1 — the delivery rules engine: ONE decision per message replaces
 // the two dial-reads (the S14 default-decision stub). The legacy dial path
@@ -110,7 +109,9 @@ export function makeHumanReplyResolver(
       return "resolved-uncertain";
     }
     let uncertain = false;
-    if (source?.state === "blocked" && isHumanSeatSession(source.blockedOn)) {
+    // A park on a person by any address (a registered person's own address, as their Slack rows carry it, or a
+    // legacy human seat) answers only from a reply written after its current question posted.
+    if (source?.state === "blocked" && source.blockedOn && queueRepo.isPersonAddress(source.blockedOn)) {
       const episode = queueRepo.transitionLog.listForQitem(input.qitemId)
         .filter((transition) => transition.ownerNotificationKind === "human-required").at(-1);
       if (!episode) return "not-applicable";
