@@ -87,8 +87,10 @@ interface ParticipantView {
   channel(address: string | null): boolean;
 }
 
-/** NEEDS YOU's rule: a human-gate tier, a row to a person, or a row parked on one. */
+/** NEEDS YOU's rule: a human-gate tier, a row to a person, or a row parked on one. A row sent to or parked on a shared
+ *  channel never is, whatever its tier: a channel takes correspondence, not decisions. */
 function needsPerson(view: ParticipantView, r: { tier: string | null; destination_session: string; state: string; blocked_on: string | null }): boolean {
+  if (view.channel(r.destination_session) || (r.state === "blocked" && view.channel(r.blocked_on))) return false;
   return r.tier === "human-gate" || view.person(r.destination_session) || (r.state === "blocked" && view.person(r.blocked_on));
 }
 

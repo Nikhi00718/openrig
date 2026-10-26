@@ -447,6 +447,10 @@ describe("GET /api/review/rig (OPR.0.4.4.22)", () => {
     insert({ id: "q-channel", dest: "support@external", tags: ["slice:20-x"], summary: "release notes posted", state: "pending" });
     insert({ id: "q-channel-park", dest: "writer@r", state: "blocked", tags: ["slice:20-x"], summary: "waiting on the channel" });
     db.prepare("UPDATE queue_items SET blocked_on = 'support@external' WHERE qitem_id = 'q-channel-park'").run();
+    // A human-gate tier doesn't make a channel's row a decision either.
+    insert({ id: "q-channel-gate", dest: "support@external", tags: ["slice:20-x"], summary: "post the cut", tier: "human-gate", state: "pending" });
+    insert({ id: "q-channel-gate-park", dest: "editor@r", state: "blocked", tags: ["slice:20-x"], summary: "waiting on the channel", tier: "human-gate" });
+    db.prepare("UPDATE queue_items SET blocked_on = 'support@external' WHERE qitem_id = 'q-channel-gate-park'").run();
     insert({ id: "q-gate", dest: "qa@r", state: "blocked", tags: ["slice:20-x"], summary: "waiting on the external gate" });
     db.prepare("UPDATE queue_items SET blocked_on = 'external:qa-pass' WHERE qitem_id = 'q-gate'").run();
     insert({ id: "q-legacy", dest: "human-review@kernel", tags: ["slice:20-x"], summary: "approve the cut", state: "pending" });
@@ -455,7 +459,7 @@ describe("GET /api/review/rig (OPR.0.4.4.22)", () => {
     const needs = body.needsYou.items.map((i: { qitemId: string | null; leg?: string }) => [i.qitemId, i.leg]);
     expect(needs).toEqual(expect.arrayContaining([["q-ask", "human-routed"], ["q-park", "park-on-human"], ["q-legacy", "human-routed"]]));
     // A shared channel takes correspondence; a typed external: gate is not a person.
-    for (const id of ["q-channel", "q-channel-park", "q-gate"]) expect(needs.some(([needed]: [string]) => needed === id)).toBe(false);
+    for (const id of ["q-channel", "q-channel-park", "q-channel-gate", "q-channel-gate-park", "q-gate"]) expect(needs.some(([needed]: [string]) => needed === id)).toBe(false);
     const sessions = body.agents.rows.map((r: { sessionName: string }) => r.sessionName);
     for (const address of ["sarah@external", "support@external", "human-review@kernel"]) expect(sessions).not.toContain(address);
     expect(sessions).toEqual(expect.arrayContaining(["planner@r", "writer@r", "qa@r"]));
