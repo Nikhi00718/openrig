@@ -831,6 +831,19 @@ describe("SeatHandoverService", () => {
     expect(binding.codexRebuildPermissions).toEqual(mode === null ? envelope : undefined);
   });
 
+  it("rebuild uses the seat's own envelope over the observed predecessor policy", async () => {
+    const { node } = seedSeat();
+    const own = { sandbox: "read-only", approval: "on-request" };
+    db.prepare("UPDATE nodes SET codex_permissions_json = ? WHERE id = ?").run(JSON.stringify(own), node.id);
+    currentCodexPermissions.mockResolvedValue({ state: "observed", envelope: { approvalPolicy: "never", sandboxPolicy: { type: "danger-full-access" } },
+      profile: null, processStartedAt: "Mon Apr 20 12:00:00 2026", observedAt: "2026-04-20T12:01:00Z" });
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", source: "rebuild", reason: "context wall" });
+    expect(result).toMatchObject({ ok: true, result: { sourceOutcome: { permissions: { state: "selection_used" } } } });
+    const binding = launchHarness.mock.calls[0]![0];
+    expect(binding.codexRebuildPermissions).toBeUndefined();
+    expect(binding.codexPermissions).toEqual(own);
+  });
+
   it.each(["observed", "unverified", "changed selection", "cleared selection", "profile change", "older selection"])(
     "rebuild permission result: %s", async state => {
       const { node } = seedSeat(state === "profile change" ? { codexConfigProfile: "next-profile" } : undefined);
@@ -903,7 +916,8 @@ describe("SeatHandoverService", () => {
     if (!result.ok || !("result" in result)) throw new Error("expected handover result");
     // The FR-3 derive-helper was reused; the token is persisted with provenance
     // "adoption" on the new claimed session, and never appears in the event log.
-    expect(captureCodexThreadId).toHaveBeenCalledWith("successor-session");
+    // The seat's node goes with it, so a seat with its own CODEX_HOME is searched there.
+    expect(captureCodexThreadId).toHaveBeenCalledWith("successor-session", { nodeId: node.id });
     const newSession = db.prepare(
       "SELECT resume_type, resume_token, resume_provenance FROM sessions WHERE node_id = ? AND session_name = ?"
     ).get(node.id, "successor-session") as Record<string, string | null>;
@@ -1346,9 +1360,12 @@ describe("SeatHandoverService", () => {
     });
   });
 
-  it("carries the persisted primary model and Advisor through handover to the successor", async () => {
-    seedSeat({ runtime: "claude-code", model: "claude-sonnet-5-5", advisor: "opus" });
+  it("carries the current rules, primary model and Advisor through handover to the successor", async () => {
+    const { node } = seedSeat({ runtime: "claude-code", model: "claude-sonnet-5-5", advisor: "opus" });
     capturePaneScreen.mockResolvedValue("Claude Code v2.1.303\n❯ \n────────────────────\n  ⏵⏵ accept edits on (shift+tab to cycle)");
+    const rules = { allow: [], deny: ["Read(./private/**)"] };
+    const writer = new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux() });
+    expect(await writer.setPermissions({ seatRef: "dev-impl@seat-rig", rules, actor: "operator@seat-rig", reason: "Set successor rules" })).toMatchObject({ ok: true });
     launchHarness.mockResolvedValue({ ok: true, resumeToken: "claude-successor", resumeType: "claude_id" });
     const claudeService = new SeatHandoverService({ db, rigRepo, sessionRegistry, discoveryRepo, eventBus,
       tmuxAdapter: tmux(), runtimeAdapters: { "claude-code": { runtime: "claude-code", launchHarness, checkReady } as unknown as RuntimeAdapter },
@@ -1358,7 +1375,7 @@ describe("SeatHandoverService", () => {
     });
     expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
     expect(launchHarness).toHaveBeenCalledTimes(1);
-    expect(launchHarness.mock.calls[0]![0]).toMatchObject({ model: "claude-sonnet-5-5", advisor: "opus" });
+    expect(launchHarness.mock.calls[0]![0]).toMatchObject({ nodeId: node.id, model: "claude-sonnet-5-5", advisor: "opus", claudePermissions: rules });
   });
 
   it("#75: an effort-pinned seat's handover launches the successor with that effort — the REAL lookupNode→createSuccessor→launchHarness path", async () => {

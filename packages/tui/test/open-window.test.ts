@@ -1,15 +1,15 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openTerminalInWindow, terminalWindowNotice, viewerHerdrEnv } from "../src/terminals/open-window.js";
+import { inCmux, inRex, openTerminalInWindow, terminalWindowNotice, viewerTerminalEnv, windowProvider } from "../src/terminals/open-window.js";
 import { createViewState } from "../src/state.js";
 import { demoSnapshot } from "../src/demo-data.js";
 import { parseCommand } from "../src/grammar.js";
 import { renderScreen } from "../src/render.js";
 import { hydrateSnapshot } from "../src/hydrate.js";
-import { terminalLines } from "../src/terminals/terminal-model.js";
+import { readTerminals, terminalLines } from "../src/terminals/terminal-model.js";
 import type { DaemonClient } from "../src/daemon-client.js";
 
 // Keep the prior implementation callable: it ignores the optional recovery hook.
@@ -17,6 +17,9 @@ const openWithRecovery: (view: string, endpoint: string, entry?: string, plan?: 
 
 const roots: string[] = [];
 const spawned: ChildProcess[] = [];
+// A test run inside cmux would otherwise open through cmux.
+const cmuxKeys = ["CMUX_SOCKET_PATH", "CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID"];
+beforeEach(() => { for (const key of cmuxKeys) vi.stubEnv(key, ""); });
 afterEach(() => {
   vi.unstubAllEnvs();
   for (const proc of spawned.splice(0)) proc.kill();
@@ -157,7 +160,9 @@ describe("TUI desktop terminal action", () => {
 });
 
 const viewerMarkers = { TERM_PROGRAM: "herdr", HERDR_ENV: "1", HERDR_PANE_ID: "p-viewer", HERDR_SOCKET_PATH: "/run/viewer/herdr.sock" };
-const herdrKeys = ["TERM_PROGRAM", "HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_SESSION"];
+const rexMarkers = { TERM_PROGRAM: "rex", REX_SESSION: "session:viewer", REX_BLOCK: "block:viewer", REX_SERVER: "unix:///viewer/rex.sock", REX_BIN_DIR: "/viewer/rex" };
+const cmuxMarkers = { CMUX_SOCKET_PATH: "/tmp/cmux-fixture.sock", CMUX_SURFACE_ID: "surface-1", CMUX_WORKSPACE_ID: "workspace-1" };
+const herdrKeys = ["TERM_PROGRAM", "HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_SESSION", "REX_SESSION", "REX_BLOCK", "REX_SERVER", "REX_BIN_DIR"];
 
 describe("TUI terminal action, viewed from a Herdr pane", () => {
   // The inert CLI reports the Herdr-related environment it was started with.
@@ -189,6 +194,49 @@ console.log(${JSON.stringify(JSON.stringify(opened))});`);
     expect(f.seen()).toEqual({ TERM_PROGRAM: "tmux" });
   });
 
+  it("hands the child a Rex viewer's markers, so it opens in that Rex", async () => {
+    ownEnv({ TERM_PROGRAM: "tmux", REX_SERVER: "unix:///daemon/rex.sock" });
+    const f = envChild();
+    await openTerminalInWindow("saved:kernel", "http://localhost:7433", f.entry, undefined, undefined, async () => rexMarkers);
+    expect(f.seen()).toEqual(rexMarkers);
+  });
+
+  it("keeps its own Rex markers and never looks for a viewer", async () => {
+    ownEnv({ TERM_PROGRAM: "rex", REX_SESSION: "session:own", REX_BLOCK: "block:own", REX_SERVER: "unix:///own/rex.sock" });
+    const f = envChild();
+    const viewer = vi.fn(async () => viewerMarkers);
+    await openTerminalInWindow("saved:kernel", "http://localhost:7433", f.entry, undefined, undefined, viewer);
+    expect(viewer).not.toHaveBeenCalled();
+    expect(f.seen()).toEqual({ TERM_PROGRAM: "rex", REX_SESSION: "session:own", REX_BLOCK: "block:own", REX_SERVER: "unix:///own/rex.sock" });
+  });
+
+  it.each([
+    ["inside Rex", { TERM_PROGRAM: "rex" }, undefined, "rex"],
+    ["in a tmux inside a Rex block", { TERM_PROGRAM: "tmux", REX_SESSION: "s", REX_BLOCK: "b", REX_SERVER: "x" }, undefined, "rex"],
+    ["viewed from Rex", { TERM_PROGRAM: "tmux" }, rexMarkers, "rex"],
+    ["viewed from Herdr", { TERM_PROGRAM: "tmux" }, viewerMarkers, "herdr"],
+    ["inside Herdr, whatever views it", { TERM_PROGRAM: "herdr", REX_SESSION: "s", REX_BLOCK: "b", REX_SERVER: "x" }, rexMarkers, "herdr"],
+    ["with no viewer", { TERM_PROGRAM: "tmux", REX_SERVER: "x" }, undefined, "herdr"],
+    ["inside cmux, whatever views it", { TERM_PROGRAM: "ghostty", ...cmuxMarkers }, viewerMarkers, "cmux"],
+    ["in a Herdr pane inside cmux", { ...cmuxMarkers, ...viewerMarkers }, undefined, "herdr"],
+    ["in Rex inside cmux", { ...cmuxMarkers, TERM_PROGRAM: "rex" }, undefined, "rex"],
+    ["with only cmux's workspace id, as the daemon's tmux keeps it", { TERM_PROGRAM: "tmux", CMUX_WORKSPACE_ID: "w" }, undefined, "herdr"],
+  ] as const)("previews with the provider the window opener picks %s", async (_name, env, viewed, provider) => {
+    ownEnv(env);
+    expect(await windowProvider(async () => viewed)).toBe(provider);
+    const previewed: string[] = [];
+    const client = { baseUrl: "http://localhost:7433", terminalViews: async () => ({ saved: [], rigs: [] }),
+      previewTerminal: async (_view: string, selected: string) => { previewed.push(selected); return null; } } as unknown as DaemonClient;
+    await readTerminals(client, "saved:kernel", () => windowProvider(async () => viewed));
+    expect(previewed).toEqual([provider]);
+  });
+
+  it("reads Rex's markers as the CLI does", () => {
+    expect(inRex({ TERM_PROGRAM: "tmux", REX_SESSION: "s", REX_BLOCK: "b" })).toBe(false);
+    expect(inRex({ TERM_PROGRAM: "tmux", REX_SESSION: "s", REX_BLOCK: "b", REX_SERVER: "x", HERDR_ENV: "1", HERDR_PANE_ID: "p", HERDR_SOCKET_PATH: "/h" })).toBe(false);
+    expect(inRex({ TERM_PROGRAM: "rex", HERDR_ENV: "1", HERDR_PANE_ID: "p", HERDR_SOCKET_PATH: "/h" })).toBe(false);
+  });
+
   it("keeps its own Herdr markers and never looks for a viewer", async () => {
     ownEnv({ TERM_PROGRAM: "herdr", HERDR_ENV: "1", HERDR_PANE_ID: "p-own", HERDR_SOCKET_PATH: "/run/own/herdr.sock" });
     const f = envChild();
@@ -196,6 +244,46 @@ console.log(${JSON.stringify(JSON.stringify(opened))});`);
     await openTerminalInWindow("saved:kernel", "http://localhost:7433", f.entry, undefined, undefined, viewer);
     expect(viewer).not.toHaveBeenCalled();
     expect(f.seen()).toMatchObject({ HERDR_PANE_ID: "p-own", HERDR_SOCKET_PATH: "/run/own/herdr.sock" });
+  });
+
+  it("inside cmux, opens in cmux as rig terminal open --provider cmux does, without --window or a viewer", async () => {
+    ownEnv({ TERM_PROGRAM: "ghostty", ...cmuxMarkers });
+    const inCmuxOpen = { ...opened, provider: "cmux" };
+    const f = child(inCmuxOpen);
+    const viewer = vi.fn(async () => viewerMarkers);
+    expect(await openTerminalInWindow("saved:kernel", "http://selected.example:7439", f.entry, "cmux-plan", undefined, viewer)).toEqual(inCmuxOpen);
+    expect(viewer).not.toHaveBeenCalled();
+    expect(f.calls()).toEqual([{ url: "http://selected.example:7439",
+      args: ["terminal", "open", "--provider", "cmux", "--json", "--expected-plan", "cmux-plan", "--", "saved:kernel"] }]);
+  });
+
+  it("keeps a failed cmux open's attach commands and names cmux's socket setting, without the window recovery or a retry", async () => {
+    ownEnv({ TERM_PROGRAM: "ghostty", ...cmuxMarkers });
+    const f = child({ provider: "cmux", ok: false, opened: [], absent: [], degraded: [], pages: 0, code: "cmux_unavailable",
+      error: "cmux is not connected — install cmux from https://cmux.io and run: cmux ping",
+      notes: ["In a new terminal on the daemon's host, attach directly using one of these commands:", "operator: env -u TMUX tmux attach -t '=operator@kernel'"] }, 1);
+    let recoveries = 0;
+    await expect(openTerminalInWindow("saved:kernel", "http://localhost:7433", f.entry, undefined, () => { recoveries++; }))
+      .rejects.toThrow(/cmux is not connected[\s\S]*"Automation mode" for Socket Control Mode[\s\S]*rig doctor[\s\S]*operator: env -u TMUX tmux attach/);
+    expect(recoveries).toBe(0);
+    expect(f.calls()).toHaveLength(1);
+    expect(f.calls()[0].args.slice(0, 4)).toEqual(["terminal", "open", "--provider", "cmux"]);
+  });
+
+  it("adds the socket setting only for cmux_unavailable", async () => {
+    ownEnv({ TERM_PROGRAM: "ghostty", ...cmuxMarkers });
+    const f = child({ provider: "cmux", ok: false, opened: [], absent: [], degraded: [], pages: 0, code: "preview_changed",
+      error: "View membership, layout or provider session changed. Refresh the preview before Open; nothing was launched." }, 1);
+    const failure = await openTerminalInWindow("saved:kernel", "http://localhost:7433", f.entry, "stale-plan").catch((error: Error) => error);
+    expect(String(failure)).toContain("Refresh the preview");
+    expect(String(failure)).not.toContain("Socket Control Mode");
+  });
+
+  it("reads cmux's markers only with its socket and surface, and not inside Herdr or Rex", () => {
+    expect(inCmux(cmuxMarkers)).toBe(true);
+    expect(inCmux({ CMUX_SURFACE_ID: "s", CMUX_WORKSPACE_ID: "w" })).toBe(false);
+    expect(inCmux({ ...cmuxMarkers, TERM_PROGRAM: "herdr" })).toBe(false);
+    expect(inCmux({ ...cmuxMarkers, REX_SESSION: "s", REX_BLOCK: "b", REX_SERVER: "x" })).toBe(false);
   });
 });
 
@@ -220,12 +308,12 @@ describe.skipIf(process.platform !== "linux")("the viewer's Herdr markers, read 
 
   it("returns only the Herdr markers of a single attached client", async () => {
     tmuxListing([10, inHerdrProcess()]);
-    expect(await viewerHerdrEnv()).toEqual(viewerMarkers);
+    expect(await viewerTerminalEnv()).toEqual(viewerMarkers);
   });
 
   it("uses the client that was active last", async () => {
     tmuxListing([10, inHerdrProcess({ HERDR_PANE_ID: "p-old" })], [11, inHerdrProcess({ HERDR_PANE_ID: "p-new" })]);
-    expect(await viewerHerdrEnv()).toMatchObject({ HERDR_PANE_ID: "p-new" });
+    expect(await viewerTerminalEnv()).toMatchObject({ HERDR_PANE_ID: "p-new" });
   });
 
   it.each([
@@ -235,23 +323,23 @@ describe.skipIf(process.platform !== "linux")("the viewer's Herdr markers, read 
     ["no client", () => tmuxListing()],
   ])("gives no answer for %s", async (_name, arrange) => {
     arrange();
-    expect(await viewerHerdrEnv()).toBeUndefined();
+    expect(await viewerTerminalEnv()).toBeUndefined();
   });
 
   it("ignores a control-mode client when choosing the viewer", async () => {
     tmuxListing([10, inHerdrProcess()], [11, process.pid, 1]);
-    expect(await viewerHerdrEnv()).toMatchObject({ HERDR_PANE_ID: "p-viewer" });
+    expect(await viewerTerminalEnv()).toMatchObject({ HERDR_PANE_ID: "p-viewer" });
   });
 
   it("gives no answer when tmux fails", async () => {
     tmuxListing([10, inHerdrProcess()]);
     writeFileSync(join(roots[roots.length - 1]!, "tmux"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
-    expect(await viewerHerdrEnv()).toBeUndefined();
+    expect(await viewerTerminalEnv()).toBeUndefined();
   });
 
   it("gives no answer outside tmux", async () => {
     tmuxListing([10, inHerdrProcess()]);
     vi.stubEnv("TMUX", "");
-    expect(await viewerHerdrEnv()).toBeUndefined();
+    expect(await viewerTerminalEnv()).toBeUndefined();
   });
 });

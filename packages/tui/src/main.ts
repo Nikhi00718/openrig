@@ -13,7 +13,7 @@ import { parseCommand } from "./grammar.js";
 import { filterPalette, paletteExecuteLine } from "./commands/palette.js";
 import { COMMAND_REGISTRY, currentCommandContext } from "./commands/registry.js";
 import { createInputDecoder, resolveEscapeAction, resolveKeyAction, resolveMouseAction, MOUSE_ENABLE, MOUSE_DISABLE, ALT_SCREEN_ON, ALT_SCREEN_OFF, PASTE_ENABLE, PASTE_DISABLE } from "./input.js";
-import { renderScreen } from "./render.js";
+import { drawableSize, renderScreen } from "./render.js";
 import { createStyle, detectColorMode } from "./theme.js";
 import { stylizeLines } from "./stylize.js";
 import { createControlSocket, defaultSocketPath } from "./socket-server.js";
@@ -33,6 +33,8 @@ import { restoreKeyAction, type RestoreInputEvent } from "./crash-cart/restore-i
 import { evaluateOneClickGate, restoreConfirmMessage } from "./crash-cart/one-click-gate.js";
 import { daemonStartArgs } from "./crash-cart/start-daemon.js";
 import { readLocal } from "./local-reading.js";
+import { replyAct, opensOnDefaultFeed, actingAs, answerRequest } from "./attention/attention-model.js";
+import type { AttentionRead } from "@openrig/daemon/attention";
 import { StartupController } from "./startup.js";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -159,6 +161,7 @@ async function run(): Promise<void> {
   function enableLive(): boolean {
     if (!live || !client || startup?.state.connection !== "up") return false;
     if (!liveEnabled) checkDaemonBuild();
+    if (!liveEnabled) openChosenDefaultFeed();
     liveEnabled = true;
     if (!buildMismatch) activityEvents ??= subscribeActivityEvents({ open: () => client.openActivityEvents(), onEvent: (event) => { if (event.type.startsWith("proof.")) reviewCache.clear(); live.pushed(); }, onStatus: (status) => {
       if (status === "dropped") eventsDropped = true;
@@ -167,14 +170,31 @@ async function run(): Promise<void> {
     } });
     return true;
   }
+  // Once, when the TUI first reaches the daemon, whichever startup path gets there: the chosen default person's Feed opens
+  // first, only for someone who hasn't touched anything since the TUI started (see opensOnDefaultFeed).
+  let defaultFeedChecked = false;
+  function openChosenDefaultFeed(): void {
+    if (defaultFeedChecked || !client) return;
+    defaultFeedChecked = true;
+    if (inputRevision !== 0) return;
+    void client.humanAttention(null, "default").then((read) => {
+      if (!opensOnDefaultFeed(read as AttentionRead | null, view.get(), inputRevision === 0)) return;
+      view.dispatch({ type: "jump", section: "needs" });
+      draw();
+      void live?.refresh();
+    }, () => {});
+  }
   function commandContext() {
     return currentCommandContext(startup && startup.state.connection !== "up" ? "unverified" : crashCartOpts.daemonState ?? null);
   }
 
   function draw(): void {
     if (nativeAttached) return;
-    const cols = process.stdout.columns ?? 120;
-    const rows = process.stdout.rows ?? 32;
+    // A terminal reporting 0 rows or columns has nothing to draw into: skip the frame (the view keeps its state) and
+    // let the next resize draw.
+    const size = drawableSize(process.stdout.columns, process.stdout.rows);
+    if (!size) return;
+    const { cols, rows } = size;
     const nowMs = Date.now();
     if (live) {
       const next = live.snapshot();
@@ -439,6 +459,14 @@ async function run(): Promise<void> {
       } else if (action.act === "run") {
         const result = await client.launchNode(action.rigId, action.agent);
         view.dispatch({ type: "notice", message: launchNodeNotice(action.agent, result) });
+      } else if (action.act === "answer") {
+        const result = await client.missionControlAction(answerRequest(action));
+        const actor = actingAs(snapshot.attentionRead, action.actorSession);
+        view.dispatch({ type: "notice", message: action.verb === "resolve" ? `Resolved ${action.qitemId} as ${actor}: it's unparked for its owner, with your decision.`
+          : action.verb === "approve"
+          ? `Approved ${action.qitemId} as ${actor}: the request is closed on its own row.`
+          : result.answer?.message ?? (result.answer?.outcome === "recorded" ? `Recorded on ${action.qitemId}. Still to answer: ${result.answer.unanswered.join("; ")}`
+          : `Answered ${action.qitemId} as ${actor}: the answer went back to the asker, and the request is closed.`) });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -476,6 +504,10 @@ async function run(): Promise<void> {
           notice: message => view.dispatch({ type: "notice", message }), draw,
         }).catch(error => view.dispatch({ type: "notice", message: String(error) }));
       } catch (err) { view.dispatch({ type: "notice", message: (err as Error).message }); }
+      return;
+    }
+    if (action.type === "attention-reply") {
+      perform(replyAct(snapshot.attentionRead, view.get().attentionOpen, action.text));
       return;
     }
     if (action.type === "act") {

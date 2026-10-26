@@ -38,12 +38,12 @@ import { getSelfHostId } from "../../hosts/fanout-contract.js";
 import { envelopeChannel, forwardChannelProblems, makeEnvelopeForwarder } from "./forwarding.js";
 import type { HostRegistryLoadResult } from "../../hosts/hosts-registry-reader.js";
 import { startSocketInbound, type SocketInboundHandle, type WsLike } from "./socket-inbound.js";
-import { loadHumanRegistry, resolveSlackHandle } from "../human-registry.js";
+import { HUMAN_ALERT_TAG, loadHumanRegistry, resolveSlackHandle } from "../human-registry.js";
+import { sharedChannelAddresses, sharedChannelFor } from "../participants.js";
 import { hasLiveHumanGate, isBlockerLive, type QueueRepository } from "../../queue-repository.js";
 import { formatReplyToChoice, REPLY_TO_CHOICE_ACTOR, REPLY_TO_CHAIN_LIMIT, type ReplyToChoice } from "../../reply-to-choice.js";
 import { parseSessionName } from "../../session-name.js";
 import type { FetchImpl } from "./slack-api.js";
-import { isHumanSeatSession } from "../../human-route-enforcer.js";
 import { ownerNotificationLevelAtLeast } from "../../queue-transition-log.js";
 // OPR.0.5.6.1 — the delivery rules engine: ONE decision per message replaces
 // the two dial-reads (the S14 default-decision stub). The legacy dial path
@@ -58,7 +58,8 @@ import {
   type DeliveryDecision,
 } from "../delivery-rules-engine.js";
 import { armDeliveryDeferral } from "../../policies/delivery-deferral.js";
-import { confirmReleaseAtPost, holdForQuiet } from "../../policies/quiet-release.js";
+import { confirmReleaseAtPost, currentAskVerdict, holdForQuiet } from "../../policies/quiet-release.js";
+import { noteRePresentNotPosted, RE_PRESENT_DECISION_PREFIX } from "./open-asks.js";
 import { quietHoldFor } from "../human-quiet-windows.js";
 import { WatchdogJobsRepository } from "../../watchdog-jobs-repository.js";
 
@@ -97,6 +98,9 @@ export function makeHumanReplyResolver(
     const source = queueRepo.getById(input.qitemId);
     if (source?.humanIntent === "update") return "not-applicable";
     if (!contract) return "not-applicable";
+    // A different person's reply to a question parked on someone else already reached the agent as their own message
+    // (the inbound row, linked to the question). It doesn't resume the question, which stays parked on its person.
+    if (source?.state === "blocked" && queueRepo.askedSomeoneElse(input.actorSession, source.blockedOn)) return "not-applicable";
     const uncertainDecision = `${input.decision}\n\n---\nOpenRig timing context (Slack reply ${JSON.stringify([input.actorSession, input.messageTs ?? null])}): This reply resumed the question, but its ordering against the posted question could not be confirmed. Resuming is not approval; read the person's words in context.`;
     // An acknowledgement retry must not resolve again. Match this reply's durable
     // context, not an older episode's generic resolved marker.
@@ -105,7 +109,9 @@ export function makeHumanReplyResolver(
       return "resolved-uncertain";
     }
     let uncertain = false;
-    if (source?.state === "blocked" && isHumanSeatSession(source.blockedOn)) {
+    // A park on a person by any address (a registered person's own address, as their Slack rows carry it, or a
+    // legacy human seat) answers only from a reply written after its current question posted.
+    if (source?.state === "blocked" && source.blockedOn && queueRepo.isPersonAddress(source.blockedOn)) {
       const episode = queueRepo.transitionLog.listForQitem(input.qitemId)
         .filter((transition) => transition.ownerNotificationKind === "human-required").at(-1);
       if (!episode) return "not-applicable";
@@ -292,6 +298,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   const registrySurface: RegistrySurface = opts.registry ?? { loadHumanRegistry, resolveSlackHandle };
   const ports = makeQueuePorts(opts.queueRepo, {
     loadHumanRegistry: () => registrySurface.loadHumanRegistry(opts.home),
+    sharedChannels: () => sharedChannelAddresses(opts.home),
   });
   // OPR.0.5.6.1 — the one engine consult (AM-F5: the gateway consults the
   // engine BEFORE dispatch). Null = destination is not a registered human;
@@ -306,6 +313,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     return decideDelivery({
       level: p.ownerNotificationLevel ?? null,
       escalation: p.humanIntent !== "update" && isEscalationClass(p.tags),
+      alerted: p.humanIntent !== "update" && (p.tags ?? []).includes(HUMAN_ALERT_TAG),
       human: {
         entityId: human.entityId,
         deliveryClass: human.prefs.deliveryClass,
@@ -328,7 +336,9 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   // default. The seat is the row's agent side (queue-access projects it into sourceSession for
   // requests, blocked items and resolved decisions alike); an aggregate digest has none and
   // posts to the default. Only called when outbound is ready, so the default is set.
-  const channelFor = (p: OutboundPostPayload): string => resolveOutboundChannel(cfg, p.sourceSession) ?? cfg.channel!;
+  // A post to a registered shared channel goes to that channel (0.7.3); a reply there already follows its root's channel.
+  const channelFor = (p: OutboundPostPayload): string =>
+    sharedChannelFor(p.destinationSession, opts.home)?.channelId ?? resolveOutboundChannel(cfg, p.sourceSession) ?? cfg.channel!;
 
   // OPR.0.5.6.14 — a failed post writes the transport-failed ledger transition so the
   // undelivered surface (and --verify) can name the gateway's error instead of guessing
@@ -798,6 +808,49 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       releaseRef(p.qitemId);
       return { ok: true as const };
     }
+    // An open ask shown again after enable (`rig slack post-open-asks`): checked here, at post time, against the row, the
+    // recipient and the posting threshold as they are now, then delivered like any fresh ask below (the delivery rules,
+    // quiet hours, digest, thread). One that's no longer current, or can't be checked, posts nothing and its row says why,
+    // unless an earlier attempt of it may already be in Slack (below).
+    if (decision.decisionId.startsWith(RE_PRESENT_DECISION_PREFIX) && p.qitemId) {
+      const key = p.notificationKey ?? p.qitemId;
+      if (opts.queueRepo.transitionLog.hasOwnerNotificationReceipt(p.qitemId, key)) {
+        releaseRef(key);
+        return { ok: true as const };
+      }
+      // Whether an earlier attempt can be in Slack is read from the attempt log, which the landing check below reads
+      // leniently. A log that exists but can't be read is unknown, not "never attempted": the decision stays in the buffer,
+      // with no post (delivery's reconcile reads the same log) and no not-posted record, until it reads.
+      try {
+        attempted.statuses();
+      } catch (error) {
+        log(`re-shown ${decision.decisionId} retained: the attempt log couldn't be read (${(error as Error).message})`);
+        return { ok: false as const, class: "re-present-attempt-log-unreadable", detail: (error as Error).message };
+      }
+      // An earlier attempt of this decision found in Slack goes to delivery, which records it.
+      const landing = "landing" in deliver ? await (deliver as { landing: (d: typeof decision) => Promise<string> }).landing(decision) : "unattempted";
+      if (landing === "found" || landing === "partial") return deliver(decision);
+      const verdict = await currentAskVerdict({
+        queueRepo: opts.queueRepo,
+        home: opts.home,
+        registry: { loadHumanRegistry: () => registrySurface.loadHumanRegistry(opts.home) },
+        entityId: (p.destinationSession ?? "").split("@")[0] ?? "",
+        qitemId: p.qitemId,
+        notificationKey: key,
+      });
+      if (verdict.kind !== "post") {
+        // One whose earlier attempt Slack couldn't rule out may already be posted: it's never recorded as not posted, and
+        // it stays in the buffer, so its replay decides again (and reconciles) instead of the uncertainty being dropped.
+        if (landing === "maybe") {
+          const why = verdict.kind === "unavailable" ? verdict.detail : verdict.reason;
+          log(`re-shown ${decision.decisionId} retained: an earlier attempt may be in Slack, and it can't go on now (${why})`);
+          return { ok: false as const, class: "re-present-earlier-attempt-unconfirmed", detail: why };
+        }
+        noteRePresentNotPosted(opts.queueRepo, p.qitemId, key, verdict);
+        releaseRef(key);
+        return { ok: true as const };
+      }
+    }
     if (p.deliveryDeferralFire) {
       const fireKey = p.notificationKey ?? p.qitemId;
       if (p.qitemId && opts.queueRepo.transitionLog.hasOwnerNotificationReceipt(p.qitemId, fireKey)) {
@@ -828,6 +881,11 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       // The decision couldn't be made (for example the person's quiet hours couldn't be read): post nothing and record
       // nothing. Releasing the in-flight guard lets the outbound sweep offer this still-unseen ask again and decide afresh.
       log(`delivery decision for ${p.qitemId} deferred: ${(error as Error).message}`);
+      // A re-shown ask is seen, so no sweep offers it again: its row says it wasn't posted, and the person who ran
+      // `rig slack post-open-asks` runs it again once the state reads (same decision id).
+      if (decision.decisionId.startsWith(RE_PRESENT_DECISION_PREFIX) && p.qitemId) {
+        noteRePresentNotPosted(opts.queueRepo, p.qitemId, p.notificationKey ?? p.qitemId, { kind: "unavailable", detail: (error as Error).message });
+      }
       // Released by notification key, the guard's own key: nothing marks this ask seen, so the next sweep must see it.
       releaseRef(p.notificationKey ?? p.qitemId!);
       return { ok: true as const };

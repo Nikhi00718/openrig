@@ -28,6 +28,7 @@ import { resolveExceptionRoute, type ExceptionRoute } from "./workflow-exception
 import type { WorkflowHumanDestination } from "./workflow-human-destination.js";
 import { classifyGateTrip, workflowExceptionTags } from "./workflow-exception.js";
 import { newQitemId } from "./queue-repository.js";
+import { HUMAN_ALERT_TAG } from "./gateway/human-registry.js";
 import type { WorkflowExceptionClass } from "./workflow-exception.js";
 import {
   WorkflowProjector,
@@ -41,6 +42,7 @@ import {
   type GateCompileResult,
   type ProjectStepInput,
   type ProjectStepResult,
+  workflowHumanGateGuidance,
 } from "./workflow-projector.js";
 import { loadHostRegistry } from "./hosts/hosts-registry-reader.js";
 import type { HostRegistryLookupFn } from "./workflow-validator.js";
@@ -1618,7 +1620,8 @@ export class WorkflowRuntime {
         priority: oldPacket.priority ?? "routine",
         tier: oldPacket.tier ?? "mode2",
         // OPR.0.4.6.WF5 (rev1-r2 B1 fold): the successor IS the same work
-        // item — tags carry VERBATIM (+ re-route) so a routed class-(c)
+        // item — tags carry over (+ re-route; the queue keeps human-alert only
+        // on an alert-worthy create, which humanAlert below restores) so a routed class-(c)
         // gate item keeps its exception identity on the live frontier
         // packet (workflow-exception/step:/exception:human_gate_trip/
         // occurrence:<ORIGINAL gate packet id> — the occurrence is the
@@ -1638,6 +1641,8 @@ export class WorkflowRuntime {
         summary: oldPacket.summary ?? undefined,
         evidenceRef: oldPacket.evidenceRef ?? undefined,
         targetRepo: oldPacket.targetRepo ?? undefined,
+        // An alert-worthy item (a failed step's approval) stays alert-worthy when it's routed to a person.
+        ...((oldPacket.tags ?? []).includes(HUMAN_ALERT_TAG) && this.queueRepo.isPersonAddress(input.toSession) ? { humanAlert: true } : {}),
       });
       register(created.persistedEvent);
       nudgeTo = { qitemId: created.qitemId, session: created.destinationSession, nudge: created.nudge };
@@ -1882,6 +1887,7 @@ function workflowInstantiateBody(input: {
       "",
       `Gate: ${input.gate.kind === "human" ? "human sign-off" : "handler-role check"} — the workflow is PARKED (waiting) until this item is resolved/closed; the flow then continues from this step.`,
     );
+    if (input.gate.kind === "human") lines.push(...workflowHumanGateGuidance(input.gate.parkOn!));
     if (input.gate.summary) lines.push(`Ask: ${input.gate.summary}`);
     if (input.gate.evidenceRef) lines.push(`Evidence: ${input.gate.evidenceRef}`);
   }

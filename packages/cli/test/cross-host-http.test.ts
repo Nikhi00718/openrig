@@ -194,11 +194,11 @@ describe("send --host (http branch)", () => {
   it.each(["\r", "\x1b", "\t", " "])("preserves explicit byte payload and interaction options over HTTP (%#)", async text => {
     const h = mockClient(() => ({ status: 200, data: { ok: true, promptInteraction: "unverified" } }));
     await sendCommand(httpDeps(h)).parseAsync(["--host", "vps-b", "dev-impl@my-rig", text,
-      "--dangerously-interact", "--reason", "explicit key", "--verify"], { from: "user" });
+      "--dangerously-interact", "--type-without-checking", "--reason", "explicit key", "--verify"], { from: "user" });
     expect(process.exitCode).toBeUndefined();
     expect(h.calls).toHaveLength(1);
     expect(h.calls[0]).toMatchObject({ method: "POST", path: "/api/transport/send", body: {
-      session: "dev-impl@my-rig", text, dangerouslyInteract: true, reason: "explicit key", verify: true,
+      session: "dev-impl@my-rig", text, dangerouslyInteract: true, typeWithoutChecking: true, reason: "explicit key", verify: true,
     } });
     expect(sshRunnerNeverCalled).not.toHaveBeenCalled();
   });
@@ -218,6 +218,7 @@ describe("send --host (http branch)", () => {
     expect(body.session).toBe("dev-impl@my-rig"); // BR-1: never member@rig@host
     expect(String(body.text)).toContain("To: dev-impl@my-rig");
     expect(String(body.text)).toContain("hello");
+    expect(body.exactText).toBe("hello"); // the remote daemon types this if the seat is a terminal
     expect(call.options?.headers?.Authorization).toBe("Bearer test-token");
     expect(captured.stdoutLines).toContain("[via host=vps-b (http://vps-b:7433)]");
     expect(captured.stdoutLines).toContain("Sent to dev-impl@my-rig");
@@ -352,6 +353,13 @@ describe("send --host (http branch)", () => {
     await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello", "--wait-for-idle", "30"], { from: "user" });
     expect(h.calls[0]!.options?.timeoutMs).toBe(30_000 + 30_000);
     expect((h.calls[0]!.body as Record<string, unknown>).waitForIdleMs).toBe(30_000);
+  });
+
+  it("--wait-for-idle longer than 300 s is one request to the remote carrying the whole wait", async () => {
+    const h = mockClient(() => ({ status: 200, data: { ok: true } }));
+    const cmd = sendCommand(httpDeps(h));
+    await cmd.parseAsync(["--host", "vps-b", "dev-impl@my-rig", "hello", "--wait-for-idle", "400"], { from: "user" });
+    expect(h.calls.map((c) => [(c.body as Record<string, unknown>).waitForIdleMs, c.options?.timeoutMs])).toEqual([[400_000, 400_000 + 30_000]]);
   });
 
   it("a cross-host send waits 30 s for the remote to deliver, not the 5 s read default", async () => {

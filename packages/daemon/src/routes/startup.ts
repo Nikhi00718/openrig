@@ -18,11 +18,13 @@ import type { Node, RigWithRelations } from "../domain/types.js";
 import { defaultProbeRuntimes } from "../domain/kernel-boot.js";
 import { SettingsStore } from "../domain/user-settings/settings-store.js";
 import { buildRestorePlanPreview, collectPreviewSessionRows } from "../domain/restore-plan-preview.js";
-import { assessCurrentStateRehydrateEligibility, snapshotMatchesCurrentOccupants } from "../domain/rehydrate-eligibility.js";
+import { assessCurrentStateRehydrateEligibility } from "../domain/rehydrate-eligibility.js";
+import { currentRestoreSnapshot } from "../domain/current-restore-snapshot.js";
+import { HISTORY_REF_RE, listSharedHistories } from "../domain/shared-history-selection.js";
 import { deriveCanonicalSessionName, deriveSessionName } from "../domain/session-name.js";
 import { observeSolePane } from "../domain/pane-binding-observation.js";
 import { assessNativeResumeProbe } from "../domain/native-resume-probe.js";
-import { verifyPaneIdleShell, type NativeProcessLister } from "../domain/native-process-lineage.js";
+import { verifyCodexPaneProcess, verifyPaneIdleShell, type NativeProcessLister } from "../domain/native-process-lineage.js";
 import { RigSpecCodec } from "../domain/rigspec-codec.js";
 import { RigSpecSchema } from "../domain/rigspec-schema.js";
 import { seatLifecycleService } from "./seat.js";
@@ -62,8 +64,12 @@ async function exclusive(c: Context, key: string, action: () => Promise<Response
 }
 
 function currentSnapshot(c: Context, rig: RigWithRelations) {
-  const snapshot = dep<SnapshotRepository>(c, "snapshotRepo").findLatestRestoreUsable(rig.rig.id);
-  return snapshot && snapshotMatchesCurrentOccupants(repo(c).db, rig, snapshot) ? snapshot : null;
+  return currentRestoreSnapshot(repo(c).db, dep<SnapshotRepository>(c, "snapshotRepo"), rig);
+}
+
+function sharedHistoryDeps(c: Context) {
+  return { rigRepo: repo(c), snapshotRepo: dep<SnapshotRepository>(c, "snapshotRepo"),
+    restoreOrchestrator: dep<RestoreOrchestrator>(c, "restoreOrchestrator") };
 }
 
 async function observeSeat(c: Context, rig: RigWithRelations, node: Node) {
@@ -79,12 +85,22 @@ async function observeSeat(c: Context, rig: RigWithRelations, node: Node) {
     const pane = await observeSolePane(tmux(c), name);
     if (!pane.ok) return { state: "unverified", detail: pane.detail, sessionName: name };
     if (node.runtime === "terminal") return { state: "running", detail: "Terminal is available", sessionName: name };
-    const probe = assessNativeResumeProbe({ runtime: node.runtime,
-      paneCommand: await tmux(c).getPaneCommand(pane.pane),
-      paneContent: (tmux(c).capturePaneScreen ? await tmux(c).capturePaneScreen(pane.pane) : await tmux(c).capturePaneContent(pane.pane, 40)) ?? "" });
+    const paneCommand = await tmux(c).getPaneCommand(pane.pane);
+    const paneContent = (tmux(c).capturePaneScreen ? await tmux(c).capturePaneScreen(pane.pane) : await tmux(c).capturePaneContent(pane.pane, 40)) ?? "";
+    const listProcesses = dep<NativeProcessLister | undefined>(c, "listProcesses");
+    let probe = assessNativeResumeProbe({ runtime: node.runtime, paneCommand, paneContent });
+    if (node.runtime === "codex" && (probe.code === "returned_to_shell" || probe.code === "awaiting_runtime")) {
+      const process = await verifyCodexPaneProcess({ target: pane.pane, tmux: tmux(c), listProcesses });
+      if (process) {
+        const currentPaneCommand = await tmux(c).getPaneCommand(pane.pane);
+        const currentPaneContent = (tmux(c).capturePaneScreen ? await tmux(c).capturePaneScreen(pane.pane) : await tmux(c).capturePaneContent(pane.pane, 40)) ?? "";
+        probe = assessNativeResumeProbe({ runtime: node.runtime, paneCommand: currentPaneCommand,
+          paneContent: currentPaneContent, codexProcessVerified: true });
+      }
+    }
     // A script-launched runtime reads as `sh` until the script hands over the foreground: name a shell only when proven idle.
     if (probe.code === "returned_to_shell" && !await verifyPaneIdleShell({ target: pane.pane, tmux: tmux(c),
-      listProcesses: c.get("listProcesses" as never) as NativeProcessLister | undefined })) {
+      listProcesses })) {
       return { state: "attention_required", sessionName: name,
         detail: `The pane shows a shell that is not a proven idle shell; a launch script may still be starting ${node.runtime === "claude-code" ? "Claude" : "Codex"}.` };
     }
@@ -144,6 +160,30 @@ startupRoutes.get("/:rigId", async (c) => {
       ...(!available ? { prerequisite: `${node.runtime} is unavailable or unauthenticated. Repair it and retry; fresh history cannot repair this prerequisite.` } : {}) });
   }
   return c.json({ rigId: rig.rig.id, rigName: rig.rig.name, seats });
+});
+
+startupRoutes.get("/:rigId/nodes/:nodeId/history", (c) => {
+  if (new URL(c.req.url).search) return c.json({ ok: false, code: "invalid_request", message: "This list takes no query fields." }, 400);
+  const result = listSharedHistories(sharedHistoryDeps(c), c.req.param("rigId"), c.req.param("nodeId"));
+  return c.json(result, result.ok ? 200 : result.code === "seat_unavailable" ? 404 : 409);
+});
+
+startupRoutes.post("/:rigId/nodes/:nodeId/history/validate", async (c) => {
+  if (new URL(c.req.url).search) return c.json({ ok: false, code: "invalid_request", message: "Validation takes no query fields." }, 400);
+  const body: unknown = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)
+    || Object.keys(body).sort().join(",") !== "historySessionId,snapshotId"
+    || typeof (body as Record<string, unknown>).snapshotId !== "string"
+    || typeof (body as Record<string, unknown>).historySessionId !== "string"
+    || !HISTORY_REF_RE.test((body as { snapshotId: string }).snapshotId)
+    || !HISTORY_REF_RE.test((body as { historySessionId: string }).historySessionId)) {
+    return c.json({ ok: false, code: "invalid_request", message: "Supply one snapshotId and historySessionId from the history list." }, 400);
+  }
+  const refs = body as { snapshotId: string; historySessionId: string };
+  const result = listSharedHistories(sharedHistoryDeps(c), c.req.param("rigId"), c.req.param("nodeId"), refs);
+  if (!result.ok) return c.json(result, result.code === "seat_unavailable" ? 404 : 409);
+  return c.json({ ok: true, rigId: result.rigId, nodeId: result.nodeId, logicalId: result.logicalId,
+    snapshotId: result.snapshotId, history: result.histories[0], eligibleForAttempt: true, mutated: false });
 });
 
 startupRoutes.post("/:rigId/:logicalId", async (c) => {

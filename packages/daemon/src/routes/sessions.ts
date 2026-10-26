@@ -27,6 +27,7 @@ import type { SessionTransport } from "../domain/session-transport.js";
 import type { PreviewRateLimiter } from "../domain/preview/preview-rate-limiter.js";
 import type { ClaimService } from "../domain/claim-service.js";
 import type { PodRigInstantiator } from "../domain/rigspec-instantiator.js";
+import type { SnapshotCapture } from "../domain/snapshot-capture.js";
 import { convergeOp } from "../domain/topology-converge.js";
 import type { RestoreOrchestrator } from "../domain/restore-orchestrator.js";
 import { launchStatusIsRunning } from "../domain/restore-orchestrator.js";
@@ -161,6 +162,7 @@ nodesRoutes.get("/", observeInventoryHandler, async (c) => {
   const withTerminalAndWork = attachTerminalActivityAndWork(withActivity, {
     db: deps.rigRepo.db,
     seatActivity: deps.seatActivityService,
+    agentActivity: deps.agentActivityStore,
   });
   // Slice 13 fix 2 — HOST ATTRIBUTION AT THE SOURCE. A daemon only inventories its own seats, so
   // every row it serves lives on THIS host; stamping the boot-reconciled self-id here means a
@@ -195,8 +197,12 @@ nodesRoutes.get("/:logicalId", async (c) => {
   const [detailWithTerminalAndWork] = attachTerminalActivityAndWork(detailWithActivity ? [detailWithActivity] : [detail], {
     db: deps.rigRepo.db,
     seatActivity: deps.seatActivityService,
+    agentActivity: deps.agentActivityStore,
   });
   Object.assign(detail, {
+    needsAttention: detailWithTerminalAndWork?.needsAttention,
+    arbitratedNeedsInput: detailWithTerminalAndWork?.arbitratedNeedsInput,
+    needsInputEvidence: detailWithTerminalAndWork?.needsInputEvidence,
     agentActivity: detailWithTerminalAndWork?.agentActivity,
     terminalActive: detailWithTerminalAndWork?.terminalActive,
     // ARCH RULING 3a947fb1: serve the raw lastActivityAt fact on node-detail too
@@ -279,6 +285,14 @@ nodesRoutes.post("/:logicalId/launch", async (c) => {
   }
 
   if (node.podId) {
+    if (body.snapshotId === undefined) {
+      const instantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
+      const firstStart = await instantiator?.launchFirstMaterializedNode(rigId, node.id);
+      if (firstStart) {
+        if (firstStart.ok) (c.get("snapshotCapture" as never) as SnapshotCapture | undefined)?.captureSnapshot(rigId, "auto-rehydrate");
+        return c.json(firstStart, firstStart.ok ? 201 : firstStart.code === "target_liveness_unknown" ? 503 : 409);
+      }
+    }
     const { restoreOrchestrator } = getDeps(c);
     if (!restoreOrchestrator) {
       return c.json({ ok: false, code: "internal_error", error: "Restore orchestrator not available" }, 500);
@@ -739,18 +753,29 @@ sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), a
     }
     try {
       const pid = await tmuxAdapter?.getPanePid?.(binding.tmuxPane);
-      if (!pid || pid !== identity.evidence.observedPid) {
+      // A shell or launcher can be the pane root; legacy verdicts only recorded one PID.
+      const verifiedPanePid = identity.evidence.observedPanePid ?? identity.evidence.observedPid;
+      if (!pid || pid !== verifiedPanePid) {
         return c.json({ error: "record_identity_unverified", message: `The bound pane for '${sessionName}' no longer matches its verified occupant.` }, 409);
       }
+      let verifiedNativeThreadId: string | undefined;
       const live = await resolveLiveCodexThreadId(binding.tmuxPane, {
         getPanePid: async () => pid,
         listProcesses: () => generationCensus.list(),
-        readThreadIdByPid: (nativePid, startedAt) => startedAt
-          ? generationThreadIds.resolve(nativePid, startedAt) : undefined,
+        readThreadIdByPid: async (nativePid, startedAt) => {
+          const threadId = startedAt ? await generationThreadIds.resolve(nativePid, startedAt) : undefined;
+          if (nativePid === identity.evidence.observedPid) verifiedNativeThreadId = threadId;
+          return threadId;
+        },
       });
       if (!live.ok) return c.json({ error: "record_identity_unverified", message: live.reason }, 409);
       sessionId = live.id;
       transcriptPath = store.readCodexTranscriptPath(sessionId);
+      // Dual-PID verdicts must name the process whose thread was selected; legacy verdicts only identify the root. A different
+      // conversation under a surviving wrapper isn't a binding change, so it says what it is.
+      if (identity.evidence.observedPanePid != null && verifiedNativeThreadId !== sessionId) {
+        return c.json({ error: "record_identity_unverified", message: `The Codex conversation in the pane for '${sessionName}' isn't the one its verified process owned, so no generation record is served.` }, 409);
+      }
       if (registry.currentOccupantTenure(context!.nodeId)?.generationUuid !== occupant.generationUuid
         || registry.getBindingForNode(context!.nodeId)?.tmuxPane !== binding.tmuxPane
         || await tmuxAdapter.getPanePid?.(binding.tmuxPane) !== pid) {

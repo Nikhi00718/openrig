@@ -3,7 +3,8 @@ name: Tests
 # Builds, type-checks and runs every test suite on a clean GitHub runner, and records the file
 # list each published package would contain. Each suite is its own job so one failure does not
 # hide the others. No provider credentials or operator configuration are supplied.
-# Package suites deny external networking; scenario runtime has no external route.
+# Package suites and the Linux seat-environment check deny external networking;
+# scenario runtime has no external route.
 
 on:
   push:
@@ -75,6 +76,40 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run test:repo
+
+  linux-seat-environment:
+    if: ${{ github.event_name != 'push' }}
+    # This integration test reads /proc/<pid>/environ and is skipped on macOS.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install the real terminal and staging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux rsync
+      - run: npm ci
+      - run: npm run build
+      - name: Check seat environments without ambient credentials or external network
+        run: |
+          set -euo pipefail
+          suite_root=$(mktemp -d "$RUNNER_TEMP/opr-seat-env.XXXXXX")
+          mkdir -p "$suite_root/home"
+          # Only loopback exists in this namespace. Drop back to the runner user
+          # before the CLI, private daemon and private tmux server are started.
+          sudo unshare --net -- /bin/bash -s -- "$(id -un)" "$suite_root" "$PATH" <<'SUITE'
+          set -euo pipefail
+          ip link set lo up
+          exec runuser -u "$1" -- env -i HOME="$2/home" PATH="$3" TMPDIR="$2" TMUX_TMPDIR="$2" \
+            CI=true TERM=xterm-256color \
+            npm run test -w packages/daemon -- test/seat-env-parent-session.integration.test.ts --maxWorkers=1 --reporter=verbose
+          SUITE
 
   package-tests:
     if: ${{ github.event_name != 'push' }}

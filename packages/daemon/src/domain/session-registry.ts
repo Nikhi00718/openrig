@@ -104,6 +104,8 @@ export interface LatestLiveSession {
   resumeType: string | null;
   resumeToken: string | null;
   cwd: string | null;
+  /** The community harness this session was launched for, when it was. */
+  communityHarness?: string | null;
 }
 
 export interface WatchdogRegistrationObserver {
@@ -539,17 +541,18 @@ export class SessionRegistry {
     return true;
   }
 
-  /** A community harness's launcher reported the conversation this launch created: record it with provenance
-   *  `launcher` and no verification stamp. A report isn't a verification, so the session doesn't read as resumable. */
-  recordLauncherReportedToken(sessionId: string, type: string, token: string): boolean {
+  /** A community harness's conversation for this launch: one its launcher reported (`launcher`), or one OpenRig named and
+   *  passed to it (`passed`). Recorded with no verification stamp: neither is a verification, so the session doesn't read
+   *  as resumable. */
+  recordLauncherReportedToken(sessionId: string, type: string, token: string, provenance: "launcher" | "passed" = "launcher"): boolean {
     if (typeof token !== "string" || token.trim().length === 0) return false;
     this.db
       .prepare(
-        "UPDATE sessions SET resume_type = ?, resume_token = ?, resume_provenance = 'launcher', " +
+        "UPDATE sessions SET resume_type = ?, resume_token = ?, resume_provenance = ?, " +
           "resume_last_verified = NULL, resume_last_probe_status = NULL, " +
           `${CLEAR_ROTATION_ON_TOKEN_CHANGE} WHERE id = ?`,
       )
-      .run(type, token, token, token, sessionId);
+      .run(type, token, provenance, token, token, sessionId);
     return true;
   }
 
@@ -752,13 +755,14 @@ export class SessionRegistry {
    *  FR-4 periodic/manual snapshot refresh call ONE query (no duplication). */
   getLatestLiveSessions(rigId: string): LatestLiveSession[] {
     const rows = this.db.prepare(`
-      SELECT n.id as node_id, s.id as session_id, s.session_name, s.status, n.runtime, n.cwd, s.resume_type, s.resume_token
+      SELECT n.id as node_id, s.id as session_id, s.session_name, s.status, n.runtime, n.cwd, s.resume_type, s.resume_token,
+        ${sessionCommunityHarnessSelect(this.db)} as community_harness
       FROM nodes n
       JOIN sessions s ON s.node_id = n.id
       WHERE n.rig_id = ?
         AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1)
         AND s.status IN ('running', 'idle', 'unknown')
-    `).all(rigId) as Array<{ node_id: string; session_id: string; session_name: string; status: string; runtime: string | null; cwd: string | null; resume_type: string | null; resume_token: string | null }>;
+    `).all(rigId) as Array<{ node_id: string; session_id: string; session_name: string; status: string; runtime: string | null; cwd: string | null; resume_type: string | null; resume_token: string | null; community_harness: string | null }>;
 
     return rows.map((r) => ({
       nodeId: r.node_id,
@@ -769,6 +773,7 @@ export class SessionRegistry {
       resumeType: r.resume_type,
       resumeToken: r.resume_token,
       cwd: r.cwd,
+      communityHarness: r.community_harness,
     }));
   }
 

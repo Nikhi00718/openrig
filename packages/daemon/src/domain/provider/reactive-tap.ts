@@ -1,4 +1,5 @@
 import type { AgentActivity } from "../types.js";
+import { isClaudeRateLimitHook } from "./claude-interruption.js";
 import type { CodexAuthMetadata } from "./codex-auth-reader.js";
 import { reactiveEventSignal, type ReactiveEventKind } from "./provider-signals.js";
 import type { ProviderSignal } from "./provider-types.js";
@@ -6,10 +7,12 @@ import type { ProviderSignal } from "./provider-types.js";
 interface ReactiveSeat {
   seatSession: string;
   runtime: string;
+  /** The seat's own runtime home, when it declares one (seat-runtime-home.ts). */
+  runtimeHome?: { home?: string };
 }
 
 interface ReactiveActivityReader {
-  getLatestForNode(input: { sessionName: string; now: Date }): AgentActivity | null;
+  getLatestForNode(input: { sessionName: string; now: Date; order?: "arrival" | "source" }): AgentActivity | null;
 }
 
 export interface ReactiveTapDeps {
@@ -64,10 +67,9 @@ const VERIFICATION_REASONS = new Set<ReactiveVerificationReason>([
 ]);
 
 /**
- * Map the current structured activity for each honestly identified Codex seat into reactive
- * provider rows. Generic needs-input activity is deliberately insufficient: permission prompts
- * are blocked seats too, but are not provider interruptions. Only the exact typed vocabulary above
- * is accepted, with raw subtype taking precedence over raw event and normalized reason.
+ * Map current structured provider failures into reactive rows. Codex uses its known account binding;
+ * Claude's StopFailure/rate_limit uses the seat identity, like its statusline lane. Generic needs-input
+ * activity and tool names are insufficient. Both paths require a current, resolved occupant generation.
  */
 export function collectReactiveEventSignals(deps: ReactiveTapDeps): ReactiveTapResult {
   const empty = (): ReactiveTapResult => ({ signals: [], triggers: [], discards: [] });
@@ -89,7 +91,22 @@ export function collectReactiveEventSignals(deps: ReactiveTapDeps): ReactiveTapR
   const discards: ReactiveDiscard[] = [];
 
   for (const seat of deps.seats) {
+    if (seat.runtime === "claude-code") {
+      const event = deps.activity.getLatestForNode({ sessionName: seat.seatSession, now: new Date(nowMs), order: "source" });
+      if (!event || event.runtime !== seat.runtime || !isClaudeRateLimitHook(event.runtime, event.rawEvent, event.rawSubtype)) continue;
+      if (event.generationProvenance !== "resolved" || event.reason === "generation_mismatch"
+        || isVerificationReason(event.reason) || event.stale) continue;
+      const eventAtMs = Date.parse(event.eventAt ?? "");
+      if (!Number.isFinite(eventAtMs) || eventAtMs > nowMs || nowMs >= eventAtMs + deps.freshnessMs) continue;
+      signals.push(reactiveEventSignal({
+        provider: "claude", seatSession: seat.seatSession, kind: "at_limit",
+        asOf: event.eventAt!, staleAfter: new Date(eventAtMs + deps.freshnessMs).toISOString(),
+      }));
+      continue;
+    }
     if (seat.runtime !== "codex") continue;
+    // The registry belongs to the daemon's CODEX_HOME; a seat with its own home isn't on any of its accounts.
+    if (seat.runtimeHome?.home) continue;
     const accountRef = accountBySeat.get(seat.seatSession);
     if (!accountRef) continue;
 

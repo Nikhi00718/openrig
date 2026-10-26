@@ -44,7 +44,7 @@ function clearEnv(): () => void {
     // its custom home into default-path resolution; UNSETTING it would fall through
     // to the REAL ~/.openrig (foreign on-box state) — so tests set a fresh tmp home.
     "OPENRIG_HOME", "RIGGED_HOME",
-    "OPENRIG_PORT", "OPENRIG_HOST", "OPENRIG_DB",
+    "OPENRIG_PORT", "OPENRIG_HOST", "OPENRIG_DB", "OPENRIG_DAEMON_DB_CONFLICT",
     "OPENRIG_TRANSCRIPTS_ENABLED", "OPENRIG_TRANSCRIPTS_PATH",
     "OPENRIG_TRANSCRIPTS_LINES", "OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS",
     "OPENRIG_WORKSPACE_ROOT", "OPENRIG_WORKSPACE_SLICES_ROOT",
@@ -111,7 +111,7 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
 
   it("VALID_KEYS includes legacy, user-settings, ui.preview, recovery, agents, feed, and transcript-rotation keys", () => {
     const expected = [
-      "daemon.port", "daemon.host",
+      "daemon.port", "daemon.host", "daemon.db_conflict",
       // OPR.0.4.6.MH1 FR-1/FR-4 — host-selection pointer + own-host name.
       "host.selected",
       "host.name",
@@ -182,16 +182,24 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
       "output.whoami_peers",
       // Slice 01 (OPR.0.7.0.1) — Codex usage windows switch.
       "provider.usage_windows",
+      // The providers chosen at rig setup --providers, which kernel boot honours.
+      "provider.selected",
       "bundle.services_enabled",
       "usage.pi_cost_facts",
       "usage.pi_openrouter_charge",
       "transport.verify_input_box",
       "transport.local_user_guard",
+      // Slice 22 (OPR.0.7.2.22) — typed decisions, off by default.
+      "decisions.enabled",
+      "decisions.consumers",
+      "decisions.template_dir",
       // OPR.0.4.6.FS-1 W2 — queue-retention maintenance knobs.
       "retention.enabled",
       "retention.transitions_days",
       "retention.watchdog_days",
       "retention.watchdog_keep_per_job",
+      "retention.stream_days", // slice 22 outcome 9: stream retention
+      "retention.stream_max_items",
       "retention.batch_size",
       "queue.pickup_stall_threshold_minutes",
       // S02 — standing-stuck-sweep cadence + unclaimed-obligation age.
@@ -205,6 +213,14 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
       "queue.wake_human_rung",
     ];
     expect([...VALID_KEYS]).toEqual(expected);
+  });
+
+  it("defaults database conflict handling to warn and persists the optional stop", () => {
+    const store = new ConfigStore(configPath);
+    expect(store.get("daemon.db_conflict")).toBe("warn");
+    store.set("daemon.db_conflict", "stop");
+    expect(store.get("daemon.db_conflict")).toBe("stop");
+    expect(() => store.set("daemon.db_conflict", "always")).toThrow(/warn or stop/);
   });
 
   it("resolves context.root from the canonical default and OPENRIG_CONTEXT_ROOT", () => {
@@ -221,6 +237,17 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
   it("defaults the advisor session to the kernel's advisor seat", () => {
     const store = new ConfigStore(configPath);
     expect(store.resolveWithSource("agents.advisor_session")).toMatchObject({ value: "advisor-lead@kernel", source: "default" });
+  });
+
+  it("defaults provider.selected to empty and accepts only claude, codex or both", () => {
+    const store = new ConfigStore(configPath);
+    expect(store.resolveWithSource("provider.selected")).toMatchObject({ value: "", source: "default" });
+    store.set("provider.selected", "codex");
+    expect(store.resolveWithSource("provider.selected")).toMatchObject({ value: "codex", source: "file" });
+    expect(store.resolve().provider.selected).toBe("codex");
+    for (const raw of ["gemini", "both", "claude,", "Claude", "claude codex"]) {
+      expect(() => store.set("provider.selected", raw)).toThrow(/provider\.selected/);
+    }
   });
 
   it("resolves context.system_world with visible default, file, and env provenance", () => {

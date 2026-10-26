@@ -1,19 +1,37 @@
 # Per-seat terminal delivery
 
-The existing typing guard supports three modes. Before draft-aware mode,
-automatic input either used the ordinary delivery path or was held unconditionally.
-Draft-aware adds an opt-in check for unfinished input without a second control or
-daemon-owned retry scheduler. Sibling seats keep their own mode.
+The typing guard has six modes. `off` and `hold` are the two ends. Draft-aware adds an
+opt-in check for unfinished input without a second control or daemon-owned retry
+scheduler. Between off and hold, three interruption levels choose which automatic messages may
+type: `openrig-urgent`, `urgent-only` and `sends-only`. Sibling seats keep their own mode.
 
 | Mode | Terminal input | When input is unavailable |
 |---|---|---|
 | `off` (default) | Existing delivery and prompt checks | Existing send result |
 | `draft-aware` | Paste into a recognized empty composer; check ownership again before Enter | Hold input and retain this attempt for inspection when bookkeeping is available |
+| `openrig-urgent` | OpenRig's own messages (watchdogs, scheduled wakes, notices) and anything marked urgent type, never over a draft | Other agents' messages are held, the sender is told, and held messages stay readable |
+| `urgent-only` | Only messages marked urgent type (`rig send --urgent`, or a queue item at priority urgent or critical), never over a draft | Everything else is held, the sender is told, and held messages stay readable |
+| `sends-only` | Deliberate sends from people and agents type, as with `off`; a terminal member's typing isn't protected, because its shell input can't be read | OpenRig's own notices are held. A terminal member defaults to this level |
 | `hold` | No automatic terminal input, even at an empty prompt | Retain for inspection outside the pane |
 
+Lifecycle work is refused at `openrig-urgent` and `urgent-only`, as at `hold`.
+
 Runtime permissions are separate. Recipient and interactive-prompt checks still
-apply. `--raw`, `--force` and `--dangerously-interact` do not bypass the typing guard.
-Direct human input remains available.
+apply. `--raw` and `--force` do not bypass the typing guard. A deliberate
+`--dangerously-interact --reason` remains available at every interruption level
+and uses the existing-input check below. Direct human input remains available.
+
+A message sent to a busy Codex seat joins its running turn and may redirect it.
+For separate work, create a queue row instead:
+`rig queue create --destination <seat> --summary "<one line>" --body-file <file>`.
+A row that's saved keeps the work apart from its wake, the short pointer typed
+into the seat. The wake is still typed input, and it isn't proof that the seat
+claimed or finished the work: the row's state says that.
+
+`rig send <seat> "<message>" --wait-for-idle <seconds>` suits a sender who
+watches the result. If the seat is still busy, or its activity is unknown, when
+the wait ends, nothing is sent (exit 1, "No text was sent.") and OpenRig keeps
+nothing to send later.
 
 ## Configure and inspect
 
@@ -55,9 +73,35 @@ authority stays active unless its exception is deliberately changed.
 
 Caller attribution is cooperative. An unattributed caller retains current
 behaviour rather than being labelled the person or a peer. The existing
-`rig send --dangerously-interact --reason` path and its audit are unchanged;
-this policy adds no restriction there, and the existing prompt, draft and
-interruption guards still apply. Plain tmux is not prevented.
+`rig send --dangerously-interact --reason` path remains available; this policy
+adds no restriction there. Its existing-input check applies independently of the
+typing mode. Plain tmux is not prevented.
+
+### Deliberate interaction and existing input
+
+A managed `rig send <seat> "<answer>" --dangerously-interact --reason "<why>" can
+drive a recognized native menu as before. Otherwise, with the delivery guard
+attached, it reads the visible composer under the seat's lease immediately before
+pasting, after buffer preparation. Empty input proceeds. A recognized dim
+suggestion is displayed separately and counts as empty; typed or pasted text
+(author unknown) stops the send with `override_input_present`. An unreadable input
+stops with `override_input_unknown`, never an empty-input claim. Both return single-send HTTP
+409, `sent: false`, and caller-only `existingInput` evidence (visible rows, suggestion
+rows, cursor/dimensions and target binding). A collapsed paste shows its label,
+not the hidden contents. OpenRig neither holds nor retries this stopped override.
+
+Inspect the shown input in the native terminal, deliberately clear the prompt with
+native/tmux controls, then issue the send again. Manual clearing runs outside
+OpenRig's lease and observation checks and is not recorded. For a deliberate
+unchecked write, add `--type-without-checking` to that same command. It skips the
+read and does **not** clear input: the text may join or submit what is already there.
+The result names that choice. It requires `--dangerously-interact` and `--reason`.
+
+Observed input is returned only to the caller, never saved in an outbox, held
+message, capture-observer record or override audit. The audit keeps classifications,
+counts and the choice, without input contents. The lease serializes OpenRig writes;
+human typing can still race the capture and paste. Ordinary sends and wakes keep
+their existing behaviour.
 
 ### Terminal delivery
 
@@ -73,7 +117,7 @@ rig seat held-messages dev-impl@my-rig --id <outbox-id> --json
 rig seat retire-held-message dev-impl@my-rig <outbox-id> --reason "read outside the pane"
 ~~~
 
-Use exactly one of `--mode off|draft-aware|hold` or the compatible
+Use exactly one of `--mode off|draft-aware|openrig-urgent|urgent-only|sends-only|hold` or the compatible
 `--enabled true|false`: true selects hold, false selects off. There are no
 retry settings or deadlines. Activation waits for an already-started seat operation
 to finish. The API may return HTTP 202 with `pending: true`; wait for
@@ -203,6 +247,9 @@ current parked-row eligibility and stop checks still apply. This changes message
 structured continuity actions such as creating a cutover baton.
 
 The parked-owner supervisor also retries current obligations despite an earlier failed, unknown or unrecorded attempt.
+Its first reminder to a seat waits until the seat's waiting state has been unchanged for 5 minutes, then goes on the next
+watchdog tick, so a seat that just handed work off or asked a person isn't interrupted; a seat still holding the work after
+that is reminded as before. A seat at an approval or question prompt gets no grace, so the prompt-blocked alert isn't delayed.
 A recorded success to the same known occupant waits for a change in its obligations. Rotation includes retained attempts,
 so a held input cannot starve another owner. Interactive prompts stay with the existing prompt-refusal recovery.
 Its own reminders wait while managed compaction owes the turn boundary, restore or audit, including a fresh check

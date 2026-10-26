@@ -4,6 +4,7 @@ import {
   deriveUsageLimitPools,
   reactiveEventSignal,
 } from "../src/domain/provider/provider-signals.js";
+import type { ProviderSignal } from "../src/domain/provider/provider-types.js";
 
 // Slice-04 (OPR.0.5.0.4) — signals[] normalization, the §1 contract's honesty rules
 // (packet 3ffa3c22 IMPLEMENTATION-PRD §1/§2 + the 2026-07-31 RESEARCH verdict).
@@ -85,6 +86,13 @@ describe("codexRateLimitSignals — normalization honesty", () => {
 
 describe("S16 usage-limit pool derivation", () => {
   const NOW = new Date("2026-08-28T12:00:00.000Z");
+  const claudeMeter = (seatSession: string, resetsAt: string): ProviderSignal => ({
+    provider: "claude", seatSession, sourceClass: "provider_statusline", authority: "account_cross_device",
+    window: "five_hour", usedPercent: 40, resetsAt, asOf: "2026-08-28T11:59:00.000Z",
+    staleAfter: "2026-08-28T12:10:00.000Z", automationUse: "allow_switch_decision",
+  });
+  const claudeLimit = () => reactiveEventSignal({ provider: "claude", seatSession: "dev-a@rig", kind: "at_limit",
+    asOf: "2026-08-28T11:59:00.000Z", staleAfter: "2026-08-28T12:10:00.000Z" });
 
   it("groups every Claude seat under one local limit and keeps the latest stated reset", () => {
     const pools = deriveUsageLimitPools({
@@ -129,6 +137,43 @@ describe("S16 usage-limit pool derivation", () => {
         expiresAt: "2026-08-28T13:00:00.000Z",
         source: "provider-reset",
       },
+    ]);
+  });
+
+  it("keeps a Claude seat with its own config dir out of another home's exhausted pool, and pools it by its own home", () => {
+    const claude = (seatSession: string, usedPercent: number) => ({
+      provider: "claude" as const, seatSession, sourceClass: "provider_statusline" as const, authority: "account_cross_device" as const,
+      window: "five_hour", usedPercent, resetsAt: "2026-08-28T13:00:00.000Z", asOf: "2026-08-28T11:59:00.000Z",
+      staleAfter: "2026-08-28T12:10:00.000Z", supportsNotification: false, automationUse: "allow_switch_decision" as const,
+    });
+    const claudeHomeOf = (seat: string) => seat === "dev-b@rig" ? "/homes/b" : undefined;
+    // The daemon home's login is exhausted; dev-b runs on its own home and isn't parked with it.
+    expect(deriveUsageLimitPools({ now: NOW, fallbackSeconds: 300, bindings: [], claudeHomeOf,
+      signals: [claude("dev-a@rig", 100), claude("dev-b@rig", 72)] })).toEqual([
+      { poolKey: "claude:local", provider: "claude", seatSessions: ["dev-a@rig"], expiresAt: "2026-08-28T13:00:00.000Z", source: "provider-reset" },
+    ]);
+    // dev-b's own home is exhausted; the daemon home's seat isn't parked with it.
+    expect(deriveUsageLimitPools({ now: NOW, fallbackSeconds: 300, bindings: [], claudeHomeOf,
+      signals: [claude("dev-a@rig", 72), claude("dev-b@rig", 100)] })).toEqual([
+      { poolKey: "claude:home:/homes/b", provider: "claude", seatSessions: ["dev-b@rig"], expiresAt: "2026-08-28T13:00:00.000Z", source: "provider-reset" },
+    ]);
+  });
+
+  it.each([undefined, "/homes/shared"])("isolates a reported Claude limit when seats in the same pool disagree on reset windows (home: %s)", home => {
+    expect(deriveUsageLimitPools({ now: NOW, fallbackSeconds: 300, bindings: [], claudeHomeOf: () => home,
+      signals: [claudeMeter("dev-a@rig", "2026-08-28T13:00:00.000Z"), claudeMeter("dev-b@rig", "2026-08-28T14:00:00.000Z"), claudeLimit()],
+    })).toEqual([
+      { poolKey: "claude:seat:dev-a@rig", provider: "claude", seatSessions: ["dev-a@rig"], expiresAt: "2026-08-28T12:04:00.000Z", source: "config-fallback" },
+    ]);
+  });
+
+  it("keeps matching windows in one Claude home pooled when another home's reset differs", () => {
+    expect(deriveUsageLimitPools({ now: NOW, fallbackSeconds: 300, bindings: [],
+      claudeHomeOf: seat => seat === "dev-b@rig" ? "/homes/b" : "/homes/a",
+      signals: [claudeMeter("dev-a@rig", "2026-08-28T13:00:00.000Z"), claudeMeter("dev-a2@rig", "2026-08-28T13:00:00.000Z"),
+        claudeMeter("dev-b@rig", "2026-08-28T14:00:00.000Z"), claudeLimit()],
+    })).toEqual([
+      { poolKey: "claude:home:/homes/a", provider: "claude", seatSessions: ["dev-a2@rig", "dev-a@rig"], expiresAt: "2026-08-28T12:04:00.000Z", source: "config-fallback" },
     ]);
   });
 

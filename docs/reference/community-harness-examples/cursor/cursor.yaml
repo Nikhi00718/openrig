@@ -9,3 +9,5 @@ limits:
   - needs-input and approval prompts are read from the screen only
 launch_result: true
 resume: true
+startup_assisted: false
+first_input: true

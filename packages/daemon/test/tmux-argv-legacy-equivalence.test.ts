@@ -49,7 +49,7 @@ function respond(cmd: string, failing: string[], composer = false): string {
     case "display-message":
       return cmd.includes("session_id") ? "$7\n" : cmd.includes("pane_pid") ? "4242\n" : "1\n";
     case "show-environment": return "OPENRIG_NODE_ID=n1\nCLAUDECODE=1\nHERDR_PANE_ID=p1\n";
-    case "new-session": return "%1\n";
+    case "new-session": case "source-file": case "start-server": return "%1\n";
     default: return "";
   }
 }
@@ -113,6 +113,11 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   await a.sendShellCommand(SESSION, "echo 'hi there'", undefined, { sourceInPane: true });
   await a.sendKeys(SESSION, ["Enter; rm -rf /", "C-c"]);
   await a.setWindowOption(SESSION, "@openrig x", "a b'c");
+  await a.getWindowLocalOption(SESSION, "window-size");
+  await a.readWindow(SESSION, "@openrig-window-size-prior");
+  await a.readWindow("@3", "@openrig-window-size-prior");
+  await a.restoreWindowOption(SESSION, "window-size", "a b'c");
+  await a.restoreWindowOption(SESSION, "window-size", null);
   await a.resizeWindow(SESSION, 120, 40);
   await a.killSession(SESSION);
   await a.respawnPane("%1", "codex resume 'tok en'", { cwd: "/w x", env: { A: "b c", Q: "it's" } });
@@ -133,6 +138,7 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   await a.setSessionEnv(SESSION, "SEAT_FLAG", "it's a value");
   await a.unsetSessionEnv(SESSION, "SEAT_FLAG");
   await a.hasSessionEnv(SESSION, "OPENRIG_NODE_ID");
+  await a.hasSessionEnvBatch(SESSION, ["OPENRIG_NODE_ID", "OPENRIG_RUNTIME"]);
   await a.startPipePane(SESSION, "/tmp/out dir/it's.log");
   await a.stopPipePane(SESSION);
   await a.capturePanesContent([SESSION, "alpha", "missing"], 50);
@@ -150,6 +156,9 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   await a.readPaneLastActivity(SESSION);
   await a.listClients();
   await a.switchClient("/dev/ttys001", SESSION);
+  // A runtime switch's exchange: two session-id reads, then the guarded if-shell swap (nested quoting); and its env writes.
+  await a.swapRuntimeSwitchPanes({ nodeId: "n1", stagingSession: "staging'q a", canonicalSession: SESSION, canonicalPane: "%1", stagedPane: "%1" });
+  await a.setRuntimeSwitchEnvironment(SESSION, "claude-code", "gen 'q 1");
   // A failed paste deletes the loaded buffer; the guarded kill reads the session id first.
   await recordingAdapter(calls, { failing: ["paste-buffer"] }).sendText(SESSION, "hello");
   await recordingAdapter(calls, { guard: true }).killSession(SESSION);

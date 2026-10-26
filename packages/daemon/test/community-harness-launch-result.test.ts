@@ -122,11 +122,14 @@ describe("a community harness whose launcher can reopen a reported conversation"
     ["the launcher reports another conversation", (a: string) => ({ ...good(a), nativeRef: "chat-999" }), { resumeMismatch: { opened: "chat-999" } },
       "asked to resume conversation chat-123, its launcher reports conversation chat-999 instead"],
   ] as const)("needs the person's attention, and the seat keeps its conversation, when %s", async (_case, record, flag, error) => {
-    const { app } = seat(record as never, RESUMABLE);
+    const { app, sendShellCommand } = seat(record as never, RESUMABLE);
     const result = await app.launchHarness(binding, { name: "w@r", resumeToken: "chat-123", resumeType: "community:synth" });
     expect(result).toMatchObject({ ok: false, recovery: "attention_required", ...flag, error: expect.stringContaining(error) });
     expect(result).toMatchObject({ error: expect.stringContaining("The seat keeps conversation chat-123") });
     expect(result).not.toHaveProperty("resumeToken");
+    expect(sendShellCommand).toHaveBeenCalledTimes(1);
+    expect(sendShellCommand.mock.calls[0]![1]).toContain("OPENRIG_RESUME_REF='chat-123'");
+    expect(sendShellCommand.mock.calls[0]![1]).not.toContain("OPENRIG_CONVERSATION=");
   });
 
   it("never hands another runtime's saved conversation to the launcher", async () => {
@@ -149,9 +152,9 @@ describe("a community harness whose launcher can reopen a reported conversation"
     expect(sendShellCommand).not.toHaveBeenCalled();
   });
 
-  it("needs launch_result for resume, so the launcher can say which conversation it reopened", () => {
+  it("needs launch_result or names_conversation for resume, so the conversation to reopen is one OpenRig knows", () => {
     const presets = scratch("harness-presets-");
     writeFileSync(join(presets, "synth.yaml"), `${PRESET.replace("launch_result: true\n", "")}resume: true\n`);
-    expect(loadCommunityHarnessPreset("synth", presets)).toMatchObject({ ok: false, message: expect.stringContaining("resume needs launch_result: true") });
+    expect(loadCommunityHarnessPreset("synth", presets)).toMatchObject({ ok: false, message: expect.stringContaining("resume needs launch_result: true or names_conversation: true") });
   });
 });

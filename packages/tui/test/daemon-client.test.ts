@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { DaemonClient, launchNodeNotice, StartupRequestError } from "../src/daemon-client.js";
+import { PageRead } from "../src/page-read.js";
 
 // FR-8 / R7 no-new-data: the TUI's entire daemon surface is this ONE module,
 // and every route it can emit is on the §4.A table of EXISTING web-consumed
@@ -166,6 +167,20 @@ describe("daemon client = the §4.A table, one module, nothing else (FR-8/FR-9)"
     await expect(c.seatEffort("dev@openrig-build")).resolves.toEqual(report);
   });
 
+  it("doesn't show a refused seat-effort report as a failed read on the page, and still fails a real error", async () => {
+    const report = { ok: false, code: "effort_unsupported_runtime", message: "runtime does not report effort" };
+    let status = 409;
+    const c = new DaemonClient({ baseUrl: "http://x",
+      fetchImpl: (async () => status === 409 ? Response.json(report, { status }) : new Response("{}", { status })) as typeof fetch });
+    const page = new PageRead(() => 0);
+    page.begin();
+    const pageClient = c.forPage(page, new AbortController().signal);
+    await expect(pageClient.seatEffort("dev@openrig-build")).resolves.toEqual(report);
+    expect(page.errors).toEqual([]);
+    status = 503;
+    await expect(pageClient.seatEffort("dev@openrig-build")).rejects.toThrow(/GET \/api\/seat\/effort\/dev%40openrig-build → 503/);
+  });
+
   it("keeps generic reads strict when a refusal body is returned", async () => {
     const c = new DaemonClient({
       baseUrl: "http://x",
@@ -192,6 +207,17 @@ describe("daemon client = the §4.A table, one module, nothing else (FR-8/FR-9)"
 
 
 describe("terminal preview width", () => {
+  it("previews with the provider the window opener will use", async () => {
+    const requests: string[] = [];
+    const client = new DaemonClient({ baseUrl: "http://fixture", fetchImpl: (async url => {
+      requests.push(String(url));
+      return { ok: true, json: async () => ({}) } as Response;
+    }) as typeof fetch });
+    await client.previewTerminal("saved:kernel");
+    await client.previewTerminal("saved:kernel", "rex");
+    expect(requests.map(url => new URL(url).searchParams.get("provider"))).toEqual(["herdr", "rex"]);
+  });
+
   it.each([undefined, 0, -1, 119.5, Infinity, NaN, 119, 120, 159, 160])("only sends a measured positive integer width: %s", async columns => {
     const descriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
     const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
@@ -209,6 +235,29 @@ describe("terminal preview width", () => {
       Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: false });
       await client.previewTerminal("saved:kernel");
       expect(new URL(requests[1]!).searchParams.has("viewportColumns")).toBe(false);
+    } finally {
+      if (descriptor) Object.defineProperty(process.stdout, "columns", descriptor);
+      else delete (process.stdout as unknown as Record<string, unknown>)["columns"];
+      if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor);
+      else delete (process.stdout as unknown as Record<string, unknown>)["isTTY"];
+    }
+  });
+
+  it("previews the kernel view for cmux without the wide TUI's width, as the cmux open sends none", async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    const requests: string[] = [];
+    try {
+      Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+      Object.defineProperty(process.stdout, "columns", { configurable: true, value: 160 });
+      const client = new DaemonClient({ baseUrl: "http://fixture", fetchImpl: (async url => {
+        requests.push(String(url));
+        return { ok: true, json: async () => ({}) } as Response;
+      }) as typeof fetch });
+      await client.previewTerminal("saved:kernel", "cmux");
+      await client.previewTerminal("saved:kernel", "herdr");
+      expect(requests.map(url => [new URL(url).searchParams.get("provider"), new URL(url).searchParams.get("viewportColumns")]))
+        .toEqual([["cmux", null], ["herdr", "160"]]);
     } finally {
       if (descriptor) Object.defineProperty(process.stdout, "columns", descriptor);
       else delete (process.stdout as unknown as Record<string, unknown>)["columns"];

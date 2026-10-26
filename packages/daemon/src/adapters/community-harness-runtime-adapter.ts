@@ -16,6 +16,10 @@ import { isShellForeground } from "../domain/shell-classifier.js";
 import { isCommunityHarnessRuntime, loadCommunityHarnessPreset, communityHarnessesDir } from "../domain/community-harness-presets.js";
 import { communityHarnessOf } from "../domain/built-in-runtimes.js";
 import { launchResultRoot, newLaunchAttempt, waitForLaunchResult, type LaunchAttempt } from "../domain/community-harness-launch-result.js";
+import { writeFirstInput, type FirstInputPassed } from "../domain/community-harness-first-input.js";
+import type { CommunityHarnessPreset } from "../domain/community-harness-presets.js";
+import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
 import { shellQuote } from "./shell-quote.js";
 
 interface CommunityHarnessAdapterDeps {
@@ -32,8 +36,10 @@ interface CommunityHarnessAdapterDeps {
  * A community harness, launched from its installed preset (`domain/community-harness-presets.ts`). It types the preset's
  * command into the seat's pane and is ready while the pane runs something other than a shell. That's readiness, not
  * identity: a process alone doesn't prove which session it is. It projects nothing and refuses fork. It resumes only a
- * preset that declares `resume` (with `launch_result`): its launcher is told the conversation to reopen and reports
- * what it did, and a conversation it says is gone is never replaced by a new one.
+ * preset that declares `resume`. With `launch_result`, its launcher is told the conversation to reopen and reports what it
+ * did, and a conversation it says is gone is never replaced by a new one. With `names_conversation`, OpenRig names each new
+ * conversation and passes the saved name back on a resume. Nothing reports back, so a named seat's readiness is
+ * process-only: its saved name is unverified until something observes it.
  */
 export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
   constructor(readonly runtime: string, private readonly deps: CommunityHarnessAdapterDeps) {}
@@ -57,7 +63,7 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
     };
   }
 
-  async launchHarness(binding: NodeBinding, opts: { name: string; resumeToken?: string; resumeType?: string; forkSource?: ForkSource }): Promise<HarnessLaunchResult> {
+  async launchHarness(binding: NodeBinding, opts: { name: string; resumeToken?: string; resumeType?: string; forkSource?: ForkSource; firstInputText?: string }): Promise<HarnessLaunchResult> {
     if (opts.forkSource) {
       return { ok: false, error: `Fork is unsupported: community harness "${this.runtime}" is launch-only. Remove session_source for this member.` };
     }
@@ -71,18 +77,42 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
     if (resumeRef && !(found.ok && found.preset.resume)) {
       // A conversation id its launcher reported earlier doesn't make a launch-only harness resumable: say so, and let the
       // caller start a new conversation as it did before (it never resumes one silently).
-      return found.ok && found.preset.launchResult
+      return found.ok && (found.preset.launchResult || found.preset.namesConversation)
         ? { ok: false, recovery: "retry_fresh",
-          error: `Resume is unsupported: community harness "${this.runtime}" is launch-only, so its reported conversation isn't reopened. A new conversation starts only where the caller allows a fresh start; a restore stops and asks.` }
+          error: `Resume is unsupported: community harness "${this.runtime}" is launch-only, so its ${found.preset.launchResult ? "reported" : "named"} conversation isn't reopened. A new conversation starts only where the caller allows a fresh start; a restore stops and asks.` }
         : { ok: false, error: `Resume is unsupported: community harness "${this.runtime}" is launch-only. No session was started.` };
     }
     if (!found.ok) return { ok: false, error: found.message };
     const session = binding.tmuxSession ?? opts.name;
+    let firstInput: FirstInputPassed | undefined;
+    try {
+      if (found.preset.firstInput && opts.firstInputText !== undefined) {
+        firstInput = writeFirstInput(session, opts.firstInputText,
+          this.deps.launchResultRoot ? join(dirname(this.deps.launchResultRoot()), "first-input") : undefined);
+      }
+    } catch (error) {
+      return { ok: false, error: `Couldn't prepare the first input for community harness "${this.runtime}": ${(error as Error).message}; nothing was started.` };
+    }
+    const preset = found.preset.firstInput ? { ...found.preset, command: firstInput
+      ? `/usr/bin/env OPENRIG_FIRST_INPUT=${shellQuote(firstInput.path)} ${found.preset.command}`
+      : `/usr/bin/env -u OPENRIG_FIRST_INPUT ${found.preset.command}` } : found.preset;
+    let passed = false;
+    try {
+      const result = await this.launchPreset(session, preset, resumeRef, firstInput ? () => { passed = true; } : undefined);
+      return { ...result, ...(passed ? { firstInput } : {}) };
+    } catch (error) {
+      if (!passed) throw error;
+      return { ok: false, firstInput, error: `Community harness "${this.runtime}" launch is uncertain: ${(error as Error).message}` };
+    }
+  }
+
+  private async launchPreset(session: string, preset: CommunityHarnessPreset, resumeRef: string | undefined, beforeInput?: () => void): Promise<HarnessLaunchResult> {
+    if (preset.namesConversation) return this.launchNamed(session, preset.command, resumeRef, beforeInput);
     let attempt: LaunchAttempt | undefined;
-    let program = found.preset.command;
+    let program = preset.command;
     // The record is optional: a folder that can't be made leaves the identity unavailable, and the harness still launches.
     let storageNote: string | undefined;
-    if (found.preset.launchResult) {
+    if (preset.launchResult) {
       try {
         attempt = newLaunchAttempt(session, this.deps.launchResultRoot?.() ?? launchResultRoot());
         program = `/usr/bin/env OPENRIG_LAUNCH_RESULT=${shellQuote(attempt.file)} OPENRIG_LAUNCH_ATTEMPT=${attempt.attempt}`
@@ -98,7 +128,7 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
     const command = this.deps.seatLaunchEnvironment
       ? await this.deps.seatLaunchEnvironment.command(session, program, { runtime: this.runtime })
       : program;
-    const sent = await this.deps.tmux.sendShellCommand(session, command, undefined, { stageIfLong: true, execInScript: true });
+    const sent = await this.deps.tmux.sendShellCommand(session, command, beforeInput, { stageIfLong: true, execInScript: true });
     if (!sent.ok) return { ok: false, error: `Couldn't start community harness "${this.runtime}": ${sent.message}` };
     if (!attempt) return storageNote ? { ok: true, warnings: [storageNote] } : { ok: true };
     const read = await waitForLaunchResult(attempt, this.runtime, { ...this.deps.launchResultWait, root: this.deps.launchResultRoot?.() ?? launchResultRoot() });
@@ -122,6 +152,21 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
       : { ok: true, warnings: [`community harness "${this.runtime}": its launch identity is unavailable: ${read.reason}`] };
   }
 
+  /** OpenRig names the conversation: a new one gets a fresh name in OPENRIG_CONVERSATION, and a resume passes the saved name
+   *  in OPENRIG_RESUME_REF. Nothing reports back, so the name is recorded as passed, not observed, and readiness says only
+   *  that a process runs: a harness that hasn't yet found a gone conversation reads as ready. Never creating one on a
+   *  resume is the launcher's job; OpenRig never asks for a new conversation on a resume. */
+  private async launchNamed(session: string, preset: string, resumeRef: string | undefined, beforeInput?: () => void): Promise<HarnessLaunchResult> {
+    const name = resumeRef ?? conversationName(session);
+    const program = `/usr/bin/env ${resumeRef ? "OPENRIG_RESUME_REF" : "OPENRIG_CONVERSATION"}=${shellQuote(name)} ${preset}`;
+    const command = this.deps.seatLaunchEnvironment
+      ? await this.deps.seatLaunchEnvironment.command(session, program, { runtime: this.runtime })
+      : program;
+    const sent = await this.deps.tmux.sendShellCommand(session, command, beforeInput, { stageIfLong: true, execInScript: true });
+    if (!sent.ok) return { ok: false, error: `Couldn't start community harness "${this.runtime}": ${sent.message}` };
+    return { ok: true, resumeToken: name, resumeType: `community:${this.runtime}`, resumeProvenance: "passed" };
+  }
+
   async checkReady(binding: NodeBinding): Promise<ReadinessResult> {
     const session = binding.tmuxSession;
     if (!session || !(await this.deps.tmux.hasSession(session))) {
@@ -133,6 +178,24 @@ export class CommunityHarnessRuntimeAdapter implements RuntimeAdapter {
     }
     return { ready: true };
   }
+
+  /** Snapshot this launch's declaration before composing its first turn. */
+  firstInput(): boolean {
+    const found = loadCommunityHarnessPreset(this.runtime, this.deps.presetsDir?.() ?? communityHarnessesDir());
+    return found.ok && found.preset.firstInput;
+  }
+
+  /** A process running isn't proof that the startup paste was submitted. */
+  startupAssisted(): boolean {
+    const found = loadCommunityHarnessPreset(this.runtime, this.deps.presetsDir?.() ?? communityHarnessesDir());
+    return found.ok && found.preset.startupAssisted;
+  }
+}
+
+/** A new conversation's name: the seat's session name, made safe, and 8 random hex digits, at most 100 characters. */
+function conversationName(session: string): string {
+  const seat = session.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "seat";
+  return `openrig-${seat}-${randomBytes(4).toString("hex")}`;
 }
 
 /**

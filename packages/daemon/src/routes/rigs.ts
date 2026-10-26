@@ -165,6 +165,10 @@ function normalizeExpansionPodFragment(raw: Record<string, unknown>): ExpansionP
             : typeof m["codex_config_profile"] === "string"
               ? m["codex_config_profile"]
               : undefined,
+        ...("claudePermissions" in m ? { claudePermissions: m["claudePermissions"] }
+          : "claude_permissions" in m ? { claudePermissions: m["claude_permissions"] } : {}),
+        ...("codexPermissions" in m ? { codexPermissions: m["codexPermissions"] }
+          : "codex_permissions" in m ? { codexPermissions: m["codex_permissions"] } : {}),
         cwd: typeof m["cwd"] === "string" ? m["cwd"] : undefined,
         model: typeof m["model"] === "string" ? m["model"] : undefined,
         // R2 (4ac243c3): PRESERVE raw presence — a present-invalid value (null, number,
@@ -396,6 +400,7 @@ rigsRoutes.get("/:id/graph", async (c) => {
   const inventoryWithActivity = attachTerminalActivityAndWork(inventoryWithActivityOnly, {
     db: getRepo(c).db,
     seatActivity: seatActivityService,
+    agentActivity: agentActivityStore,
   });
 
   // PL-019 item 5: read-side join for active-qitem enrichment. Cheap by
@@ -423,6 +428,7 @@ rigsRoutes.get("/:id/graph", async (c) => {
     contextAvailability: n.contextUsage?.availability ?? "unknown",
     contextTotalInputTokens: n.contextUsage?.totalInputTokens ?? null,
     contextTotalOutputTokens: n.contextUsage?.totalOutputTokens ?? null,
+    needsAttention: n.needsAttention,
     agentActivity: n.agentActivity ?? null,
     currentQitems: n.canonicalSessionName
       ? currentQitemsBySession.get(n.canonicalSessionName) ?? []

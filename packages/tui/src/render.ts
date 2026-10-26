@@ -376,6 +376,10 @@ function agentDetailLines(
     ? snap.seatEffort.report
     : null;
   const activityReason = agent.activity?.needsInput?.reason ?? agent.activity?.signalReason ?? null;
+  const attention = agent.needsAttention == null ? "unknown" : agent.needsAttention ? "needed" : "not raised";
+  const rawInputSource = agent.activity?.signalSource === "runtime_hook" ? "hook"
+    : agent.activity?.signalSource === "pane_heuristic" ? "pane" : "unknown";
+  const inputEvidence = agent.arbitratedNeedsInput == null ? (agent.activity?.signalState === "needs_input" ? rawInputSource : "absent") : `${agent.arbitratedNeedsInput ? "observed input" : "observed clear"}${agent.needsInputEvidence ? ` · ${agent.needsInputEvidence.rung} · ${displayTime(agent.needsInputEvidence.observedAt, timeZone)}` : ""}`;
   const needsRows = needs.length > 0
     ? needs.flatMap((item) => [
       ...wrapDetailValue("qitem", item.qitemId ?? "no actionable qitem id served", contentWidth),
@@ -405,7 +409,7 @@ function agentDetailLines(
       {
         title: "CURRENT ACTIVITY",
         fields: [
-          { label: "activity", value: agent.activity?.activity ?? agent.status },
+          { label: "activity", value: `${agent.activity?.activity ?? agent.status} · attention ${attention} · needs-input evidence ${inputEvidence}` },
           ...(activityReason ? [{ label: "reason", value: activityReason }] : []),
           ...(agent.activity?.decidedBy ? [{ label: "decided by", value: agent.activity.decidedBy }] : []),
           ...(agent.activity?.signalSource || agent.activity?.signalReason ? [{ label: "signal", value: `${agent.activity.signalSource ?? "unknown"} · ${agent.activity.signalReason ?? "no reason"}` }] : []),
@@ -690,6 +694,19 @@ interface MotionCtx {
   loading: boolean;
 }
 
+/** A host page's line for a host with no rigs listed. Another host's rigs are read only once it is drilled into, through
+ *  this daemon, so for it "none" is claimed only when that read answered. */
+function noRigsText(snap: FleetSnapshot, host: FleetSnapshot["hosts"][number], local: boolean, motion: MotionCtx): string {
+  if (local) return "  (no local rigs served — proven empty)";
+  if (motion.loading) {
+    if (!motion.reduced) motion.used = true;
+    return `  ${motion.frame} ${host.name} rigs read pending`;
+  }
+  return snap.readErrors.some((error) => error.startsWith(`rigs-summary(${host.name})`))
+    ? "  ✕ rigs read failed — named in the status line"
+    : `  (no rigs served by ${host.name})`;
+}
+
 function instanceContentLines(
   state: ViewState,
   snap: FleetSnapshot,
@@ -701,10 +718,11 @@ function instanceContentLines(
   const scope = { kind: "instance", local: host === snap.hosts[0] } as const;
   if (state.viewTab === "health") return [...lines, { text: "" }, ...healthListLines(snap, scope, contentWidth)];
   if (state.viewTab === "recent") {
-    const recent = recentLines(snap, scope, contentWidth, true, state.timeZone);
+    // This host's queue changes are never listed under another host's name.
+    const recent = scope.local ? recentLines(snap, scope, contentWidth, true, state.timeZone) : [];
     return recent.length > 0
       ? [...lines, ...recent]
-      : [...lines, { text: "" }, { text: motion.loading ? `${motion.frame} instance RECENT read pending` : "(instance RECENT window not served)" }];
+      : [...lines, { text: "" }, { text: motion.loading && scope.local ? `${motion.frame} instance RECENT read pending` : "(instance RECENT window not served)" }];
   }
   if (state.viewTab === "overview") {
     return [
@@ -715,17 +733,18 @@ function instanceContentLines(
           fields: [
             { label: "identity", value: host.name },
             { label: "transport", value: host.id ?? "local" },
-            { label: "shape", value: host.rigs.some(r => r.inventoryUnavailable) ? `${host.rigs.length} rigs · seat inventory incomplete` : `${host.rigs.length} rigs · ${host.rigs.reduce((n, rig) => n + rig.pods.reduce((m, pod) => m + pod.agents.length, 0), 0)} seats` },
+            { label: "shape", value: !scope.local ? `${host.rigs.length} rigs · seats not read here`
+              : host.rigs.some(r => r.inventoryUnavailable) ? `${host.rigs.length} rigs · seat inventory incomplete` : `${host.rigs.length} rigs · ${host.rigs.reduce((n, rig) => n + rig.pods.reduce((m, pod) => m + pod.agents.length, 0), 0)} seats` },
           ],
         },
         {
           title: "rigs",
           lines: host.rigs.length > 0
             ? host.rigs.map((rig) => listItem(
-                alignedRow([[rig.name, 20], [rig.lifecycleState ?? "unknown", 20], [rig.inventoryUnavailable ? "inventory unavailable" : `${rig.pods.length} pods · ${rig.pods.reduce((n, pod) => n + pod.agents.length, 0)} seats`, 24]]),
+                alignedRow([[rig.name, 20], [rig.lifecycleState ?? "unknown", 20], [rig.remoteHost ? "seats not read here" : rig.inventoryUnavailable ? "inventory unavailable" : `${rig.pods.length} pods · ${rig.pods.reduce((n, pod) => n + pod.agents.length, 0)} seats`, 24]]),
                 { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } },
               ))
-            : [{ text: "  (no local rigs served — proven empty)" }],
+            : [{ text: noRigsText(snap, host, scope.local, motion) }],
         },
       ]),
     ];
@@ -734,7 +753,9 @@ function instanceContentLines(
     for (const rig of host.rigs) {
       lines.push({ text: "" }, sectionRule(`rig ${rig.name} · ${rig.lifecycleState ?? "unknown"}`, contentWidth));
       if (!rig.graph) {
-        if (motion.loading) {
+        if (rig.remoteHost) {
+          lines.push({ text: "  (another host's topology graph isn't read in this view)" });
+        } else if (motion.loading) {
           if (!motion.reduced) motion.used = true;
           lines.push({ text: `  ${motion.frame} topology graph read pending` });
         } else if (snap.readErrors.some((error) => error.startsWith(`graph(${rig.name})`))) {
@@ -753,10 +774,26 @@ function instanceContentLines(
         zones: canvas.zones.filter((zone) => zone.y === row).map((zone) => ({ start: zone.start, end: zone.end, action: zone.action })),
       });
     }
-    if (host.rigs.length === 0) lines.push({ text: "" }, { text: "  (no local rigs served — proven empty)" });
+    if (host.rigs.length === 0) lines.push({ text: "" }, { text: noRigsText(snap, host, scope.local, motion) });
     lines.push({ text: "" }, { text: `  style: ${state.graphStyle} · style hatchet|braille|braille-fallback rides the command bar` });
     return lines;
   }
+
+  // Another registered host: its reachability and its rigs' names and states, read through this daemon. Its seats and
+  // queue aren't read here, so none of this machine's are shown under its name.
+  if (!scope.local) return [
+    ...lines,
+    healthSummaryLine(snap, scope, contentWidth),
+    ...wrapDetailLines([
+      { text: `host ${host.name} · ${host.reachable ? "reachable" : "not reachable"}` },
+      { text: `Its seats aren't read in this view: rig ps --host ${host.name} --nodes -A` },
+    ], contentWidth),
+    { text: "" },
+    ...(host.rigs.length > 0
+      ? host.rigs.map((rig) => listItem(alignedRow([[rig.name, 20], [rig.lifecycleState ?? "unknown", 20]]),
+        { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } }))
+      : [{ text: noRigsText(snap, host, false, motion) }]),
+  ];
 
   lines.push(healthSummaryLine(snap, scope, contentWidth));
   lines.push(...queueSampleLines(snap, contentWidth));
@@ -767,6 +804,7 @@ function instanceContentLines(
   let seatCount = 0;
   let workingCount = 0;
   let attentionCount = 0;
+  let attentionUnknown = 0;
   let openCount = 0;
   for (const rig of host.rigs) {
     const agents = rig.pods.flatMap((pod) => pod.agents.map((agent) => ({ pod: pod.name, agent })))
@@ -789,7 +827,8 @@ function instanceContentLines(
       const queue = queueFacts(snap, agent.session);
       seatCount += 1;
       if (["active", "working", "running"].includes(agent.status)) workingCount += 1;
-      if (/attention|needs|blocked|unknown|failed/.test(agent.status)) attentionCount += 1;
+      if (agent.needsAttention === true) attentionCount += 1;
+      else if (agent.needsAttention == null) attentionUnknown += 1;
       openCount += queue.count;
       lines.push({
         text: tableRow(columns, {
@@ -808,7 +847,7 @@ function instanceContentLines(
       });
     }
   }
-  lines.push({ text: "" }, { text: host.rigs.some(r => r.inventoryUnavailable) ? `${host.rigs.length} rigs · inventory incomplete · ${seatCount} seats read` : `${host.rigs.length} rigs · ${seatCount} seats · ${workingCount} working · ${attentionCount} need attention · ${openCount}${queueIncomplete(snap) ? "+ sampled" : ""} open rows` });
+  lines.push({ text: "" }, { text: host.rigs.some(r => r.inventoryUnavailable) ? `${host.rigs.length} rigs · inventory incomplete · ${seatCount} seats read` : `${host.rigs.length} rigs · ${seatCount} seats · ${workingCount} working · ${attentionCount} need attention${attentionUnknown ? ` · ${attentionUnknown} attention unknown` : ""} · ${openCount}${queueIncomplete(snap) ? "+ sampled" : ""} open rows` });
   lines.push(...recentLines(snap, scope, contentWidth, false, state.timeZone));
   return lines;
 }
@@ -886,8 +925,16 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       if (snap.readErrors.some((e) => e.startsWith("rigs-summary"))) {
         return [{ text: "✕ rigs read failed — named in the status line (honest-empty, not fabricated)" }];
       }
+      // A drilled host this snapshot doesn't list proves nothing about its rigs.
+      if (hostName && !host) return [{ text: snap.readErrors.some((e) => e.startsWith("hosts:"))
+        ? `✕ host ${hostName} not listed: the hosts read failed — named in the status line`
+        : `host ${hostName} is not a registered host here · rig host list` }];
       return [{ text: "(no rigs served — proven empty, not fabricated)" }];
     }
+    if (rig.remoteHost) return [
+      { text: `rig ${rig.name} on ${rig.remoteHost} · ${rig.lifecycleState ?? "unknown"}` },
+      { text: `Its seats aren't read in this view: rig ps --host ${rig.remoteHost} --nodes --rig ${rig.name}` },
+    ];
     if (rig.inventoryNotLoaded) return [{ text: `Reading ${rig.name}…` }];
     if (rig.inventoryUnavailable) return [{ text: `Inventory unavailable for ${rig.name} · refresh to Retry` }];
     const podFilter = leaf?.kind === "pod" ? leaf.name : null;
@@ -1714,6 +1761,13 @@ function crashCartShell(
     explorerRows: [],
     segRows,
   };
+}
+
+/** The size to draw at, or null when the terminal reports 0 rows or columns (a detached, headless or just-resizing pane):
+ *  nothing fits yet, so the caller skips the frame and draws on the next resize. An unreported size keeps the defaults. */
+export function drawableSize(columns: number | undefined, rows: number | undefined): { cols: number; rows: number } | null {
+  const size = { cols: columns ?? 120, rows: rows ?? 32 };
+  return size.cols > 0 && size.rows > 0 ? size : null;
 }
 
 export function renderScreen(state: ViewState, snap: FleetSnapshot, options: RenderOptions = {}, inputLine = ""): Screen {

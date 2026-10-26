@@ -1,3 +1,5 @@
+import type { ClaudeCompactionEnforcer, ObservedCompaction } from "./claude-compaction-enforcer.js";
+import path from "node:path";
 import { TerminalPolicyStore } from "./terminal-policy.js";
 import type { RigRepository } from "./rig-repository.js";
 import { deriveCanonicalFromEntry, getNodeInventory } from "./node-inventory.js";
@@ -6,10 +8,13 @@ import type { NodeInventoryEntry, SeatIdentityVerdict } from "./types.js";
 import { NativePermissionStore, type StoredNativePermissionSelection, type ResolvedSeatPermission } from "./native-permission-store.js";
 import { AppliedLaunchObservationStore, type StoredAppliedLaunchObservation } from "./applied-launch-observation-store.js";
 import { planPermissionAccount, type PermissionAccount } from "./permission-account.js";
+import { RUNTIME_HOME_VAR, seatRuntimeHome, type HomeRuntime } from "./seat-runtime-home.js";
+import { claudeSeatTokenFallbackNotice, claudeSeatTokenFileProblem, readClaudeSeatTokenRef } from "./claude-seat-token.js";
 
 const SEAT_LOOKUP_GUIDANCE = "List seats with: rig ps --nodes";
 
 export interface SeatStatus {
+  compaction?: ObservedCompaction & { owedRestore: ReturnType<ClaudeCompactionEnforcer["getOwedRestore"]> };
   seat_ref: string;
   rig_id: string;
   rig_name: string;
@@ -29,6 +34,17 @@ export interface SeatStatus {
   previous_occupant: string | null;
   handover_at: string | null;
   restore_outcome: NodeInventoryEntry["restoreOutcome"];
+  /** Claude and Codex seats: the home (and with it the login) the seat's launches use. Configured, not proof of
+   *  which login a running process holds. `ignored` is a declared value that isn't an absolute path. */
+  runtime_home?: {
+    variable: "CLAUDE_CONFIG_DIR" | "CODEX_HOME";
+    home: string | null;
+    source: "member" | "rig" | "daemon" | "native_default";
+    ignored?: { source: "member" | "rig"; value: string };
+  };
+  /** A Claude seat's own subscription token: its reference (never the value), and whether the file would give Claude the
+   *  token at the next launch. When it wouldn't, Claude starts on the config dir's stored login, and `notice` says so. */
+  claude_token?: { label: string; token_file: string; file: "readable" | "unusable"; problem?: string; notice?: string };
   terminalPolicy: ReturnType<TerminalPolicyStore["account"]> | { state: "unknown"; error: string };
   permissions: {
     selectionState: "explicit" | "inherit" | "unknown";
@@ -53,9 +69,13 @@ interface SeatMatch {
 
 export class SeatStatusService {
   private rigRepo: RigRepository;
+  private env: NodeJS.ProcessEnv;
+  private compactionEnforcer?: Pick<ClaudeCompactionEnforcer, "recoverSeat" | "observedCompaction" | "getOwedRestore">;
 
-  constructor(deps: { rigRepo: RigRepository }) {
+  constructor(deps: { rigRepo: RigRepository; env?: NodeJS.ProcessEnv; compactionEnforcer?: SeatStatusService["compactionEnforcer"] }) {
+    this.compactionEnforcer = deps.compactionEnforcer;
     this.rigRepo = deps.rigRepo;
+    this.env = deps.env ?? process.env;
   }
 
   getStatus(seatRef: string): SeatStatusResult {
@@ -85,6 +105,16 @@ export class SeatStatusService {
     return { ok: true, status: this.projectStatus(ref, matches[0]!.entry) };
   }
 
+  getStatusByNodeId(nodeId: string): SeatStatusResult {
+    const id = nodeId.trim();
+    if (!id) return { ok: false, code: "seat_ref_required", message: "node ID is required", guidance: SEAT_LOOKUP_GUIDANCE };
+    const row = this.rigRepo.db.prepare(`SELECT n.rig_id FROM nodes n JOIN rigs r ON r.id = n.rig_id
+      WHERE n.id = ? AND r.archived_at IS NULL`).get(id) as { rig_id: string } | undefined;
+    const entry = row && this.entriesForRig(row.rig_id).find(candidate => candidate.nodeId === id);
+    if (!entry) return { ok: false, code: "seat_not_found", message: `Node "${id}" not found in an active rig.`, guidance: SEAT_LOOKUP_GUIDANCE };
+    return { ok: true, status: this.projectStatus(entry.canonicalSessionName ?? deriveCanonicalFromEntry(entry) ?? entry.logicalId, entry) };
+  }
+
   private findMatches(ref: string): SeatMatch[] {
     // OPR.0.4.6.MH1 FR-8: the shared parse contract (greedy first-@ rig).
     const parsed = parseSessionName(ref);
@@ -112,6 +142,7 @@ export class SeatStatusService {
 
   private projectStatus(seatRef: string, entry: NodeInventoryEntry): SeatStatus {
     return {
+      ...this.compactionStatus(entry),
       seat_ref: seatRef,
       rig_id: entry.rigId,
       rig_name: entry.rigName,
@@ -130,9 +161,42 @@ export class SeatStatusService {
       previous_occupant: entry.previousOccupant,
       handover_at: entry.handoverAt,
       restore_outcome: entry.restoreOutcome,
+      ...this.runtimeHomeStatus(entry.nodeId, entry.runtime),
+      ...this.claudeTokenStatus(entry.nodeId, entry.runtime),
       permissions: this.permissionStatus(entry.nodeId, entry.runtime, entry.canonicalSessionName ?? deriveCanonicalFromEntry(entry) ?? seatRef),
       terminalPolicy: this.terminalPolicyStatus(entry.nodeId, entry.runtime),
     };
+  }
+
+  private compactionStatus(entry: NodeInventoryEntry): Pick<SeatStatus, "compaction"> {
+    const enforcer = this.compactionEnforcer, session = entry.canonicalSessionName;
+    if (!enforcer || entry.runtime !== "claude-code" || !session) return {};
+    enforcer.recoverSeat({ sessionName: session, cwd: entry.cwd, runtime: entry.runtime });
+    const observed = enforcer.observedCompaction(session);
+    return observed ? { compaction: { ...observed, owedRestore: enforcer.getOwedRestore(session) } } : {};
+  }
+
+  private runtimeHomeStatus(nodeId: string, runtime: string | null): Pick<SeatStatus, "runtime_home"> {
+    if (!runtime || !Object.hasOwn(RUNTIME_HOME_VAR, runtime)) return {};
+    const variable = RUNTIME_HOME_VAR[runtime as HomeRuntime];
+    const own = seatRuntimeHome(this.rigRepo.db, nodeId, runtime as HomeRuntime);
+    const ignored = own.ignored ? { ignored: own.ignored } : {};
+    if (own.home && own.source) return { runtime_home: { variable, home: own.home, source: own.source } };
+    // The daemon's explicit value, as its launches pass it on; else the runtime's native default under HOME.
+    const daemon = this.env[variable];
+    if (daemon) return { runtime_home: { variable, home: daemon, source: "daemon", ...ignored } };
+    const home = this.env.HOME;
+    const native = home ? path.join(home, runtime === "codex" ? ".codex" : ".claude") : null;
+    return { runtime_home: { variable, home: native, source: "native_default", ...ignored } };
+  }
+
+  private claudeTokenStatus(nodeId: string, runtime: string | null): Pick<SeatStatus, "claude_token"> {
+    if (runtime !== "claude-code") return {};
+    const ref = readClaudeSeatTokenRef(this.rigRepo.db, nodeId);
+    if (!ref) return {};
+    const problem = claudeSeatTokenFileProblem(ref);
+    return { claude_token: { label: ref.label, token_file: ref.tokenFile, file: problem ? "unusable" : "readable",
+      ...(problem ? { problem, notice: claudeSeatTokenFallbackNotice(ref, problem) } : {}) } };
   }
 
   private terminalPolicyStatus(nodeId: string, runtime: string | null): SeatStatus["terminalPolicy"] {

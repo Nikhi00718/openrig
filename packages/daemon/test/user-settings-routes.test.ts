@@ -125,7 +125,15 @@ describe("config routes (User Settings v0)", () => {
     // + 1 terminal.history_limit (rows of tmux scrollback in the block rig setup writes; default 10000).
     // + 1 skills.router_line.enabled (the seat-skills bootstrap line; default off).
     // + 1 instance-wide Claude compaction preparation root (#1445).
-    expect(Object.keys(body.settings).length).toBe(85);
+    // + 3 decisions.enabled / consumers / template_dir (slice 22 typed decisions; default off, none, shipped).
+    // + 1 daemon.db_conflict (warn by default; optional pre-open conflict stop).
+    // + 1 provider.selected (the providers chosen at rig setup --providers; default empty).
+    // + 2 retention.stream_days / stream_max_items (slice 22 outcome 9 stream retention; default 30, 20000).
+    expect(Object.keys(body.settings).length).toBe(92);
+    expect(body.settings["retention.stream_days"]).toMatchObject({ value: 30, source: "default", defaultValue: 30 });
+    expect(body.settings["retention.stream_max_items"]).toMatchObject({ value: 20000, source: "default", defaultValue: 20000 });
+    expect(body.settings["decisions.enabled"]).toMatchObject({ value: false, source: "default", defaultValue: false });
+    expect(body.settings["provider.selected"]).toMatchObject({ value: "", source: "default", defaultValue: "" });
     expect(body.settings["terminal.history_limit"]).toMatchObject({ value: 10000, source: "default", defaultValue: 10000 });
     expect(body.settings).not.toHaveProperty("provider.subscription_moves");
     expect(body.settings["launch.non_interruptive"]).toMatchObject({ value: false, source: "default" });

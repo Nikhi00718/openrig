@@ -36,13 +36,68 @@ export const ENTITY_ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/;
 export const ADDRESS_DOMAIN = "external";
 
 // Closed key sets — a typo'd field must fail LOUD, never silently degrade behavior.
-const ALLOWED_FRAGMENT_KEYS = new Set(["entityId", "class", "displayName", "address", "connectorBindings", "prefs"]);
+const ALLOWED_FRAGMENT_KEYS = new Set(["entityId", "class", "displayName", "address", "connectorBindings", "prefs", "subscriptions"]);
 const ALLOWED_BINDING_KEYS = new Set(["kind", "connectorRef", "secretsRef", "role", "handle"]);
 // A connector handle (M1 A6 v3 schema 9e468b2f): the platform-native id of the human ON that
 // connector (e.g. a Slack user id). Constrained so it can never forge a session ref (no ':' / '@'
 // / whitespace) — it is compared to an inbound sender id and spliced into teaching text.
 export const HANDLE_PATTERN = /^[A-Za-z0-9._-]+$/;
 const ALLOWED_PREFS_KEYS = new Set(["deliveryClass", "away", "availability"]);
+
+/** Attention subscriptions: where a person's items go besides Steering and the TUI, each a saved filter plus a
+ *  destination. The first is Slack's, with two preset filters. Field filters and channel destinations extend these
+ *  objects later without a migration. */
+export const SUBSCRIPTION_PRESETS = ["every-ask", "urgent-only"] as const;
+export type SubscriptionPreset = (typeof SUBSCRIPTION_PRESETS)[number];
+/** With no Slack subscription authored, every ask posts, as before subscriptions existed, so nothing changes on upgrade. */
+export const DEFAULT_SLACK_PRESET: SubscriptionPreset = "every-ask";
+export interface AttentionSubscription {
+  /** Where matching items go: the person's Slack binding. */
+  destination: { connector: "slack" };
+  /** Which items: `every-ask` (every ask to them) or `urgent-only` (asks marked --alert, which carry HUMAN_ALERT_TAG). */
+  filter: { preset: SubscriptionPreset };
+}
+const ALLOWED_SUBSCRIPTION_KEYS = new Set(["destination", "filter"]);
+
+/** The person's Slack subscription preset, and whether they authored it. */
+export function slackSubscriptionFor(human: Pick<HumanFragment, "subscriptions"> | undefined): { preset: SubscriptionPreset; source: "authored" | "default" } {
+  const authored = human?.subscriptions?.find((sub) => sub.destination.connector === "slack");
+  return authored ? { preset: authored.filter.preset, source: "authored" } : { preset: DEFAULT_SLACK_PRESET, source: "default" };
+}
+
+function validateSubscriptions(value: unknown): { ok: true; subscriptions: AttentionSubscription[] } | { ok: false; error: string } {
+  if (!Array.isArray(value)) return { ok: false, error: "subscriptions must be a list of { destination, filter }" };
+  const subscriptions: AttentionSubscription[] = [];
+  for (const [i, sub] of value.entries()) {
+    const where = `subscriptions[${i}]`;
+    if (!isObj(sub)) return { ok: false, error: `${where} must be a mapping { destination, filter }` };
+    const uk = unknownKey(sub, ALLOWED_SUBSCRIPTION_KEYS);
+    if (uk) return { ok: false, error: `${where} has unknown key "${uk}" — allowed: destination, filter` };
+    const { destination, filter } = sub;
+    if (!isObj(destination) || unknownKey(destination, new Set(["connector"])) || destination.connector !== "slack") {
+      return { ok: false, error: `${where}.destination must be { connector: slack } (the person's Slack binding)` };
+    }
+    if (!isObj(filter) || unknownKey(filter, new Set(["preset"])) || typeof filter.preset !== "string"
+      || !(SUBSCRIPTION_PRESETS as readonly string[]).includes(filter.preset)) {
+      return { ok: false, error: `${where}.filter must be { preset: ${SUBSCRIPTION_PRESETS.join("|")} }` };
+    }
+    if (subscriptions.some((s) => s.destination.connector === "slack")) return { ok: false, error: `${where}: one Slack subscription per person` };
+    subscriptions.push({ destination: { connector: "slack" }, filter: { preset: filter.preset as SubscriptionPreset } });
+  }
+  return { ok: true, subscriptions };
+}
+
+/** The tag an ask created or handed off with humanAlert (`--alert`) carries: it stands out in Slack, as an interrupt,
+ *  under every setting. */
+export const HUMAN_ALERT_TAG = "human-alert";
+
+/** The ask's tags, with HUMAN_ALERT_TAG exactly when this create or handoff is marked alert-worthy: an inherited one is
+ *  dropped, so `--alert` decides per item. */
+export function withHumanAlertTag(tags: string[] | null | undefined, humanAlert: boolean | undefined): string[] | null {
+  const rest = (tags ?? []).filter((tag) => tag !== HUMAN_ALERT_TAG);
+  if (humanAlert === true) return [...rest, HUMAN_ALERT_TAG];
+  return tags ? rest : null;
+}
 // OPR.0.5.6.1 — the availability enum the delivery rules engine consumes.
 // Legacy `away: true` reads as availability=away ONLY when availability is
 // whole-field-absent (the D1 convention); a present-but-conflicting pair is
@@ -88,6 +143,8 @@ export interface HumanFragment {
   address: string;
   connectorBindings: HumanConnectorBinding[];
   prefs: HumanPrefs;
+  /** Attention subscriptions (one per connector for now); none means the default Slack subscription. */
+  subscriptions?: AttentionSubscription[];
 }
 
 export type ValidateResult =
@@ -105,7 +162,7 @@ export function validateHumanFragment(raw: unknown): ValidateResult {
   if (!isObj(raw)) return { ok: false, error: "human fragment must be a mapping" };
   const uk = unknownKey(raw, ALLOWED_FRAGMENT_KEYS);
   if (uk) return { ok: false, error: `unknown fragment key "${uk}" — allowed: ${[...ALLOWED_FRAGMENT_KEYS].join(", ")} (a typo must not silently degrade)` };
-  const { entityId, class: cls, displayName, address, connectorBindings, prefs } = raw;
+  const { entityId, class: cls, displayName, address, connectorBindings, prefs, subscriptions: rawSubscriptions } = raw;
 
   if (typeof entityId !== "string" || !ENTITY_ID_PATTERN.test(entityId)) {
     return { ok: false, error: `entityId "${String(entityId)}" must be a lowercase slug (a-z0-9._- , no leading/trailing separator)` };
@@ -196,10 +253,16 @@ export function validateHumanFragment(raw: unknown): ValidateResult {
   const validatedPrefs: HumanPrefs = { deliveryClass: prefs.deliveryClass as HumanPrefs["deliveryClass"] };
   if (prefs.away !== undefined) validatedPrefs.away = prefs.away;
   if (prefs.availability !== undefined) validatedPrefs.availability = prefs.availability as HumanPrefs["availability"];
+  let subscriptions: AttentionSubscription[] | undefined;
+  if (rawSubscriptions !== undefined) {
+    const v = validateSubscriptions(rawSubscriptions);
+    if (!v.ok) return v;
+    subscriptions = v.subscriptions;
+  }
 
   return {
     ok: true,
-    fragment: { entityId, class: "human", displayName, address, connectorBindings: bindings, prefs: validatedPrefs },
+    fragment: { entityId, class: "human", displayName, address, connectorBindings: bindings, prefs: validatedPrefs, ...(subscriptions ? { subscriptions } : {}) },
   };
 }
 
@@ -209,6 +272,23 @@ export function humansDir(home: string = getOpenRigHome()): string {
 }
 export function projectionPath(home: string = getOpenRigHome()): string {
   return join(home, "gateway", "humans.generated.yaml");
+}
+/** The participant side file (participants.ts owns its contents). Older daemons never read it. */
+export function participantsPath(home: string = getOpenRigHome()): string {
+  return join(home, "gateway", "participants.yaml");
+}
+
+/** People and shared channels share one address space (<id>@external): the shared channel registered under `entityId`,
+ *  if the participant file names one. A file that doesn't parse names none here — it never blocks registering a person,
+ *  and its own error is reported where it's read. */
+function sharedChannelWithId(entityId: string, home: string): string | null {
+  const path = participantsPath(home);
+  if (!existsSync(path)) return null;
+  let raw: unknown;
+  try { raw = parseYaml(readFileSync(path, "utf8")); } catch { return null; }
+  const entry = isObj(raw) && isObj(raw.participants) ? raw.participants[entityId] : undefined;
+  if (!isObj(entry) || entry.kind !== "shared-channel") return null;
+  return typeof entry.displayName === "string" ? entry.displayName : entityId;
 }
 
 /** @deprecated Historical spelling retained for readers of old records only.
@@ -321,7 +401,7 @@ export function resolveSlackHandle(
   };
 }
 
-function atomicWrite(path: string, body: string): { ok: true } | { ok: false; error: string } {
+export function atomicWrite(path: string, body: string): { ok: true } | { ok: false; error: string } {
   try {
     mkdirSync(dirname(path), { recursive: true });
     const tmp = `${path}.tmp-${process.pid}`;
@@ -361,6 +441,11 @@ export function addHumanFragment(
   const file = join(humansDir(home), `${v.fragment.entityId}.yaml`);
   if (!opts.replace && existsSync(file)) {
     return { ok: false, error: `human "${v.fragment.entityId}" already exists at ${file} — pass an explicit replace to update it (no silent overwrite)` };
+  }
+  // A person can't take a shared channel's id: they'd share <id>@external, and the participant file would stop reading.
+  const channel = sharedChannelWithId(v.fragment.entityId, home);
+  if (channel !== null) {
+    return { ok: false, error: `"${v.fragment.entityId}" is already the shared channel "${channel}" (${v.fragment.entityId}@${ADDRESS_DOMAIN}); choose another id for the person, or remove the channel first with rig gateway channel remove ${v.fragment.entityId}` };
   }
   // A6 v3 pin-1: reject a handle already claimed by a DIFFERENT human BEFORE writing (never leave a
   // conflicting fragment on disk with a failed re-projection). projectHumans is the load-time backstop.
@@ -424,13 +509,8 @@ export interface HumanSummary {
 }
 
 export type ListHumansResult =
-  | { ok: true; humans: HumanSummary[]; advisory?: string }
+  | { ok: true; humans: HumanSummary[] }
   | { ok: false; error: string };
-
-/** Amendment A1 (founder R5): the human surface is SINGLE-HUMAN. Several fragments render
- *  honestly, but enumeration is display, never management — the advisory names the boundary. */
-export const MULTI_HUMAN_ADVISORY =
-  "several human fragments exist; OpenRig supports one configured human, so they are displayed as found and no command manages several";
 
 /** A field value with its provenance: authored in the fragment, or filled by a default. */
 export interface ProvenancedValue<T> {
@@ -447,6 +527,8 @@ export interface EffectiveHumanRecord {
     deliveryClass: ProvenancedValue<HumanPrefs["deliveryClass"]>;
     away: ProvenancedValue<boolean>;
   };
+  /** The Slack subscription's preset filter (`every-ask` unless authored). */
+  slackSubscription: ProvenancedValue<SubscriptionPreset>;
   connectorBindings: Array<HumanConnectorBinding & { inboundResolvable: boolean }>;
 }
 
@@ -526,7 +608,8 @@ export function listHumans(home: string = getOpenRigHome()): ListHumansResult {
       fragmentPath: fragmentPathFor(e.entityId, home),
     };
   });
-  return humans.length > 1 ? { ok: true, humans, advisory: MULTI_HUMAN_ADVISORY } : { ok: true, humans };
+  // Several people are a supported registry (0.7.3): the default and their placement live in gateway/participants.yaml.
+  return { ok: true, humans };
 }
 
 /** Read one fragment RAW (for authored-vs-default provenance) + validated. */
@@ -564,13 +647,14 @@ export function showHuman(entityId: string, home: string = getOpenRigHome()): Sh
           source: rawPrefs.away !== undefined ? "authored" : "default",
         },
       },
+      slackSubscription: (({ preset, source }) => ({ value: preset, source }))(slackSubscriptionFor(f.fragment)),
       connectorBindings: f.fragment.connectorBindings.map((b) => ({ ...b, inboundResolvable: b.handle !== undefined })),
     },
   };
 }
 
 const SETTABLE_FIELDS_TEACHING =
-  "settable fields: display-name, delivery-class, away, availability (available|focus|away|off, or unset), binding.<n> (binding.<n> takes a full kind:connectorRef:secretsRef:role[:handle=<id>] spec)";
+  "settable fields: display-name, delivery-class, away, availability (available|focus|away|off, or unset), slack-subscription (every-ask|urgent-only, or unset for every-ask), binding.<n> (binding.<n> takes a full kind:connectorRef:secretsRef:role[:handle=<id>] spec)";
 
 /** Cross-fragment handle-uniqueness: the same pre-write check add runs (one platform id =
  *  one human), extracted so set enforces it identically. */
@@ -659,6 +743,14 @@ export function setHumanField(
     if (value === "unset") delete rawPrefs.availability;
     else rawPrefs.availability = value;
     raw.prefs = rawPrefs;
+  } else if (field === "slack-subscription") {
+    // The preset of the person's Slack subscription. `unset` removes it, so the default (DEFAULT_SLACK_PRESET) applies;
+    // the add-time validator checks any other value.
+    const others = (Array.isArray(raw.subscriptions) ? raw.subscriptions : [])
+      .filter((sub) => !(isObj(sub) && isObj(sub.destination) && sub.destination.connector === "slack"));
+    const next = value === "unset" ? others : [...others, { destination: { connector: "slack" }, filter: { preset: value } }];
+    if (next.length) raw.subscriptions = next;
+    else delete raw.subscriptions;
   } else if (field.startsWith("binding.")) {
     const idxRaw = field.slice("binding.".length);
     const idx = /^\d+$/.test(idxRaw) ? Number.parseInt(idxRaw, 10) : NaN;
@@ -775,6 +867,12 @@ export type LoadResult =
   | { ok: true; entities: HumanFragment[] }
   /** `noHumans`: refused because nobody is registered yet (no fragments, nothing projected), not a broken registry. */
   | { ok: false; error: string; noHumans?: true };
+
+/** The people a load names, for paths that don't need a person: none when nobody is registered yet, so a registered
+ *  shared channel still converses in a channel-only setup (0.7.3); null when the registry is broken (fail-closed). */
+export function registeredPeople(loaded: LoadResult): HumanFragment[] | null {
+  return loaded.ok ? loaded.entities : loaded.noHumans ? [] : null;
+}
 
 /** Recognize only projection bytes an adopted generator could have emitted. The
  * parsed snapshot is validation evidence, never identity input; current fragments

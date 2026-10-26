@@ -24,7 +24,8 @@ import { resolvePickupThresholdMinutes } from "./queue-pickup.js";
 // share one contract instead of two guesses. S03 owns park/wake honesty: state=blocked rows
 // legitimately wait; only an undelivered human notice is a delivery finding.
 
-import { defaultResolveOrchestrator } from "./queue-owner.js";
+import { defaultResolveOrchestrator, resolveOperatorSeat, resolveRecoveryAgentSeat, resolveSessionNodeId } from "./queue-owner.js";
+import { nodeSessionConfirmedMissing } from "./node-inventory.js";
 import type Database from "better-sqlite3";
 import { deriveCrossHostSuccessorId, hasLinkedSuccessor, matchesRecordedHandoffTarget, QueueRepositoryError, type QueueItem, type QueueRepository } from "./queue-repository.js";
 import { stalledPickupFinding } from "./queue-pickup.js";
@@ -39,6 +40,13 @@ export const STUCK_SWEEP_CUSTODY_WINDOW_HOURS = 24;
 
 /** Stamp tag on every routed finding row: the sweep's self-exclusion mark. */
 export const STUCK_SWEEP_FINDING_TAG = "stuck-sweep-finding";
+
+/** How a confirmed-missing seat's finding names the rule that chose its recovery seat, in the order tried. */
+const RECOVERY_SEAT_RULES = [
+  "the operator agent (agents.operator_session)",
+  "the operator seat (workspace.operator_seat_name)",
+  "the row's creator",
+] as const;
 
 // S01 ladder marker vocabulary (the seam contract). S01 writes these transition-note
 // prefixes; the sweep derives "live ladder" from the latest marker. An attempt/rung is
@@ -152,9 +160,20 @@ export interface StuckSweepDeps {
   status?: StuckSweepStatus;
   /** Route resolution for obligations nobody holds: the destination seat's orchestrator
    *  (delegates_to parentage). null = no orchestrator known → the finding stays with the
-   *  destination (the row is durable there even if the seat is dead — S01 is the wake
-   *  layer). Injectable for tests; default derives from topology. */
+   *  destination, unless that session is confirmed missing (below): S01's ladder covers
+   *  handed-off batons only, so a finding addressed to a dead seat would reach nobody.
+   *  Injectable for tests; default derives from topology. */
   resolveOrchestrator?: (session: string) => string | null;
+  /** Is this session's current binding confirmed missing (node inventory's session_missing
+   *  rule)? Such a session's finding goes to a live recovery seat when one is available.
+   *  Injectable for tests; default reads the seat identity verdicts. */
+  sessionConfirmedMissing?: (session: string) => boolean;
+  /** The agent a confirmed-missing session's finding goes to first. Injectable for tests;
+   *  default reads agents.operator_session. */
+  resolveRecoveryAgentSeat?: () => string | null;
+  /** Where that finding goes next, before the stuck row's creator: the wake ladder's own
+   *  floor. Injectable for tests; default reads workspace.operator_seat_name. */
+  resolveOperatorSeat?: () => string | null;
   unclaimedAgeMinutes?: number;
   custodyWindowHours?: number;
   now?: Date;
@@ -188,7 +207,7 @@ export interface StuckSweepResult {
   error?: string;
 }
 
-export { resolveSessionNodeId, defaultResolveOrchestrator } from "./queue-owner.js";
+export { resolveSessionNodeId, defaultResolveOrchestrator, resolveOperatorSeat } from "./queue-owner.js";
 
 interface TransitionNoteRow {
   transition_note: string | null;
@@ -310,6 +329,12 @@ function minutesSince(iso: string | null | undefined, now: Date): number {
   const then = Date.parse(iso);
   if (Number.isNaN(then)) return 0;
   return Math.max(0, Math.round((now.getTime() - then) / 60_000));
+}
+
+/** Whole minutes, floored as the pickup evidence counts them (queue-pickup.ts). */
+function wholeMinutesSince(iso: string, now: Date): number {
+  const then = Date.parse(iso);
+  return Number.isNaN(then) ? 0 : Math.max(0, Math.floor((now.getTime() - then) / 60_000));
 }
 
 function lastTransitionLine(db: Database.Database, qitemId: string): string {
@@ -460,14 +485,17 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       if (!row || isFindingRow(row)) continue;
       const stalled = stalledPickupFinding(row);
       if (!stalled) continue;
+      // Keep this null arm for the 0.5.7 mechanized-pull turn-end hook that knows the in-flight row;
+      // it is the first honest row-scoped writer, and wiring reopens only in that slice.
+      const evidenceAt = latestIso(lastMeaningfulTransition(deps.db, row.qitemId)?.at, row.lastHeartbeat, row.claimedAt);
       candidates.push({
         kind: stalled.kind,
         row,
         route: resolveOrch(stalled.target) ?? stalled.target,
-        ageMinutes: minutesSince(row.claimedAt, now),
-        // Keep this null arm for the 0.5.7 mechanized-pull turn-end hook that knows the in-flight row;
-        // it is the first honest row-scoped writer, and wiring reopens only in that slice.
-        evidenceAt: latestIso(lastMeaningfulTransition(deps.db, row.qitemId)?.at, row.lastHeartbeat, row.claimedAt),
+        // The stall's own age: from the anchor the pickup decision uses, floored as its "why" counts, so a claim
+        // parked and resumed doesn't count its parked time and the headline matches the why to the minute.
+        ageMinutes: wholeMinutesSince(evidenceAt, now),
+        evidenceAt,
         why: stalled.evidence,
       });
     }
@@ -557,6 +585,8 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       // that human; it is not stuck, and a finding would post the human again. Unposted, failed,
       // legacy and non-human rows keep this net.
       if (deps.queueRepo.humanNotificationPostedThisEpisode(row.qitemId)) continue;
+      // An ask placed on Steering without an alert waits on its person there by design; a finding would alert them.
+      if (deps.queueRepo.humanAskWithoutAlert(row.qitemId)) continue;
       // Quiet hours: a held ask whose window's release job is live waits on that job, and one already released waits on
       // its post; neither is stuck. A release whose post failed is reported once, by the undelivered-wake loop above. A
       // hold with no live release job is stuck: nothing will ever release it.
@@ -696,10 +726,39 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       });
     }
 
+    // A finding for a confirmed-missing session goes to a live recovery seat when one is available,
+    // since nothing would ever wake the missing one (the ladder covers handed-off batons only): the
+    // operator agent, else the operator seat (the ladder's own floor, the person approvals use), else
+    // the stuck row's creator, skipping any that is unset, confirmed missing or this seat. When none
+    // qualifies, the finding stays addressed to the missing session and says so; it's never dropped.
+    // A live seat keeps its own.
+    const sessionMissing = deps.sessionConfirmedMissing ?? ((session: string) => {
+      const nodeId = resolveSessionNodeId(deps.db, session);
+      return nodeId !== null && nodeSessionConfirmedMissing(deps.db, nodeId);
+    });
+    let recoverySeats: Array<string | null> | undefined;
+    for (const c of candidates) {
+      if (!sessionMissing(c.route)) continue;
+      recoverySeats ??= [(deps.resolveRecoveryAgentSeat ?? resolveRecoveryAgentSeat)(), (deps.resolveOperatorSeat ?? resolveOperatorSeat)()];
+      const choices = [...recoverySeats, c.row.sourceSession];
+      const chosen = choices.findIndex((seat) => !!seat && seat !== c.route && !sessionMissing(seat));
+      const floor = chosen < 0 ? null : choices[chosen]!;
+      if (!floor) {
+        c.why += `; ${c.route} is confirmed missing (session_missing) and no live recovery seat is available (operator agent, operator seat and creator are each unset, missing or this seat; an operator agent setting that's unreadable or isn't an agent's session counts as unset), so this finding stays addressed to it`;
+        continue;
+      }
+      // Name the rule that chose it, so whoever receives the finding knows why, and which setting to change.
+      c.why += `; ${c.route} is confirmed missing (session_missing), so this finding goes to ${floor}, ${RECOVERY_SEAT_RULES[chosen]}`;
+      c.route = floor;
+    }
+
     // Route: idempotent per (row, kind). An existing open finding refreshes its age; a
     // new one is created durable + waking (the create path's default nudge).
     const findings: StuckSweepFindingAction[] = [];
     const liveDedupTags = new Set<string>();
+    // A finding that could not be created (a row whose destination no longer resolves, say) must not
+    // stop the others: it is reported, its row stays detected, and the pass is still a failure.
+    const failedCreates: string[] = [];
     for (const c of [...new Map(candidates.map(c => [c.row.qitemId, c])).values()]) {
       const dedupTag = findingDedupTag(c.kind, c.row.qitemId);
       const shared = findQueueRecovery(deps.db, c.row.qitemId);
@@ -743,8 +802,14 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
           // OpenRig's own finding, whoever created the stuck row.
           wakeTrigger: "openrig" as const,
         };
-        const created = await deps.queueRepo.create(input);
-        findings.push({ kind: c.kind, qitemId: c.row.qitemId, findingQitemId: created.qitemId, action: "created" });
+        try {
+          const created = await deps.queueRepo.create(input);
+          findings.push({ kind: c.kind, qitemId: c.row.qitemId, findingQitemId: created.qitemId, action: "created" });
+        } catch (err) {
+          const message = `${c.kind} finding for ${c.row.qitemId} to ${c.route} not created: ${err instanceof Error ? err.message : String(err)}`;
+          log(`[stuck-sweep] ${message}`);
+          failedCreates.push(message);
+        }
       }
     }
 
@@ -752,11 +817,11 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     // with its reason — the sweep cleans up after itself, no human unwind.
     const openFindings = deps.db
       .prepare(
-        `SELECT qitem_id, source_session, tags FROM queue_items
+        `SELECT qitem_id, tags FROM queue_items
           WHERE state IN ('pending', 'in-progress', 'blocked')
             AND tags LIKE ?`,
       )
-      .all(`%"${STUCK_SWEEP_FINDING_TAG}"%`) as Array<{ qitem_id: string; source_session: string; tags: string }>;
+      .all(`%"${STUCK_SWEEP_FINDING_TAG}"%`) as Array<{ qitem_id: string; tags: string }>;
     for (const f of openFindings) {
       let tags: string[] = [];
       try {
@@ -775,7 +840,8 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       if (suppressedTags.has(dedupTag)) continue;
       await deps.queueRepo.update({
         qitemId: f.qitem_id,
-        actorSession: f.source_session,
+        // The sweep performed this transition; ownership stays on the existing row.
+        actorSession: "stuck-sweep@system",
         state: "done",
         closureReason: "no-follow-on",
         transitionNote: `stuck-sweep resolved: ${kind ?? "finding"} on ${stuckId ?? "row"} no longer detected`,
@@ -790,6 +856,12 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       }
     }
 
+    if (failedCreates.length > 0) {
+      // Not a clean or complete pass: say so, while keeping the findings that were made.
+      const error = failedCreates.join("; ");
+      status?.record("failed", { error, findings: findings.filter((f) => f.action !== "closed").length });
+      return { outcome: "failed", findings, error };
+    }
     const outcome = findings.length > 0 ? "findings" : "clean";
     status?.record(outcome, { findings: findings.filter((f) => f.action !== "closed").length });
     return { outcome, findings };

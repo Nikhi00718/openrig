@@ -15,6 +15,7 @@ import YAML from "yaml";
 import { scopeCommand } from "../src/commands/scope.js";
 import { readFrontmatter } from "../src/lib/scope/scope-fs.js";
 import { readMissionReadiness, readProjectReadiness, readSliceReadiness, recordJudgment } from "../../daemon/src/domain/proof/judgments.js";
+import { compileProjectLifecycle } from "../../daemon/src/domain/project-lifecycle-compiler.js";
 
 function mktemp(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "rig-scope-cmd-"));
@@ -715,6 +716,20 @@ describe("rig scope mission create (HG-14 + HG-15)", () => {
     expect(parsed.mission.template).toBe("release");
   });
 
+  // The lab's self-scout: a new mission refused to compile (lifecycle_field_missing) until metadata.name was added by hand.
+  it("scaffolds a mission whose project lifecycle compiles, with its name recorded exactly", async () => {
+    fs.copyFileSync(new URL("../../../docs/reference/project-release-profile.yaml", import.meta.url),
+      path.join(path.dirname(env.missionsRoot), "project.yaml"));
+    // Unquoted, YAML would read "#2" as a comment and "1.10" as the number 1.1.
+    for (const name of ["lab-mission", "#2", "1.10"]) {
+      const r = await run(["mission", "create", name, "--json"], env.missionsRoot);
+      expect(r.exitCode).toBe(0);
+      const missionPath = JSON.parse(r.stdout).mission.path as string;
+      expect(YAML.parse(fs.readFileSync(path.join(missionPath, "mission.yaml"), "utf8")).metadata).toEqual({ name, status: "planned" });
+      expect(compileProjectLifecycle({ missionPath, operationKey: "first-compile" }).identity.mission).toBe(name);
+    }
+  });
+
   it("creates the first mission under an explicit workspace before its missions folder exists", async () => {
     const workspace = path.join(env.root, "project-workspace");
     const globalHome = path.join(env.root, "global-home");
@@ -813,10 +828,9 @@ describe("rig scope mission create (HG-14 + HG-15)", () => {
     ["OPENRIG_WORK_ROOT", "project"],
     ["--workspace naming its missions folder", "missions"],
   ] as const) {
-    it(`creates under a missing workspace named by ${via}, reads it back, and leaves the configured root alone`, async () => {
+    it(`refuses a missing workspace named by ${via}, creating nothing there or in the configured root`, async () => {
       const absent = path.join(env.root, "not-yet", via.replace(/\W+/g, "-"));
       const workspace = path.join(absent, named);
-      const missionsRoot = named === "missions" ? workspace : path.join(workspace, "missions");
       const configuredRoot = path.join(env.root, "configured", via.replace(/\W+/g, "-"), "missions");
       fs.mkdirSync(configuredRoot, { recursive: true });
       const priorSlicesRoot = process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
@@ -830,13 +844,9 @@ describe("rig scope mission create (HG-14 + HG-15)", () => {
         expect(fs.existsSync(absent)).toBe(false);
 
         const created = await run(["mission", "create", "first-anywhere", "--json"], naming);
-        expect(created.exitCode).toBe(0);
-        expect(JSON.parse(created.stdout).mission.path).toBe(path.join(missionsRoot, "first-anywhere"));
-        expect(fs.existsSync(path.join(missionsRoot, "first-anywhere", "SPEC.md"))).toBe(true);
-
-        const shown = await run(["mission", "show", "first-anywhere", "--json"], naming);
-        expect(shown.exitCode).toBe(0);
-        expect(JSON.parse(shown.stdout).mission.path).toBe(path.join(missionsRoot, "first-anywhere"));
+        expect(created.exitCode).not.toBe(0);
+        expect(created.stdout + created.stderr).toContain(`named by ${byEnv ? "OPENRIG_WORK_ROOT" : "--workspace"} is not an existing directory`);
+        expect(fs.existsSync(absent)).toBe(false);
         expect(fs.readdirSync(configuredRoot)).toEqual([]);
       } finally {
         if (priorSlicesRoot === undefined) delete process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
@@ -847,7 +857,7 @@ describe("rig scope mission create (HG-14 + HG-15)", () => {
     });
   }
 
-  it("reports the filesystem's own error for a workspace path that is a file, writing nowhere else", async () => {
+  it("refuses a workspace path that is a file, writing nowhere else", async () => {
     const workspace = path.join(env.root, "a-file-not-a-folder");
     writeFile(workspace, "not a workspace\n");
     const configuredRoot = path.join(env.root, "configured-for-file", "missions");
@@ -857,8 +867,26 @@ describe("rig scope mission create (HG-14 + HG-15)", () => {
     try {
       const r = await run(["mission", "create", "nowhere", "--json"], path.join(workspace, "child"));
       expect(r.exitCode).not.toBe(0);
-      expect(r.stdout + r.stderr).toMatch(/ENOTDIR/);
+      expect(r.stdout + r.stderr).toContain("named by --workspace is not an existing directory");
       expect(fs.readdirSync(configuredRoot)).toEqual([]);
+    } finally {
+      if (priorSlicesRoot === undefined) delete process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
+      else process.env.OPENRIG_WORKSPACE_SLICES_ROOT = priorSlicesRoot;
+    }
+  });
+
+  it("slice create refuses a named workspace with no missions tree instead of using the configured root", async () => {
+    const configuredRoot = path.join(env.root, "configured-for-slice", "missions");
+    fs.mkdirSync(path.join(configuredRoot, "kept-mission"), { recursive: true });
+    const empty = path.join(env.root, "no-missions-here");
+    fs.mkdirSync(empty, { recursive: true });
+    const priorSlicesRoot = process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
+    process.env.OPENRIG_WORKSPACE_SLICES_ROOT = configuredRoot;
+    try {
+      const r = await run(["slice", "create", "kept-mission", "stray", "--json"], path.join(empty, "missions"));
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stdout + r.stderr).toContain("the configured workspace was NOT used as a fallback");
+      expect(fs.readdirSync(path.join(configuredRoot, "kept-mission"))).toEqual([]);
     } finally {
       if (priorSlicesRoot === undefined) delete process.env.OPENRIG_WORKSPACE_SLICES_ROOT;
       else process.env.OPENRIG_WORKSPACE_SLICES_ROOT = priorSlicesRoot;

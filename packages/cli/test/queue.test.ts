@@ -166,6 +166,24 @@ describe("rig queue CLI", () => {
     expect(errors.join("\n")).toContain("--source is required");
   });
 
+  it("verbs whose actor is the seat's identity name OPENRIG_SESSION_NAME outside a managed seat, never their ignored flag", async () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "");
+    vi.stubEnv("RIGGED_SESSION_NAME", "");
+    for (const [flag, argv] of [["actor", ["update", "q1", "--note", "x", "--actor", "me@rig"]], ["from", ["handoff", "q1", "--to", "bob@rig", "--body", "next"]],
+      ["destination", ["claim", "q1"]]] as const) {
+      errors.length = 0;
+      process.exitCode = undefined;
+      const { deps, calls } = makeDeps();
+      await createProgram({ queueDeps: deps }).parseAsync(["node", "rig", "queue", ...argv]);
+      expect(process.exitCode, argv[0]).toBe(1);
+      expect(calls, argv[0]).toEqual([]);
+      const text = errors.join("\n");
+      expect(text, argv[0]).toContain("OPENRIG_SESSION_NAME is not set");
+      expect(text, argv[0]).toContain(`--${flag} is ignored`);
+      expect(text, argv[0]).not.toContain("is required when OPENRIG_SESSION_NAME is not set");
+    }
+  });
+
   it("create preserves the legacy managed source env without forwarding an explicit body claim", async () => {
     vi.stubEnv("OPENRIG_SESSION_NAME", "");
     vi.stubEnv("RIGGED_SESSION_NAME", "legacy@rig");
@@ -417,6 +435,32 @@ describe("rig queue CLI", () => {
     );
     expect(result).toMatchObject({ outcome: "indeterminate", connectorAccepted: null, humanReadership: "unknown" });
     expect(result.detail).toContain("HTTP 503");
+  });
+
+  // An ask placed on Steering without an alert owes no Slack post: verification says so at once, never "still pending".
+  it("create --alert sends humanAlert; delivery verification reports an unalerted ask at once, without waiting for a post", async () => {
+    const { deps, calls } = makeDeps();
+    await createProgram({ queueDeps: deps }).parseAsync(["node", "rig", "queue", "create", "--destination", "human-founder@external", "--body", "Approve the rollback now?", "--alert", "--json"]);
+    expect(calls.find((c) => c.path === "/api/queue/create")?.body).toMatchObject({ humanAlert: true });
+    const quiet = makeDeps();
+    await createProgram({ queueDeps: quiet.deps }).parseAsync(["node", "rig", "queue", "create", "--destination", "human-founder@external", "--body", "Which name?", "--json"]);
+    expect(quiet.calls.find((c) => c.path === "/api/queue/create")?.body).not.toHaveProperty("humanAlert");
+    const handoff = makeDeps();
+    await createProgram({ queueDeps: handoff.deps }).parseAsync(["node", "rig", "queue", "handoff", "qitem-src", "--to", "human-founder@external", "--body", "Approve now?", "--alert", "--json"]);
+    expect(handoff.calls.find((c) => c.path === "/api/queue/qitem-src/handoff")?.body).toMatchObject({ humanAlert: true });
+    const complete = makeDeps();
+    await createProgram({ queueDeps: complete.deps }).parseAsync(["node", "rig", "queue", "handoff-and-complete", "qitem-src", "--to", "human-founder@external", "--body", "Approve now?", "--alert", "--json"]);
+    expect(complete.calls.find((c) => c.path === "/api/queue/qitem-src/handoff-and-complete")?.body).toMatchObject({ humanAlert: true });
+    let reads = 0;
+    const result = await waitForDeliveryOutcome(
+      { get: async <T>() => { reads += 1; return { status: 200, data: { destinationSession: "human-founder@external", lastNudgeResult: "gateway-owned:slack", ownerNotificationLevel: "RECORD", deliveryOutcome: null } as T }; } },
+      "qitem-steering",
+      { timeoutMs: 60_000, sleep: async () => { throw new Error("waited for a post that isn't owed"); } },
+      { destinationSession: "human-founder@external" },
+    );
+    expect(result).toMatchObject({ receiptSource: "gateway", outcome: "not-alerted", connectorAccepted: null, nextAction: null });
+    expect(result.detail).toMatch(/^created without --alert, and the person's Slack subscription is urgent-only/);
+    expect(reads).toBe(1);
   });
 
   it("delivery verification reports an unreadable receipt as indeterminate, not rejected", async () => {
@@ -1930,6 +1974,14 @@ describe("rig queue CLI", () => {
       expect(help).toContain("--resolution <text>");
       expect(help).not.toContain("resolution_not_admitted");
       expect(help).not.toContain("resolution_already_closed");
+    });
+
+    it("update --help says how to cancel a row: --state done --closure-reason canceled", async () => {
+      const { deps } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      const help = program.commands.find((c) => c.name() === "queue")!.commands.find((c) => c.name() === "update")!.helpInformation().replace(/\s+/g, " ");
+      expect(help).toContain("To cancel a row: --state done --closure-reason canceled");
+      expect(help).toContain("--state canceled takes no reason, except 'superseded'");
     });
 
     it("update without --resolution sends no resolution", async () => {

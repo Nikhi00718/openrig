@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../src/mcp-server.js";
@@ -41,9 +44,10 @@ describe("MCP Server", () => {
     if (cleanup) await cleanup();
   });
 
-  // T1: MCP server lists all 34 tools: the original 18, the five queue tools, the telemetry events read, restore status, whoami,
-  // the team, slice, mission and two context reads, the artifact read, and the decision room and delegated decision
-  it("lists all 34 tools", async () => {
+  // T1: MCP server lists all 36 tools: the original 18, the five queue tools, the telemetry events read, restore status, whoami,
+  // the team, slice, mission and two context reads, the artifact read, the decision room and delegated decision, and the
+  // worker's handoff and unclaim
+  it("lists all 36 tools", async () => {
     await setup();
     const result = await mcpClient.listTools();
     const names = result.tools.map((t) => t.name).sort();
@@ -66,8 +70,10 @@ describe("MCP Server", () => {
       "rig_queue_claim",
       "rig_queue_create",
       "rig_queue_decide",
+      "rig_queue_handoff",
       "rig_queue_list",
       "rig_queue_show",
+      "rig_queue_unclaim",
       "rig_queue_update",
       "rig_restore",
       "rig_restore_status",
@@ -236,8 +242,9 @@ describe("MCP Server", () => {
       "rig_team", "rig_slices", "rig_mission", "rig_context_pack", "rig_context_get", "rig_artifact_read", "rig_human_decision_room"];
     const additive = ["rig_add", "rig_chatroom_send", "rig_queue_create", "rig_snapshot_create"];
     // Discover refreshes and retires discovered facts; claim ends a blocked row's wait. Both change existing state.
-    // A delegated decision closes the person's ask.
-    const destructive = ["rig_bind", "rig_discover", "rig_down", "rig_queue_claim", "rig_queue_decide", "rig_queue_update", "rig_restore", "rig_send", "rig_up"];
+    // A delegated decision closes the person's ask; a handoff closes the item passed on; an unclaim ends a claim.
+    const destructive = ["rig_bind", "rig_discover", "rig_down", "rig_queue_claim", "rig_queue_decide", "rig_queue_handoff", "rig_queue_unclaim",
+      "rig_queue_update", "rig_restore", "rig_send", "rig_up"];
     const hints = Object.fromEntries(tools.map((tool) => [tool.name, tool.annotations]));
     expect(Object.keys(hints).sort()).toEqual([...reads, ...additive, ...destructive].sort());
     for (const name of reads) expect(hints[name], name).toEqual({ readOnlyHint: true });
@@ -302,7 +309,8 @@ describe("MCP Server", () => {
       await setup({ get: getFn });
       const seated = await mcpClient.callTool({ name: "rig_whoami", arguments: {} });
       expect(getFn).toHaveBeenCalledWith("/api/whoami?sessionName=dev-impl%40my-rig&compact=1");
-      expect(seated.structuredContent).toEqual(identity);
+      // A local server's seat is declared (the env), not authenticated, and says so.
+      expect(seated.structuredContent).toEqual({ ...identity, caller: { authenticated: false, identity: "declared" } });
       await cleanup();
 
       vi.stubEnv("OPENRIG_SESSION_NAME", "");
@@ -310,7 +318,7 @@ describe("MCP Server", () => {
       await setup({ get: quietGet });
       const unseated = await mcpClient.callTool({ name: "rig_whoami", arguments: {} });
       expect(unseated.isError).toBeFalsy();
-      expect(unseated.structuredContent).toMatchObject({ ok: true, seat: null });
+      expect(unseated.structuredContent).toMatchObject({ ok: true, seat: null, caller: { authenticated: false } });
       expect(quietGet).not.toHaveBeenCalled();
       await cleanup();
     } finally {
@@ -408,6 +416,66 @@ describe("MCP Server", () => {
     served = detail;
     expect((await team()).leadNote).toContain("doesn't report");
     await cleanup();
+  });
+
+  it("rig_team adds the rig's hosted members (marked hosted, on this host, not a node), and says when it can't tell", async () => {
+    const folder = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-rosters-"));
+    const member = (seat: string, host: string, extra: Record<string, unknown> = {}) =>
+      ({ seat, host, capabilities: ["web research"], engagement: ["delegate"], use_when: "Current sources", why: "Searches the web", hosted: true, ...extra });
+    fs.writeFileSync(path.join(folder, "a.json"), JSON.stringify({ version: 1, id: "research", name: "Research", purpose: "Find things",
+      curator: { seat: "dev-impl@my-rig", host: "host-a" }, updated_at: "2026-10-26",
+      members: [
+        member("grok@my-rig", "host-a", { caveat: "Text only" }),
+        member("dev-impl@my-rig", "host-a"), // a node with a session: a seat
+        member("dev-qa@my-rig", "host-a"), // a node not launched yet (no session): still a seat
+        member("old@my-rig", "host-a", { hosted: undefined }), // a stale entry not marked hosted
+        member("bot@my-rig", "host-b"), // another host's
+        member("grok@other-rig", "host-a"), // another rig's
+      ] }));
+    fs.writeFileSync(path.join(folder, "b.json"), "{ not json");
+    let hostSelfId: string | null = "host-a";
+    const getFn = vi.fn(async (p: string) => {
+      if (p.startsWith("/api/rigs/summary")) return { status: 200, data: [{ id: "rig-1", name: "my-rig" }] };
+      if (p === "/api/rigs/rig-1") return { status: 200, data: { rig: { id: "rig-1", name: "my-rig" }, nodes: [{ id: "n1", logicalId: "dev.impl" }, { id: "n2", logicalId: "dev.qa" }], edges: [], representative: null } };
+      if (p === "/api/rigs/rig-1/nodes") return { status: 200, data: [
+        { logicalId: "dev.impl", canonicalSessionName: "dev-impl@my-rig", hostSelfId, agentActivity: { state: "idle" }, activityState: null },
+        { logicalId: "dev.qa", canonicalSessionName: null, hostSelfId, activityState: null },
+      ] };
+      return { status: 404, data: {} };
+    });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const connectTo = async (rostersFolder: string) => {
+      const server = createMcpServer(mockClient({ get: getFn }), { rostersFolder: () => rostersFolder });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: "test-client", version: "1.0.0" });
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      return { team: async () => (await client.callTool({ name: "rig_team", arguments: { rigId: "my-rig" } })).structuredContent as { hostedMembers: unknown[]; hostedMembersNote?: string },
+        close: async () => { await client.close(); await server.close(); } };
+    };
+    const blocked = path.join(folder, "a-file");
+    fs.writeFileSync(blocked, "not a folder");
+    const [here, unreachable] = [await connectTo(folder), await connectTo(path.join(blocked, "rosters"))];
+    try {
+      const found = await here.team();
+      expect(found.hostedMembers).toEqual([{ session: "grok@my-rig", roster: "research", capabilities: ["web research"], useWhen: "Current sources",
+        caveat: "Text only", pane: null, activity: "unknown" }]);
+      // A scoped caller gets a generic note; the file names and errors go to this server's log.
+      expect(found.hostedMembersNote).toBe("Some rosters couldn't be read, so hosted members may be missing.");
+      expect(log.mock.calls.flat().join(" ")).toContain("b.json");
+      // A folder that can't be inspected isn't "no rosters".
+      expect(await unreachable.team()).toMatchObject({ hostedMembers: [], hostedMembersNote: "Some rosters couldn't be read, so hosted members may be missing." });
+      // With this daemon's host id unknown (none on the nodes, none from health), it says so instead of listing none.
+      hostSelfId = null;
+      const unknown = await here.team();
+      expect(unknown.hostedMembers).toEqual([]);
+      expect(unknown.hostedMembersNote).toContain("host id isn't known");
+    } finally {
+      await here.close();
+      await unreachable.close();
+      log.mockRestore();
+      fs.rmSync(folder, { recursive: true, force: true });
+    }
   });
 
   it("the context reads return bounded summaries, cut long text and say so, and keep a route's hint as the message", async () => {
@@ -558,7 +626,7 @@ describe("MCP Server", () => {
 
     // Verify server is responsive
     const result = await mcpClient.listTools();
-    expect(result.tools.length).toBe(34);
+    expect(result.tools.length).toBe(36);
 
     // Clean disconnect
     await cleanup();
@@ -572,7 +640,7 @@ describe("MCP Server", () => {
     await client2.connect(ct2);
 
     const result2 = await client2.listTools();
-    expect(result2.tools.length).toBe(34);
+    expect(result2.tools.length).toBe(36);
 
     await client2.close();
     await server2.close();
@@ -729,6 +797,20 @@ describe("MCP Server", () => {
       }),
       { timeoutMs: 35000 },
     );
+    expect(result.isError).toBeUndefined();
+    await cleanup();
+  });
+
+  it("rig_send with a wait longer than 300 s is one request carrying the whole wait", async () => {
+    const postFn = vi.fn().mockResolvedValueOnce({ status: 200, data: { ok: true, sessionName: "dev-impl@my-rig" } });
+    await setup({ post: postFn });
+
+    const result = await mcpClient.callTool({
+      name: "rig_send",
+      arguments: { session: "dev-impl@my-rig", text: "hello", waitForIdleSeconds: 400 },
+    });
+
+    expect(postFn.mock.calls.map((call) => [(call[1] as { waitForIdleMs: number }).waitForIdleMs, call[2]])).toEqual([[400000, { timeoutMs: 405000 }]]);
     expect(result.isError).toBeUndefined();
     await cleanup();
   });
@@ -908,6 +990,17 @@ describe("MCP Server", () => {
       await cleanup();
     });
 
+    it("rig_queue_create sends humanAlert only when alert is set, so an MCP-only agent can still raise a sign-in", async () => {
+      const postFn = vi.fn(async () => ({ status: 201, data: { qitemId: "qitem-1" } }));
+      await setup({ post: postFn });
+      await mcpClient.callTool({ name: "rig_queue_create", arguments: { destination: "human-founder@external", body: "Sign in again?", alert: true } });
+      await mcpClient.callTool({ name: "rig_queue_create", arguments: { destination: "human-founder@external", body: "Which name?" } });
+      const bodies = postFn.mock.calls.map((call) => (call as unknown as [string, Record<string, unknown>])[1]);
+      expect(bodies[0]).toMatchObject({ humanAlert: true });
+      expect(bodies[1]).not.toHaveProperty("humanAlert");
+      await cleanup();
+    });
+
     it("rig_queue_create reuses a given request id and names it when the outcome is unknown", async () => {
       const postFn = vi.fn(async () => { throw new Error("timed out after 5000ms"); });
       await setup({ post: postFn });
@@ -988,6 +1081,26 @@ describe("MCP Server", () => {
       expect(postFn.mock.calls[0]?.[0]).toBe("/api/queue/qitem-1/claim");
       expect(postFn.mock.calls[1]?.[0]).toBe("/api/queue/qitem-1/update");
       expect(postFn.mock.calls[1]?.[1]).toMatchObject({ state: "done", closureReason: "no-follow-on", transitionNote: "the answer" });
+      await cleanup();
+    });
+    it("rig_queue_handoff and rig_queue_unclaim post to the item's routes, naming the next seat and the reason", async () => {
+      const postFn = vi.fn(async () => ({ status: 201, data: { ok: true } }));
+      await setup({ post: postFn });
+      await mcpClient.callTool({ name: "rig_queue_handoff", arguments: { qitemId: "qitem-1", to: "qa@team", note: "needs a check" } });
+      await mcpClient.callTool({ name: "rig_queue_unclaim", arguments: { qitemId: "qitem-2", reason: "no capacity" } });
+      expect(postFn.mock.calls[0]?.[0]).toBe("/api/queue/qitem-1/handoff");
+      expect(postFn.mock.calls[0]?.[1]).toMatchObject({ toSession: "qa@team", transitionNote: "needs a check" });
+      expect(postFn.mock.calls[1]?.[0]).toBe("/api/queue/qitem-2/unclaim");
+      expect(postFn.mock.calls[1]?.[1]).toEqual({ reason: "no capacity" });
+      await cleanup();
+    });
+    it("rig_queue_handoff that times out says the outcome is unknown and how to check it before retrying", async () => {
+      const postFn = vi.fn(async () => { throw new Error("Request timed out"); });
+      await setup({ post: postFn });
+      const result = await mcpClient.callTool({ name: "rig_queue_handoff", arguments: { qitemId: "qitem-1", to: "qa@team" } });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({ ok: false, qitemId: "qitem-1", outcome: "unknown" });
+      expect((result.content as Array<{ text: string }>)[0]!.text).toContain("check rig_queue_show with qitemId qitem-1 before retrying");
       await cleanup();
     });
     it("rig_queue_update passes the outcome as resolution and a deliberate reopen", async () => {
