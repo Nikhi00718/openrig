@@ -26,7 +26,7 @@ import {
   validateClosure,
   type ClosureReason,
 } from "./hot-potato-enforcer.js";
-import { isHumanSeatSession, validateHumanPark, validateHumanRoute } from "./human-route-enforcer.js";
+import { validateHumanPark, validateHumanRoute } from "./human-route-enforcer.js";
 import {
   QueueWakeRepository,
   USAGE_LIMIT_BLOCKER_TAG,
@@ -3012,7 +3012,9 @@ export class QueueRepository {
     if (qitem.humanIntent === "update" && input.state === "blocked" && isHumanSeatSessionRef(effectiveBlockedOn ?? "")) {
       throw new QueueRepositoryError("invalid_human_notification", "An informational delivery cannot become a human approval park; author a separate decision request.");
     }
-    const isHumanPark = input.state === "blocked" && isHumanSeatSession(effectiveBlockedOn);
+    // A park on a person by any address (a legacy human seat, or a registered person's own address or alias) keeps the
+    // summary and evidence it names. validateHumanPark still requires them only for the legacy human-seat form.
+    const isHumanPark = input.state === "blocked" && !!effectiveBlockedOn && this.isPersonAddress(effectiveBlockedOn);
     // A done close can also store the artifact the work produced, so the finished row carries its link.
     const isDoneClose = input.state === "done";
 

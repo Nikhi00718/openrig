@@ -101,6 +101,28 @@ describe("51-06 D2 — non-park queue update metadata reject", () => {
     expect(res.evidenceRef).toBe("/proof/park.md");
   });
 
+  it.each(["sarah@external", "sarah@host"])("a park on registered person %s persists summary + evidence like a human-seat park", async (blockedOn) => {
+    const person = { entityId: "sarah", class: "human" as const, displayName: "Sarah", address: "sarah@external",
+      connectorBindings: [{ kind: "slack" as const, connectorRef: "primary", secretsRef: "env:SLACK_BOT_TOKEN", role: "primary" as const, handle: "USARAH" }],
+      prefs: { deliveryClass: "A" as const } };
+    const people = new QueueRepository(db, bus, { validateRig: () => true, loadHumanRegistry: () => ({ ok: true, entities: [person] }) });
+    const id = await mkItem();
+    const res = people.update({ qitemId: id, actorSession: "orch@rig", state: "blocked", blockedOn, summary: "Which layout?", evidenceRef: "/proof/layout.md" });
+    expect(res).toMatchObject({ state: "blocked", blockedOn, summary: "Which layout?", evidenceRef: "/proof/layout.md" });
+    // The legacy human-seat requirement isn't extended: a park on the person without them still parks.
+    const bare = await mkItem();
+    expect(people.update({ qitemId: bare, actorSession: "orch@rig", state: "blocked", blockedOn })).toMatchObject({ state: "blocked", summary: null });
+  });
+
+  it("an unregistered name on another daemon's domain still refuses summary on a park", async () => {
+    const nobody = new QueueRepository(db, bus, { validateRig: () => true, loadHumanRegistry: () => ({ ok: true, entities: [] }) });
+    const id = await mkItem();
+    let err: unknown;
+    try { nobody.update({ qitemId: id, actorSession: "orch@rig", state: "blocked", blockedOn: "sarah@host", summary: "S" }); }
+    catch (e) { err = e; }
+    expect((err as QueueRepositoryError).code).toBe(REJECT_CODE);
+  });
+
   it("a done close stores evidence_ref, and queue show returns it on the closed row", async () => {
     const id = await mkItem();
     repo.update({ qitemId: id, actorSession: "dev-x@rig", state: "in-progress" });
