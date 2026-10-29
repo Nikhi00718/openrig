@@ -519,6 +519,16 @@ describe("MCP Server", () => {
     await cleanup();
   });
 
+  it("cuts long context text before an emoji instead of through it", async () => {
+    const text = `${"x".repeat(47_999)}🚀${"y".repeat(10)}`;
+    await setup({ get: vi.fn(async (path: string) => path.startsWith("/api/context-packs/library/resolve-address")
+      ? { status: 200, data: { address: "world/a.md", packRef: "world", filePath: "a.md", text } }
+      : { status: 404, data: {} }) });
+    const got = (await mcpClient.callTool({ name: "rig_context_get", arguments: { address: "world/a.md" } })).structuredContent as { text: string };
+    expect(got).toMatchObject({ text: "x".repeat(47_999), truncated: true, totalChars: 48_011 });
+    await cleanup();
+  });
+
   it("gives the client short instructions on the seat, durable delegation and reserved questions", async () => {
     await setup();
     const instructions = mcpClient.getInstructions() ?? "";

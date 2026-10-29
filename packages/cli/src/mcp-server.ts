@@ -18,6 +18,15 @@ const WAIT_FOR_IDLE_REQUEST_OVERHEAD_MS = 5_000;
 /** The most text rig_context_get and rig_artifact_read return in one call; a longer file or section is cut, and says so. */
 const CONTEXT_TEXT_LIMIT = 48_000;
 
+/** Where a cut of text at end goes: one unit earlier when end falls inside a surrogate pair (an emoji, say), so the
+ *  cut text and the rest after it both hold whole characters. */
+function wholeCharEnd(text: string, end: number): number {
+  if (end <= 0 || end >= text.length) return end;
+  const before = text.charCodeAt(end - 1);
+  const after = text.charCodeAt(end);
+  return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff ? end - 1 : end;
+}
+
 type TextResult = {
   content: Array<{ type: "text"; text: string }>;
   isError?: true;
@@ -399,7 +408,7 @@ function artifactView(source: string, read: FileRead, offset: number): Record<st
   const base = { available: true, source, root: read.root, path: read.path, size: read.size, mtime: read.mtime };
   if (read.binary) return { ...base, binary: true, note: "A binary file: not shown as text." };
   const text = read.content ?? "";
-  const end = offset + CONTEXT_TEXT_LIMIT;
+  const end = wholeCharEnd(text, offset + CONTEXT_TEXT_LIMIT);
   return {
     ...base, binary: false, offset, text: text.slice(offset, end), totalChars: text.length,
     truncated: text.length > end || read.truncated === true,
@@ -1581,7 +1590,7 @@ export function createMcpServer(client: DaemonClient, options: { seat?: string; 
         return mapResult({ status: 200, data: {
           address: found.address ?? address, packRef: found.packRef, filePath: found.filePath,
           ...(found.headerPath !== undefined ? { headerPath: found.headerPath } : {}),
-          text: cut ? text.slice(0, CONTEXT_TEXT_LIMIT) : text,
+          text: cut ? text.slice(0, wholeCharEnd(text, CONTEXT_TEXT_LIMIT)) : text,
           ...(cut ? { truncated: true, totalChars: text.length } : {}),
         } }, undefined, { structured: true });
       } catch (err) {
