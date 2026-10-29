@@ -3,7 +3,9 @@ import { configListLines } from "../src/config/config-model.js";
 import { demoSnapshot } from "../src/demo-data.js";
 import { healthListLines, healthSummaryLine } from "../src/health/health-model.js";
 import { renderLanes } from "../src/pulse/render-pulse.js";
+import { renderScreen } from "../src/render.js";
 import { scopeIdentityLines, type SliceScopeSnap } from "../src/scopes/scopes-model.js";
+import { createViewState } from "../src/state.js";
 import type { FleetSnapshot } from "../src/types.js";
 
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
@@ -60,6 +62,23 @@ describe("TUI truncation keeps emoji whole", () => {
     }], 60)).flat().map((line) => line.text);
     expect(texts.some((text) => text.includes("…"))).toBe(true);
     expect(texts.filter((text) => LONE_SURROGATE.test(text))).toEqual([]);
+  });
+
+  it("cuts a seat's NOW summary in the rig table before an emoji and keeps the columns aligned", () => {
+    const rows: string[][] = [];
+    for (let k = 0; k < 40; k++) {
+      const snap = demoSnapshot();
+      for (const list of [snap.attention, snap.blocked, snap.inProgress, snap.pending]) for (const row of list) {
+        if (row.destinationSession === "dev50-driver@openrig-build") row.summary = `${"a".repeat(k)}🚀 incremental build of the pulse view`;
+      }
+      const view = createViewState({ instanceId: "emoji-table", getSnapshot: () => snap });
+      view.dispatch({ type: "drill", resource: "rig", name: "openrig-build", target: { host: "vm-host" } });
+      const screen = renderScreen(view.get(), snap, { cols: 180, rows: 40, nowMs: Date.parse("2026-08-06T12:00:00.000Z") });
+      rows.push(screen.lines.filter((line) => /\b(driver|guard) +c[lx] /.test(line)));
+    }
+    expect(rows.flat().some((line) => line.includes("aaaa") && line.includes("…"))).toBe(true);
+    expect(rows.flat().filter((line) => LONE_SURROGATE.test(line))).toEqual([]);
+    for (const [driver, guard] of rows) expect(driver!.indexOf(" term ▸")).toBe(guard!.indexOf(" term ▸"));
   });
 });
 
