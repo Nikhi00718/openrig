@@ -902,6 +902,22 @@ describe("S05 authored source and observed consumers", () => {
     expect(view.get()).toMatchObject({ drill: origin.drill, filter: "implementer", contentOffset: 6, viewTab: origin.viewTab });
   });
 
+  it("does not report an agent spec's running seats as none when the Specs page did not read them", async () => {
+    const specPage = async (focused: boolean) => {
+      const full = await hydrateSnapshot(fixtureClient());
+      const view = createViewState({ instanceId: "proof", getSnapshot: () => full });
+      view.dispatch({ type: "jump", section: "specs" });
+      view.dispatch({ type: "drill", resource: "spec", name: "implementer" });
+      // The live TUI hydrates with the view context; the Specs page reads the library, not the seat inventory.
+      const snap = focused ? await hydrateSnapshot(fixtureClient({}, { "/api/files/roots": { roots: [] } }), undefined, undefined, undefined, undefined, view.get()) : full;
+      return renderScreen(view.get(), snap, { cols: 160, rows: 80 }).lines.join("\n");
+    };
+    expect(await specPage(false)).toMatch(/seats now:\s+dev\.impl/);
+    const text = await specPage(true);
+    expect(text).toContain("Consumer projection unavailable.");
+    expect(text).toMatch(/seats now:\s+not loaded in this view/);
+    expect(text).not.toMatch(/seats now:\s+\(none\)/);
+  });
   it("refreshes the selected file even with the same library revision and does not hide a later failure behind its cache", async () => {
     const cache = new Map();
     const context = { section: "specs", viewTab: "configuration" as const, drill: [{ kind: "spec" as const, name: "myrig" }] };

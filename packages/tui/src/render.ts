@@ -1271,7 +1271,8 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
                     }))),
                 {
                   label: "seats now",
-                  value: seats.join(", ") || "(none)",
+                  // Consumers are undefined when this page didn't read the seat inventory: unknown, not none.
+                  value: spec.consumers === undefined ? "not loaded in this view" : seats.join(", ") || "(none)",
                   link: { type: "cross", kind: "running", name: spec.name },
                 },
               ],
