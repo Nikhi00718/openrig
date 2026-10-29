@@ -509,6 +509,8 @@ export async function hydrateSnapshot(
   const broadReads = !readingOnly && !focusedTopology && !wantsConnections;
   // Seat rows (Q / WORK / NOW) join these four lists: only a seat's page and the drilled table tab show them.
   const seatQueueReads = broadReads || (focusedTopology && (topologyLeaf?.kind === "agent" || (!!topologyLeaf && viewContext?.viewTab === "table")));
+  // A seat's page also lists that seat's RECENTLY FINISHED items; the drilled table tab shows none.
+  const recentlyFinishedReads = broadReads || (focusedTopology && topologyLeaf?.kind === "agent");
   // render.ts draws healthSummaryLine on the instance Table and on the rig/pod Table and Overview; those focused pages must load health too.
   const rendersHealthSummary = (topologyLeaf?.kind === "host" && viewContext?.viewTab === "table")
     || ((topologyLeaf?.kind === "rig" || topologyLeaf?.kind === "pod") && (viewContext?.viewTab === "table" || viewContext?.viewTab === "overview"));
@@ -537,7 +539,7 @@ export async function hydrateSnapshot(
     !seatQueueReads ? Promise.resolve(null) : safe<QueueItemRead[]>("queue-in-progress", () => client.queueInProgress()),
     // PULSE UP NEXT + JUST FINISHED lane reads (increment 3) — same shipped /list route
     !seatQueueReads ? Promise.resolve(null) : safe<QueueItemRead[]>("queue-pending", () => client.queuePending()),
-    !broadReads ? Promise.resolve(null) : safe<QueueItemRead[]>("queue-recently-finished", () => client.queueRecentlyFinished()),
+    !recentlyFinishedReads ? Promise.resolve(null) : safe<QueueItemRead[]>("queue-recently-finished", () => client.queueRecentlyFinished()),
     !broadReads ? Promise.resolve(null) : safe<{ missions: unknown[]; sourceObservation?: { state: string } }>("scopes", () => client.scopesDetailed() as Promise<{ missions: unknown[] }>),
     !broadReads ? Promise.resolve(null) : safe<{ rows: unknown[] }>("execution", () => client.execution(executionMission ?? undefined) as Promise<{ rows: unknown[] }>),
     broadReads && sliceDetailName

@@ -337,6 +337,31 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     expect(snap.pending.map((q) => q.qitemId)).toEqual(["qp1"]);
     expect(snap.recentlyFinished).toEqual([]);
   });
+  it("hydrates the seat's recently finished items on an agent page so RECENTLY FINISHED can fill", async () => {
+    const row = (qitemId: string, state: string, destinationSession: string) => ({ qitemId, state, destinationSession, blockedOn: null, handedOffTo: null, tier: null, tags: [], summary: `work ${qitemId}`, body: "", claimedAt: null, tsUpdated: "2026-09-12T10:00:00.000Z" });
+    const finished = { "/api/queue/list?state=done,handed-off&limit=20": [row("qd1", "done", "dev-impl@myrig"), row("qd2", "done", "dev-qa@myrig")] };
+    const page = async (drill: Record<string, unknown>, tab: "table" | "graph" = "table") => {
+      const calls: string[] = [];
+      const full = await hydrateSnapshot(fixtureClient());
+      const view = createViewState({ instanceId: "t", getSnapshot: () => full });
+      view.dispatch({ type: "drill", ...drill } as never);
+      view.dispatch({ type: "tab", tab });
+      const { section, viewTab, drill: segments } = view.get();
+      const snap = await hydrateSnapshot(fixtureClient({}, finished, calls), undefined, undefined, undefined, "myrig", { section, viewTab, drill: segments });
+      return { calls, snap, text: renderScreen(view.get(), snap, { cols: 220, rows: 120 }).lines.join("\n") };
+    };
+    const agent = await page({ resource: "agent", name: "dev.impl", target: { host: "mm2-openrig1", rig: "myrig", pod: "dev" } });
+    expect(agent.calls).toContain("/api/queue/list?state=done,handed-off&limit=20");
+    expect(agent.snap.recentlyFinished.map((q) => q.qitemId)).toEqual(["qd1", "qd2"]);
+    expect(agent.text).toContain("RECENTLY FINISHED · bounded window");
+    expect(agent.text).toContain("qd1 · done");
+    expect(agent.text).not.toContain("qd2");
+    // The rig table and graph draw no finished items, so they keep that read off.
+    for (const tab of ["table", "graph"] as const) {
+      const rig = await page({ resource: "rig", name: "myrig", target: { host: "mm2-openrig1" } }, tab);
+      expect(rig.calls).not.toContain("/api/queue/list?state=done,handed-off&limit=20");
+    }
+  });
   it("marks health unavailable when the selected health view read fails", async () => {
     const context = { section: "topology" as const, viewTab: "health" as const, drill: [] };
     const snap = await hydrateSnapshot(fixtureClient({ "/api/health?limit=200": { status: 503 } }), undefined, undefined, undefined, undefined, context);
