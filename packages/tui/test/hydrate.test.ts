@@ -326,6 +326,28 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     expect(snap.controlPlane).toMatchObject({ ok: true });
     expect(snap.health).toBeUndefined();
   });
+  it("reads the rig's RECENT window on a pod's Recent tab, and only there among the pod's tabs", async () => {
+    const route = "/api/queue/recent-transitions?scope=rig&rig=myrig&limit=20";
+    const transitions = [{ transitionId: 7, qitemId: "q-7", ts: "2026-09-05T11:58:00.000Z", actorSession: "dev-impl@myrig",
+      change: "completed", summary: "Ship the pod recent window", targetKind: "qitem", target: "q-7" }];
+    const pod = async (tab: "table" | "recent" | "overview" | "graph" | "health") => {
+      const calls: string[] = [];
+      const full = await hydrateSnapshot(fixtureClient());
+      const view = createViewState({ instanceId: "t", getSnapshot: () => full });
+      view.dispatch({ type: "drill", resource: "pod", name: "dev", target: { host: "mm2-openrig1", rig: "myrig" } } as never);
+      view.dispatch({ type: "tab", tab });
+      const { section, viewTab, drill: segments } = view.get();
+      const snap = await hydrateSnapshot(fixtureClient({}, { [route]: transitions }, calls), undefined, undefined, undefined, "myrig", { section, viewTab, drill: segments });
+      return { calls, text: renderScreen(view.get(), snap, { cols: 220, rows: 60 }).lines.join("\n") };
+    };
+    const recent = await pod("recent");
+    expect(recent.calls.filter((call) => call === route)).toEqual([route]);
+    expect(recent.text).toContain("RECENT · rig myrig");
+    expect(recent.text).toContain("Ship the pod recent window");
+    expect(recent.text).not.toContain("RECENT window not served");
+    // The pod's other tabs draw no RECENT window (the pod Table leaves out the rig's strip), so they skip the read.
+    for (const tab of ["table", "overview", "graph", "health"] as const) expect((await pod(tab)).calls).not.toContain(route);
+  });
   it("hydrates the seat queue on the focused topology table so Q / WORK / NOW can fill", async () => {
     const row = (qitemId: string, state: string, destinationSession: string) => ({ qitemId, state, destinationSession, blockedOn: null, handedOffTo: null, tier: null, tags: ["slice:OPR.1.0.2.7"], summary: `work ${qitemId}`, body: "", claimedAt: null, tsUpdated: "2026-09-12T10:00:00.000Z" });
     const context = { section: "topology" as const, viewTab: "table" as const, drill: [{ kind: "rig" as const, name: "myrig" }] };
